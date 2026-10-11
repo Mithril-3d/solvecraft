@@ -508,7 +508,7 @@ pub(crate) fn bore_union(a: &Body, b: &Body, accept: &dyn Fn(&Body) -> bool) -> 
             let Some(radial) = (q - along).normalized() else { continue };
             let on = along + radial * c.radius;
             let e = (c.radius * 0.05).max(size * 1e-4);
-            if !(inside.contains(on + radial * e) && !inside.contains(on - radial * e)) {
+            if !inside.contains(on + radial * e) || inside.contains(on - radial * e) {
                 continue;
             }
             // The cylinder over the tool's length holds no material of either body.

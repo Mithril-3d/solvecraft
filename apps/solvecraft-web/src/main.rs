@@ -334,6 +334,45 @@ mod web {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
     }
 
+    /// Fetch font bytes asynchronously through the browser.
+    async fn fetch_font_bytes(url: &str) -> Result<Vec<u8>, String> {
+        let window = web_sys::window().ok_or("no window")?;
+        let resp_val = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await.map_err(|e| format!("{e:?}"))?;
+        let resp: web_sys::Response = resp_val.dyn_into().map_err(|_| "response cast failed")?;
+        if !resp.ok() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let ab_val = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+        let uint8_arr = js_sys::Uint8Array::new(&ab_val);
+        Ok(uint8_arr.to_vec())
+    }
+
+    /// Load Japanese/CJK fallback font in the browser.
+    fn load_web_fonts(ctx: egui::Context) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let urls = [
+                "./fonts/BIZUDPGothic-Regular.ttf",
+                "./fonts/NotoSansCJKjp-Regular.otf",
+                "https://cdn.jsdelivr.net/gh/googlefonts/morisawa-biz-ud-gothic@main/fonts/ttf/BIZUDPGothic-Regular.ttf",
+            ];
+
+            for url in urls {
+                match fetch_font_bytes(url).await {
+                    Ok(bytes) => {
+                        if solvecraft_ui_egui::fonts::install_cjk_font(&ctx, bytes) {
+                            log::info!("loaded web CJK font from {url}");
+                            ctx.request_repaint();
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!("fetching font from {url} failed: {err}");
+                    }
+                }
+            }
+        });
+    }
+
     pub fn start() {
         eframe::WebLogger::init(log::LevelFilter::Info).ok();
         wasm_bindgen_futures::spawn_local(async {
@@ -355,6 +394,8 @@ mod web {
                     canvas,
                     options,
                     Box::new(move |cc| {
+                        solvecraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
+                        load_web_fonts(cc.egui_ctx.clone());
                         let files = Rc::new(Files::default());
                         files::start(&files);
                         let panel = files.clone();

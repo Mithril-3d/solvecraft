@@ -30,9 +30,12 @@ use a render scope that restores the previous locale when it exits, including ne
 Standalone translated panels enter the same scope. Measure rendered text to size custom
 widgets; UTF-8 byte lengths do not describe their displayed width.
 
-The desktop host tries system CJK fonts and skips files that cannot be parsed. No system fonts
-are redistributed. Japanese glyph coverage depends on installed fonts; browser hosts cannot
-load local system fonts and must provide suitably licensed font assets separately.
+The desktop host tries system CJK fonts across Windows, macOS and Linux, as well as an optional
+`CRAFT_FONTS_DIR` font pack, and skips files that cannot be parsed. No system fonts are redistributed.
+Japanese glyph coverage on desktop depends on installed system fonts or craft-fonts. In the browser,
+`solvecraft-web` asynchronously loads a licensed CJK font (trying self-hosted `./fonts/` first, then
+falling back to a public CDN) and installs it into egui once fetched so that localized text renders
+seamlessly without requiring local system font access.
 
 The current messages support named substitution, not locale-specific plural selection,
 number/date formatting, or right-to-left layout and shaping. Add those capabilities when
