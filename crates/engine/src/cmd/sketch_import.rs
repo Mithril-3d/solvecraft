@@ -16,11 +16,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sketch.insert_dxf", "Insert DXF", insert_dxf)
         .at("SKETCH", "INSERT")
         .icon("dxf")
-        .params("path | text: ASCII DXF (blocks expanded); at?: [x,y] offset, scale?, tolerance?: mm within which ends join (default 0.0001); plane?: (when no sketch is active, a new sketch on it; default XY)"),
+        .params(concat!("path | text: ASCII DXF (blocks expanded); at?: [x,y] offset, scale?, tolerance?: mm within which ends join (default 0.0001); plane?: (when no sketch is active, a new sketch on it; default XY)", created_doc!())),
     CommandSpec::new("sketch.insert_svg", "Insert SVG", insert_svg)
         .at("SKETCH", "INSERT")
         .icon("svg")
-        .params("path | text: SVG; at?: [x,y] offset, scale?, tolerance?: mm within which ends join (default 0.0001); plane?: (when no sketch is active, a new sketch on it; default XY)"),
+        .params(concat!("path | text: SVG; at?: [x,y] offset, scale?, tolerance?: mm within which ends join (default 0.0001); plane?: (when no sketch is active, a new sketch on it; default XY)", created_doc!())),
     CommandSpec::new("sketch.export_dxf", "Save As DXF", export_dxf)
         .noundo()
         .params("sketch?: id|name (default active); path?: file to write (else the DXF text is returned)"),
@@ -34,11 +34,7 @@ fn source_text(p: &Value, cmd: &str) -> Result<String> {
         return Ok(t.to_string());
     }
     let path = str_(p, "path").filter(|x| !x.trim().is_empty() && x.len() < 4096).ok_or_else(|| bad(cmd, "give `path` or `text`"))?;
-    let meta = solvecraft_io::vfs::len(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    if meta as usize > MAX_DRAWING_BYTES {
-        return Err(EngineError::Other(format!("{path}: file too large")));
-    }
-    let bytes = solvecraft_io::vfs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let bytes = solvecraft_io::vfs::read(path, MAX_DRAWING_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -113,7 +109,7 @@ fn insert(s: &mut Session, p: &Value, cmd: &str, svg: bool) -> Result<Value> {
     let text = source_text(p, cmd)?;
     let geom = if svg { solvecraft_io::read_svg(&text) } else { solvecraft_io::read_dxf(&text) }.map_err(|e| bad(cmd, e.to_string()))?;
     if geom.is_empty() {
-        return Err(bad(cmd, "the drawing has no geometry SolveCraft reads"));
+        return Err(bad(cmd, "the drawing has no geometry SolidCraft reads"));
     }
     let k = num(p, "scale").filter(|k| *k > 1e-9 && *k < 1e6).unwrap_or(1.0);
     let off = p.get("at").and_then(vec2).unwrap_or(Vec2::ZERO);

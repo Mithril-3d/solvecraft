@@ -609,7 +609,7 @@ fn layout(w: &W, header: &StepHeader, max_coord: f64) -> String {
     let line = |out: &mut String, data: &str, sect: char, seq: usize| {
         let _ = writeln!(out, "{data:<72}{sect}{seq:>7}");
     };
-    line(&mut out, "SolveCraft IGES export", 'S', 1);
+    line(&mut out, "SolidCraft IGES export", 'S', 1);
     let stamp = {
         let t = header.time_stamp.replace(['-', ':', 'T'], "");
         let t: String = t.chars().filter(char::is_ascii_digit).collect();
@@ -618,10 +618,10 @@ fn layout(w: &W, header: &StepHeader, max_coord: f64) -> String {
     let g = [
         "1H,".to_string(),
         "1H;".to_string(),
-        holl("SolveCraft"),
+        holl("SolidCraft"),
         holl(&header.file_name),
-        holl("SolveCraft"),
-        holl("SolveCraft IGES 5.3"),
+        holl("SolidCraft"),
+        holl("SolidCraft IGES 5.3"),
         "32".into(),
         "38".into(),
         "6".into(),

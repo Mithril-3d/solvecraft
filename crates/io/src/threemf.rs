@@ -211,7 +211,7 @@ pub fn model_xml(objects: &[MeshObject]) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     let _ = writeln!(x, "<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"{CORE_NS}\">");
-    x.push_str(" <metadata name=\"Application\">SolveCraft</metadata>\n <resources>\n");
+    x.push_str(" <metadata name=\"Application\">SolidCraft</metadata>\n <resources>\n");
     let colored = objects.iter().any(|o| o.color.is_some() || o.transparency > 0.0 || !o.looks.is_empty());
     // Base material group id 1 (each object's own colour, then its faces' colours); objects
     // from 2. A see-through colour carries its alpha (#RRGGBBAA).
@@ -528,20 +528,44 @@ fn flatten(m: &Model, id: u32, xf: &Xf, out: &mut MeshObject, stack: &mut Vec<u3
         return bad("components nested too deeply or recursive");
     }
     let o = m.objects.get(&id).ok_or_else(|| IoError::Invalid(format!("3MF: missing object {id}")))?;
-    *total += o.triangles.len();
+    *total = total.saturating_add(o.triangles.len());
     if *total > MAX_ELEMENTS {
         return bad("too many triangles after placing components");
     }
-    let base = u32::try_from(out.positions.len()).map_err(|_| IoError::Invalid("3MF: too many vertices".into()))?;
     let n = o.positions.len();
-    out.positions.extend(o.positions.iter().map(|p| apply(xf, *p) * m.unit));
+    // One object can be placed by thousands of build items and components, and each placement
+    // needs its own transformed copy of the vertices. Copying only the vertices the triangles
+    // reach keeps that cost tied to the triangle budget above; copying the whole vertex array
+    // let an object with many vertices and one triangle multiply into tens of gigabytes.
+    let mut used: Vec<u32> = o.triangles.iter().flatten().copied().collect();
+    used.sort_unstable();
+    used.dedup();
+    if used.last().is_some_and(|v| *v as usize >= n) {
+        return bad(format!("object {id}: triangle refers to a missing vertex"));
+    }
+    let base = u32::try_from(out.positions.len()).map_err(|_| IoError::Invalid("3MF: too many vertices".into()))?;
+    if base as usize + used.len() > u32::MAX as usize {
+        return bad("too many vertices");
+    }
+    for v in &used {
+        let Some(p) = o.positions.get(*v as usize) else {
+            return bad(format!("object {id}: triangle refers to a missing vertex"));
+        };
+        out.positions.push(apply(xf, *p) * m.unit);
+    }
+    // Vertices keep their relative order, so a mesh whose triangles use all of them is
+    // numbered exactly as it was in the file.
+    let at = |v: u32| used.binary_search(&v).ok().map(|i| base + i as u32);
     let flip = det(xf) < 0.0;
     for t in &o.triangles {
-        if t.iter().any(|v| *v as usize >= n) {
-            return bad(format!("object {id}: triangle refers to a missing vertex"));
+        let mut q = [0u32; 3];
+        for (slot, v) in q.iter_mut().zip(t) {
+            let Some(i) = at(*v) else {
+                return bad(format!("object {id}: triangle refers to a missing vertex"));
+            };
+            *slot = i;
         }
-        let t = t.map(|v| v + base);
-        out.triangles.push(if flip { [t[0], t[2], t[1]] } else { t });
+        out.triangles.push(if flip { [q[0], q[2], q[1]] } else { q });
     }
     if out.color.is_none() {
         out.color = o.material.and_then(|(g, i)| m.materials.get(&g).and_then(|g| g.get(i).copied().flatten()));
@@ -733,5 +757,42 @@ mod tests {
             read_3mf(&package("<model/>", Some("<Relationships><Relationship Type=\"x/3dmodel\" Target=\"/missing.model\"/></Relationships>")))
                 .is_err()
         );
+    }
+
+    /// Every placement needs its own transformed copy of the vertices, so an object with many
+    /// vertices and one triangle used to cost its whole vertex array per build item: 100k
+    /// vertices times 10,000 items asked for about 140 GB and the process aborted on the
+    /// allocation, which no panic guard can intercept.
+    #[test]
+    fn many_placements_of_a_big_object_stay_bounded() {
+        let t = std::time::Instant::now();
+        let verts: String = (0..100_000).map(|i| format!("<vertex x=\"{}\" y=\"{}\" z=\"0\"/>", i % 100, i / 100)).collect();
+        let model = format!(
+            "{}<object id=\"1\" type=\"model\"><mesh><vertices>{verts}</vertices>\
+             <triangles><triangle v1=\"0\" v2=\"1\" v3=\"2\"/></triangles></mesh></object></resources><build>{}</build></model>",
+            r#"<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources>"#,
+            "<item objectid=\"1\"/>".repeat(10_000)
+        );
+        let (objs, _) = read_3mf(&package(&model, None)).unwrap();
+        assert_eq!(objs.len(), 10_000);
+        // Only the three vertices the one triangle reaches are copied per placement.
+        assert!(objs.iter().all(|o| o.positions.len() == 3 && o.triangles.len() == 1), "{:?}", objs.first().map(|o| o.positions.len()));
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "took {:?}", t.elapsed());
+    }
+
+    /// Triangles are budgeted across every placement, so fan-out cannot outrun the cap.
+    #[test]
+    fn placements_share_the_triangle_budget() {
+        let verts: String = (0..30_000).map(|i| format!("<vertex x=\"{}\" y=\"0\" z=\"0\"/>", i % 100)).collect();
+        let tris: String = (0..10_000).map(|i| format!("<triangle v1=\"{}\" v2=\"{}\" v3=\"{}\"/>", 3 * i, 3 * i + 1, 3 * i + 2)).collect();
+        let model = format!(
+            "{}<object id=\"1\" type=\"model\"><mesh><vertices>{verts}</vertices><triangles>{tris}</triangles></mesh></object>\
+             </resources><build>{}</build></model>",
+            r#"<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources>"#,
+            "<item objectid=\"1\"/>".repeat(4_000)
+        );
+        let (objs, warnings) = read_3mf(&package(&model, None)).unwrap();
+        assert!(objs.len() < 4_000, "the shared budget must stop the later items: {} built", objs.len());
+        assert!(warnings.iter().any(|w| w.contains("too many triangles")), "{warnings:?}");
     }
 }

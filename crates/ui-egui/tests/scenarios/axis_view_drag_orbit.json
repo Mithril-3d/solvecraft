@@ -1,0 +1,56 @@
+[
+  {
+    "note": "Viewport right-drag orbits freely; holding Shift snaps after accumulated motion."
+  },
+  {
+    "call": "ui.view",
+    "params": {
+      "view": "front"
+    }
+  },
+  {
+    "call": "ui.drag",
+    "params": {
+      "x0": 800,
+      "y0": 500,
+      "x1": 848,
+      "y1": 500,
+      "steps": 8,
+      "button": "right"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 22,
+        "pitch_deg": 0
+      }
+    }
+  },
+  {
+    "call": "ui.view",
+    "params": {
+      "view": "front"
+    }
+  },
+  {
+    "call": "ui.drag",
+    "params": {
+      "x0": 800,
+      "y0": 500,
+      "x1": 920,
+      "y1": 500,
+      "steps": 40,
+      "shift": true,
+      "button": "right"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 45,
+        "pitch_deg": 0
+      }
+    }
+  }
+]

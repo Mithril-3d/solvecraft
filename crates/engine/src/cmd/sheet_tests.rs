@@ -1103,3 +1103,458 @@ fn ring_cut_preserves_retained_island_through_unfold_and_refold() {
     assert!((volume(&mut s) - expected).abs() < 0.2);
     material_probes(&s);
 }
+
+fn retained_depth_check(s: &mut Session, want: f64, z0: f64, z1: f64) {
+    use solvecraft_geom::Vec3;
+    assert!((volume(s) - want).abs() < 1e-6, "{} vs {want}", volume(s));
+    let state = s.model.state();
+    assert_eq!(state.sheets.len(), 1);
+    assert_eq!(state.sheets[0].t, 2.5, "rule stock gauge is preserved");
+    assert!(state.bodies.iter().any(|b| b.body.contains(Vec3::new(25.0, 25.0, (z0 + z1) * 0.5))));
+    assert!(!state.bodies.iter().any(|b| b.body.contains(Vec3::new(25.0, 25.0, z0 - 0.1))));
+    assert!(!state.bodies.iter().any(|b| b.body.contains(Vec3::new(25.0, 25.0, z1 + 0.1))));
+    assert!(!state.bodies.iter().any(|b| b.body.contains(Vec3::new(10.0, 25.0, (z0 + z1) * 0.5))));
+    let bounds = state.bodies[0].mesh().bounds();
+    assert!((bounds.min.z - z0).abs() < 1e-8 && (bounds.max.z - z1).abs() < 1e-8, "{bounds:?}");
+}
+
+fn depth_step_reopen(s: &mut Session, suffix: &str, want: f64, inside: solvecraft_geom::Vec3, outside: solvecraft_geom::Vec3) {
+    let path = std::env::temp_dir().join(format!("solvecraft-depth-intersect-{suffix}-{}.step", std::process::id()));
+    run(s, "file.export", json!({"path":path.to_string_lossy()}));
+    let mut imported = Session::default();
+    run(&mut imported, "doc.open", json!({"path":path.to_string_lossy()}));
+    assert!((volume(&mut imported) - want).abs() < 1e-6);
+    assert!(imported.model.state().bodies.iter().any(|b| b.body.contains(inside)));
+    assert!(!imported.model.state().bodies.iter().any(|b| b.body.contains(outside)));
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The generic sketch importer intentionally drops DXF layers/depth. Reimport only the
+/// material outline at a separately known depth, never pretend all entities reconstruct3D.
+fn dxf_outline_only(text: &str) -> String {
+    let lines: Vec<_> = text.lines().collect();
+    let pairs: Vec<_> = lines.as_chunks::<2>().0.iter().filter_map(|p| Some((p.first()?.trim(), *p.get(1)?))).collect();
+    let mut out = String::from("0\nSECTION\n2\nENTITIES\n");
+    let mut start = 0;
+    for end in 1..=pairs.len() {
+        if end == pairs.len() || pairs.get(end).is_some_and(|p| p.0 == "0") {
+            let entity = &pairs[start..end];
+            if entity.first().is_some_and(|p| matches!(p.1, "LINE" | "ARC" | "CIRCLE")) && entity.iter().any(|p| p.0 == "8" && p.1 == "OUTLINE") {
+                for (code, value) in entity {
+                    out.push_str(&format!("{code}\n{value}\n"));
+                }
+            }
+            start = end;
+        }
+    }
+    out.push_str("0\nENDSEC\n0\nEOF\n");
+    out
+}
+
+#[test]
+fn partial_depth_intersect_retains_bottom_top_and_middle_material_through_history_and_exports() {
+    use solvecraft_geom::Vec3;
+    for (offset, z0, z1, layers) in [
+        (0.0, 0.0, 1.0, vec![("top", 1.0, 2.5)]),
+        (1.5, 1.5, 2.5, vec![("bottom", 0.0, 1.5)]),
+        (0.5, 0.5, 1.5, vec![("bottom", 0.0, 0.5), ("top", 1.5, 2.5)]),
+    ] {
+        let mut s = Session::default();
+        base(&mut s, 100.0, 60.0);
+        rectangle_tool(&mut s, "RetainDepth", [20.0, 20.0], [30.0, 30.0]);
+        run(&mut s, "solid.extrude", json!({"sketch":"RetainDepth","distance":1,"start_offset":offset,"operation":"intersect","name":"RetainSlab"}));
+        retained_depth_check(&mut s, 100.0, z0, z1);
+        let exported = flat(&mut s);
+        assert_eq!(exported["thickness"], 2.5);
+        assert_eq!(exported["pockets"].as_array().unwrap().len(), layers.len());
+        let dxf = run(&mut s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap().to_string();
+        for (side, a, b) in &layers {
+            assert!(
+                exported["pockets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["side"] == *side && p["z0_mm"] == *a && p["z1_mm"] == *b && p["depth_mm"] == b - a)
+            );
+            assert!(dxf.contains(&format!("POCKET_{}_Z{a:.6}_TO_{b:.6}_MM", side.to_uppercase())));
+        }
+        let outline = dxf_outline_only(&dxf);
+        assert_eq!(solvecraft_io::read_dxf(&outline).unwrap().len(), 4);
+        let mut outline_import = Session::default();
+        run(&mut outline_import, "sketch.insert_dxf", json!({"text":outline,"name":"Outline"}));
+        run(&mut outline_import, "sketch.finish", json!({}));
+        run(&mut outline_import, "solid.extrude", json!({"distance":1}));
+        assert!((volume(&mut outline_import) - 100.0).abs() < 1e-6);
+        run(&mut s, "edit.undo", json!({}));
+        assert!((volume(&mut s) - 15000.0).abs() < 1e-6);
+        run(&mut s, "edit.redo", json!({}));
+        for command in ["sheet.unfold", "sheet.refold"] {
+            run(&mut s, command, json!({}));
+            retained_depth_check(&mut s, 100.0, z0, z1);
+            assert_eq!(flat(&mut s)["pockets"], exported["pockets"]);
+        }
+        let mut reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        retained_depth_check(&mut reopened, 100.0, z0, z1);
+        depth_step_reopen(&mut s, &format!("offset{offset}"), 100.0, Vec3::new(25.0, 25.0, (z0 + z1) * 0.5), Vec3::new(25.0, 25.0, z1 + 0.1));
+    }
+}
+
+#[test]
+fn partial_depth_intersect_preserves_prior_pockets_and_actual_interval_intersections() {
+    use solvecraft_geom::Vec3;
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "OldPocket", [20.0, 20.0], [25.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch":"OldPocket","distance":1,"operation":"cut"}));
+    rectangle_tool(&mut s, "RetainDepth", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch":"RetainDepth","distance":1,"start_offset":0.5,"operation":"intersect"}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({}));
+        }
+        assert!((volume(&mut s) - 75.0).abs() < 1e-6);
+        let state = s.model.state();
+        let body = &state.bodies[0].body;
+        assert!(!body.contains(Vec3::new(22.0, 25.0, 0.75)));
+        assert!(body.contains(Vec3::new(22.0, 25.0, 1.25)));
+        assert!(body.contains(Vec3::new(27.0, 25.0, 0.75)));
+        assert!(!body.contains(Vec3::new(27.0, 25.0, 0.25)));
+    }
+    let records = s.model.state().sheets[0].pockets.clone();
+    run(&mut s, "solid.extrude", json!({"sketch":"RetainDepth","distance":1.5,"start_offset":0.25,"operation":"intersect"}));
+    assert!((volume(&mut s) - 75.0).abs() < 1e-6);
+    assert_eq!(s.model.state().sheets[0].pockets, records, "no-change leaves replay work unchanged");
+    run(&mut s, "solid.extrude", json!({"sketch":"RetainDepth","distance":0.25,"start_offset":1.0,"operation":"intersect"}));
+    assert!((volume(&mut s) - 25.0).abs() < 1e-6);
+    run(&mut s, "sheet.unfold", json!({}));
+    assert!((volume(&mut s) - 25.0).abs() < 1e-6);
+    let mut cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert!((volume(&mut cold) - 25.0).abs() < 1e-6);
+    depth_step_reopen(&mut s, "prior", 25.0, Vec3::new(22.0, 25.0, 1.125), Vec3::new(22.0, 25.0, 0.75));
+}
+
+#[test]
+fn partial_depth_intersect_keeps_disconnected_tool_islands_and_annular_curves() {
+    use solvecraft_geom::Vec3;
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "Islands", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "sketch.edit", json!({"sketch":"Islands"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0":[60,20],"p1":[70,30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":"Islands","distance":1,"operation":"intersect"}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({}));
+        }
+        assert!((volume(&mut s) - 200.0).abs() < 1e-6);
+        assert_eq!(s.model.state().sheets[0].flat_regions().unwrap().len(), 2);
+        for x in [25.0, 65.0] {
+            assert!(s.model.state().bodies[0].body.contains(Vec3::new(x, 25.0, 0.5)));
+        }
+        assert!(!s.model.state().bodies[0].body.contains(Vec3::new(45.0, 25.0, 0.5)));
+    }
+    depth_step_reopen(&mut s, "islands", 200.0, Vec3::new(65.0, 25.0, 0.5), Vec3::new(45.0, 25.0, 0.5));
+    let mut ring = Session::default();
+    base(&mut ring, 100.0, 60.0);
+    run(&mut ring, "sketch.create", json!({"plane":"XY","name":"Ring"}));
+    for radius in [10.0, 5.0] {
+        run(&mut ring, "sketch.circle.center", json!({"center":[50,30],"radius":radius}));
+    }
+    run(&mut ring, "sketch.finish", json!({}));
+    run(&mut ring, "solid.extrude", json!({"sketch":"Ring","profiles":[{"point":[57,30]}],"distance":1,"operation":"intersect"}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut ring, command, json!({}));
+        }
+        let state = ring.model.state();
+        let area: f64 = state.sheets[0].flat_regions().unwrap().iter().map(|r| r.area()).sum();
+        assert!((area - 75.0 * PI).abs() < 1e-8);
+        assert!((volume(&mut ring) - 75.0 * PI).abs() < 0.1);
+        assert!(state.bodies[0].body.contains(Vec3::new(57.0, 30.0, 0.5)));
+        assert!(!state.bodies[0].body.contains(Vec3::new(50.0, 30.0, 0.5)));
+        assert!(!state.bodies[0].body.contains(Vec3::new(57.0, 30.0, 1.5)));
+    }
+    let dxf = run(&mut ring, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap().to_string();
+    assert!(dxf.contains("POCKET_TOP_Z1.000000_TO_2.500000_MM"));
+    assert_eq!(solvecraft_io::read_dxf(&dxf_outline_only(&dxf)).unwrap().len(), 2);
+}
+
+#[test]
+fn partial_depth_intersect_deletes_material_already_removed_by_a_pocket_atomically() {
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "Removed", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch":"Removed","distance":1,"operation":"cut"}));
+    run(&mut s, "solid.extrude", json!({"sketch":"Removed","distance":1,"operation":"intersect"}));
+    assert!(s.model.state().bodies.is_empty());
+    assert!(s.model.state().sheets.is_empty());
+    run(&mut s, "edit.undo", json!({}));
+    assert!((volume(&mut s) - 14900.0).abs() < 1e-6);
+    run(&mut s, "edit.redo", json!({}));
+    assert!(s.model.state().bodies.is_empty());
+}
+
+#[test]
+fn partial_depth_intersect_flipped_tool_and_transferred_sheet_keep_depth_side_and_world_pose() {
+    use solvecraft_geom::Vec3;
+    let mut flipped = Session::default();
+    base(&mut flipped, 100.0, 60.0);
+    run(&mut flipped, "sketch.create", json!({"name":"FlippedTool","plane":{"origin":[0,0,2.5],"x_dir":[1,0,0],"y_dir":[0,-1,0]}}));
+    run(&mut flipped, "sketch.rectangle.two_point", json!({"p0":[20,-30],"p1":[30,-20]}));
+    run(&mut flipped, "sketch.finish", json!({}));
+    run(&mut flipped, "solid.extrude", json!({"sketch":"FlippedTool","distance":1,"operation":"intersect"}));
+    retained_depth_check(&mut flipped, 100.0, 1.5, 2.5);
+    assert_eq!(flat(&mut flipped)["pockets"][0]["side"], "bottom");
+    assert_eq!(flat(&mut flipped)["pockets"][0]["depth_mm"], 1.5);
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "RetainDepth", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch":"RetainDepth","distance":1,"start_offset":0.5,"operation":"intersect","name":"RetainSlab"}));
+    let before = s.world_state().bodies[0].mesh().bounds();
+    let name = s.model.state().sheets[0].body.clone();
+    let destination = run(&mut s, "component.create", json!({"name":"Destination","parent":0}));
+    let owner = destination["component"].as_u64().unwrap();
+    let occurrence = destination["occurrence"].as_u64().unwrap();
+    run(&mut s, "occurrence.move", json!({"occurrence":occurrence,"translate":[30,20,10],"axis":[1,0,0],"angle":"90 deg","capture":true}));
+    run(&mut s, "component.move_bodies", json!({"component":owner,"bodies":[name]}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({}));
+        }
+        let state = s.model.state();
+        let sh = &state.sheets[0];
+        assert_eq!(sh.t, 2.5);
+        assert!(sh.frame.origin.dist(Vec3::new(-30.0, -10.0, 20.0)) < 1e-8);
+        assert!(sh.frame.normal().dist(Vec3::Y) < 1e-8);
+        assert_eq!(sh.pockets.len(), 2);
+        assert_eq!(state.body(&name).unwrap().component, owner);
+        assert!(state.body(&name).unwrap().transferred);
+        let world = s.world_state();
+        let body = &world.body(&name).unwrap().body;
+        assert!(body.contains(Vec3::new(25.0, 25.0, 1.0)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 0.25)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 2.0)));
+        let bounds = world.body(&name).unwrap().mesh().bounds();
+        assert!(before.min.dist(bounds.min) < 1e-8 && before.max.dist(bounds.max) < 1e-8);
+        assert!((solvecraft_kernel::measure(body).unwrap().volume - 100.0).abs() < 1e-6);
+    }
+    let mut reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    let reopened_world = reopened.world_state();
+    let body = &reopened_world.body(&name).unwrap().body;
+    assert!(body.contains(Vec3::new(25.0, 25.0, 1.0)));
+    assert!((solvecraft_kernel::measure(body).unwrap().volume - 100.0).abs() < 1e-6);
+    run(&mut reopened, "timeline.edit", json!({"feature":"RetainSlab","set":{"extent":{"distance":"1.5"}}}));
+    let world = reopened.world_state();
+    let body = &world.body(&name).unwrap().body;
+    assert!((solvecraft_kernel::measure(body).unwrap().volume - 150.0).abs() < 1e-6);
+    assert!(body.contains(Vec3::new(25.0, 25.0, 1.75)));
+    assert!(!body.contains(Vec3::new(25.0, 25.0, 2.25)));
+}
+
+#[test]
+fn partial_depth_intersect_full_gauge_in_rotated_frames_does_not_invent_pockets() {
+    use solvecraft_geom::Vec3;
+    for (angle, translate) in [(37.0, [30.0, 20.0, 10.0]), (121.0, [12345.678, 98765.432, 4321.123])] {
+        let mut s = Session::default();
+        base(&mut s, 100.0, 60.0);
+        let name = s.model.state().sheets[0].body.clone();
+        let destination = run(&mut s, "component.create", json!({"name":"Destination","parent":0}));
+        let owner = destination["component"].as_u64().unwrap();
+        run(
+            &mut s,
+            "occurrence.move",
+            json!({"occurrence":destination["occurrence"],"translate":translate,"axis":[1,2,3],"angle":format!("{angle} deg"),"capture":true}),
+        );
+        run(&mut s, "component.move_bodies", json!({"component":owner,"bodies":[name]}));
+        run(&mut s, "component.activate", json!({"component":owner}));
+        run(&mut s, "sketch.create", json!({"name":"WorldTool","plane":{"origin":[0,0,0],"x_dir":[1,0,0],"y_dir":[0,1,0]}}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0":[20,20],"p1":[30,30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        let mut tool_session = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        run(&mut tool_session, "solid.extrude", json!({"sketch":"WorldTool","distance":2.5,"body_name":"CapWitness"}));
+        let witness_state = tool_session.model.state();
+        let witness = &witness_state.body("CapWitness").unwrap().body;
+        let tool_plane = witness_state.sketches.last().unwrap().plane;
+        let sources = witness.face_sources().unwrap();
+        assert_eq!(sources.len(), witness.face_count());
+        let mut cap_count = 0;
+        for (index, source) in sources.iter().enumerate() {
+            if let Some(solvecraft_kernel::FaceSource::CertifiedExtrudeCap { high, plane, .. }) = source {
+                cap_count += 1;
+                let current = witness.planar_face(index).unwrap();
+                assert!(current.normal().cross(tool_plane.normal()).len() < 1e-10);
+                assert!((current.origin - plane.origin).dot(tool_plane.normal()).abs() < 1e-8);
+                assert!(((plane.origin - tool_plane.origin).dot(tool_plane.normal()) - if *high { 2.5 } else { 0.0 }).abs() < 1e-8);
+            }
+        }
+        assert_eq!(cap_count, 2);
+        run(&mut s, "solid.extrude", json!({"sketch":"WorldTool","distance":2.5,"operation":"intersect","name":"PostTransferRetain"}));
+        for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+            if let Some(command) = command {
+                run(&mut s, command, json!({}));
+            }
+            assert!(s.model.state().sheets[0].pockets.is_empty(), "full gauge must not acquire roundoff-depth pockets");
+            let world = s.world_state();
+            let body = &world.body(&name).unwrap().body;
+            assert!((solvecraft_kernel::measure(body).unwrap().volume - 250.0).abs() < 1e-5);
+            assert!(body.contains(Vec3::new(25.0, 25.0, 0.1)));
+            assert!(body.contains(Vec3::new(25.0, 25.0, 2.4)));
+            assert!(!body.contains(Vec3::new(10.0, 25.0, 1.0)));
+        }
+        let mut cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!(cold.model.state().sheets[0].pockets.is_empty());
+        assert!(flat(&mut cold)["pockets"].as_array().unwrap().is_empty());
+        run(&mut s, "timeline.edit", json!({"feature":"PostTransferRetain","set":{"extent":{"distance":"1","start_offset":"0.5"}}}));
+        for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+            if let Some(command) = command {
+                run(&mut s, command, json!({}));
+            }
+            assert_eq!(s.model.state().sheets[0].pockets.len(), 2);
+            let world = s.world_state();
+            let body = &world.body(&name).unwrap().body;
+            let measured = solvecraft_kernel::measure(body).unwrap().volume;
+            assert!((measured - 100.0).abs() < 1e-5, "retained volume {measured}");
+            assert!(body.contains(Vec3::new(25.0, 25.0, 1.0)));
+            assert!(!body.contains(Vec3::new(25.0, 25.0, 0.1)));
+            assert!(!body.contains(Vec3::new(25.0, 25.0, 2.4)));
+        }
+        let cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        let world = cold.world_state();
+        let body = &world.body(&name).unwrap().body;
+        assert!((solvecraft_kernel::measure(body).unwrap().volume - 100.0).abs() < 1e-5);
+        assert!(body.contains(Vec3::new(25.0, 25.0, 1.0)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 0.1)));
+    }
+}
+
+#[test]
+fn partial_depth_intersect_planar_to_object_retains_current_target_depth() {
+    use solvecraft_geom::Vec3;
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    let name = s.model.state().sheets[0].body.clone();
+    run(&mut s, "solid.box", json!({"corner":[200,0,1.5],"length":10,"width":10,"height":1,"body_name":"Roof"}));
+    rectangle_tool(&mut s, "Tool", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch":"Tool","to":[205,5,1.5],"start_offset":0.5,"operation":"intersect","participants":[name]}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({"body":name}));
+        }
+        let state = s.model.state();
+        let body = &state.body(&name).unwrap().body;
+        assert!((solvecraft_kernel::measure(body).unwrap().volume - 100.0).abs() < 1e-6);
+        assert!(body.contains(Vec3::new(25.0, 25.0, 1.0)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 0.1)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 2.0)));
+        assert_eq!(state.sheets[0].pockets.len(), 2);
+        assert!((solvecraft_kernel::measure(&state.body("Roof").unwrap().body).unwrap().volume - 100.0).abs() < 1e-6);
+    }
+    let cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert!((solvecraft_kernel::measure(&cold.model.state().body(&name).unwrap().body).unwrap().volume - 100.0).abs() < 1e-6);
+}
+
+#[test]
+fn partial_depth_intersect_curved_to_object_refuses_unrepresentable_depth_atomically() {
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    let name = s.model.state().sheets[0].body.clone();
+    run(&mut s, "solid.cylinder", json!({"base":[25,20,12],"axis":[0,1,0],"radius":11,"height":10,"body_name":"CurvedRoof"}));
+    rectangle_tool(&mut s, "Tool", [24.0, 23.0], [26.0, 27.0]);
+    let before = s.doc.to_json();
+    let error =
+        s.execute("solid.extrude", &json!({"sketch":"Tool","to":[36,25,12],"operation":"intersect","participants":[name]})).unwrap_err().to_string();
+    assert!(error.contains("sheet machining"), "{error}");
+    assert_eq!(s.doc.to_json(), before);
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({"body":name}));
+        }
+        let state = s.model.state();
+        assert!((solvecraft_kernel::measure(&state.body(&name).unwrap().body).unwrap().volume - 15000.0).abs() < 1e-6);
+        assert!(state.sheets[0].pockets.is_empty());
+    }
+}
+
+#[test]
+fn partial_depth_intersect_curved_to_object_preserves_current_trimmed_cap_footprint() {
+    use solvecraft_geom::Vec3;
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    let name = s.model.state().sheets[0].body.clone();
+    run(&mut s, "solid.cylinder", json!({"base":[25,25,0],"axis":[0,0,1],"radius":2,"height":20,"body_name":"CurvedRoof"}));
+    run(&mut s, "solid.box", json!({"corner":[19,19,1],"length":12,"width":12,"height":1,"body_name":"StopPlate"}));
+    run(&mut s, "solid.combine", json!({"target":"CurvedRoof","tools":["StopPlate"],"operation":"join"}));
+    rectangle_tool(&mut s, "Tool", [20.0, 20.0], [30.0, 30.0]);
+    let mut tool_session = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    run(&mut tool_session, "solid.extrude", json!({"sketch":"Tool","to":[27,25,10],"body_name":"TrimWitness"}));
+    let ts = tool_session.model.state();
+    let witness = &ts.body("TrimWitness").unwrap().body;
+    assert!((solvecraft_kernel::measure(witness).unwrap().volume - (100.0 - 4.0 * std::f64::consts::PI)).abs() < 0.01);
+    assert!(witness.contains(Vec3::new(21.0, 21.0, 0.5)));
+    assert!(!witness.contains(Vec3::new(25.0, 25.0, 0.5)));
+    run(&mut s, "solid.extrude", json!({"sketch":"Tool","to":[27,25,10],"operation":"intersect","participants":[name]}));
+    for command in [None, Some("sheet.unfold"), Some("sheet.refold")] {
+        if let Some(command) = command {
+            run(&mut s, command, json!({"body":name}));
+        }
+        let state = s.model.state();
+        let body = &state.body(&name).unwrap().body;
+        let measured = solvecraft_kernel::measure(body).unwrap().volume;
+        assert!((measured - (100.0 - 4.0 * std::f64::consts::PI)).abs() < 0.01);
+        let area: f64 = state.sheets[0].flat_regions().unwrap().iter().map(|r| r.area()).sum();
+        assert!((area - (100.0 - 4.0 * std::f64::consts::PI)).abs() < 1e-8);
+        assert!(body.contains(Vec3::new(21.0, 21.0, 0.5)));
+        assert!(!body.contains(Vec3::new(25.0, 25.0, 0.5)));
+        assert!(!body.contains(Vec3::new(21.0, 21.0, 1.5)));
+    }
+    let cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert!(!cold.model.state().body(&name).unwrap().body.contains(Vec3::new(25.0, 25.0, 0.5)));
+    let dxf = run(&mut s, "sheet.export_dxf", json!({"body":name}))["dxf"].as_str().unwrap().to_string();
+    assert!(dxf.contains("POCKET_TOP_Z1.000000_TO_2.500000_MM"));
+    let outline = dxf_outline_only(&dxf);
+    assert_eq!(solvecraft_io::read_dxf(&outline).unwrap().len(), 5);
+    let mut outline_import = Session::default();
+    run(&mut outline_import, "sketch.insert_dxf", json!({"text":outline,"name":"Outline"}));
+    run(&mut outline_import, "sketch.finish", json!({}));
+    run(&mut outline_import, "solid.extrude", json!({"distance":1,"profiles":[{"point":[21,21]}]}));
+    assert!((volume(&mut outline_import) - (100.0 - 4.0 * std::f64::consts::PI)).abs() < 0.01);
+    assert!(!outline_import.model.state().bodies[0].body.contains(Vec3::new(25.0, 25.0, 0.5)));
+    let path = std::env::temp_dir().join(format!("solvecraft-current-trim-cap-{}.step", std::process::id()));
+    run(&mut s, "file.export", json!({"path":path.to_string_lossy(),"bodies":[name]}));
+    let mut imported = Session::default();
+    run(&mut imported, "doc.open", json!({"path":path.to_string_lossy()}));
+    assert!((volume(&mut imported) - (100.0 - 4.0 * std::f64::consts::PI)).abs() < 0.01);
+    assert!(!imported.model.state().bodies[0].body.contains(Vec3::new(25.0, 25.0, 0.5)));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn partial_depth_intersect_sub_extrusion_resolution_layers_refuse_atomically() {
+    for (distance, offset) in [(2.5 - 1e-8, 1e-8), (2.5 - 1e-8, 0.0), (1e-8, 0.0)] {
+        let mut s = Session::default();
+        base(&mut s, 100.0, 60.0);
+        let name = s.model.state().sheets[0].body.clone();
+        let destination = run(&mut s, "component.create", json!({"name":"Far","parent":0}));
+        let owner = destination["component"].as_u64().unwrap();
+        run(
+            &mut s,
+            "occurrence.move",
+            json!({"occurrence":destination["occurrence"],"translate":[12345.678,98765.432,4321.123],"axis":[1,2,3],"angle":"121 deg","capture":true}),
+        );
+        run(&mut s, "component.move_bodies", json!({"component":owner,"bodies":[name]}));
+        run(&mut s, "component.activate", json!({"component":owner}));
+        run(&mut s, "sketch.create", json!({"name":"Tool","plane":{"origin":[0,0,0],"x_dir":[1,0,0],"y_dir":[0,1,0]}}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0":[20,20],"p1":[30,30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        let before = s.doc.to_json();
+        let error = s
+            .execute("solid.extrude", &json!({"sketch":"Tool","distance":distance,"start_offset":offset,"operation":"intersect"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resolution") || error.contains("distance is zero") || error.contains("sheet machining"), "{error}");
+        assert_eq!(s.doc.to_json(), before);
+        assert!(s.model.state().sheets[0].pockets.is_empty());
+        assert!((solvecraft_kernel::measure(&s.world_state().body(&name).unwrap().body).unwrap().volume - 15000.0).abs() < 1e-5);
+    }
+}

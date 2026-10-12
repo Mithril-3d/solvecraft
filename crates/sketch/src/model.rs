@@ -4,6 +4,8 @@ use solvecraft_geom::{Seg2, Vec2};
 /// Hard caps that keep hostile input from exhausting memory or time.
 pub const MAX_POINTS: usize = 20_000;
 pub const MAX_CONSTRAINTS: usize = 40_000;
+/// Curves need points, so this follows the point cap.
+pub const MAX_CURVES: usize = MAX_POINTS;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SketchError {
@@ -385,7 +387,7 @@ impl ConstraintKind {
             LinearDiameter { p, l, .. } => (vec![p], vec![l]),
         }
     }
-    fn remap(&mut self, pmap: &dyn Fn(usize) -> Option<usize>, cmap: &dyn Fn(usize) -> Option<usize>) -> bool {
+    pub(crate) fn remap(&mut self, pmap: &dyn Fn(usize) -> Option<usize>, cmap: &dyn Fn(usize) -> Option<usize>) -> bool {
         use ConstraintKind::*;
         let mut ok = true;
         let mut fp = |i: &mut usize| match pmap(*i) {
@@ -540,16 +542,50 @@ impl Sketch {
     }
 
     /// A new unused id with the given prefix (`l` → `l3`).
-    pub fn fresh(&mut self, prefix: &str) -> String {
+    pub fn fresh(&mut self, prefix: &str) -> Result<String> {
         let mut n = self.counters.get(prefix).copied().unwrap_or(0);
-        loop {
-            n += 1;
+        n = n.checked_add(1).ok_or_else(|| SketchError::Invalid("sketch identity counter exhausted".into()))?;
+        let first = format!("{prefix}{n}");
+        if !self.id_taken(&first) {
+            self.counters.insert(prefix.to_string(), n);
+            return Ok(first);
+        }
+        let budget = self
+            .points
+            .len()
+            .saturating_add(self.curves.len())
+            .saturating_add(self.constraints.len())
+            .saturating_add(self.links.len())
+            .saturating_add(self.wires.len())
+            .saturating_add(
+                self.offsets.iter().filter_map(|r| r.topology.as_ref()).fold(0usize, |n, r| n.saturating_add(r.roles.len()).saturating_add(1)),
+            )
+            .saturating_add(1);
+        // A damaged counter may start before a long occupied prefix. Index
+        // reservations once so probing that prefix cannot rescan all geometry
+        // for each candidate ID.
+        let mut taken: std::collections::BTreeSet<&str> = self
+            .points
+            .iter()
+            .map(|p| p.id.as_str())
+            .chain(self.curves.iter().map(|c| c.id.as_str()))
+            .chain(self.constraints.iter().map(|c| c.id.as_str()))
+            .chain(self.links.iter().map(|l| l.id.as_str()))
+            .chain(self.wires.iter().map(|w| w.id.as_str()))
+            .collect();
+        for topology in self.offsets.iter().filter_map(|r| r.topology.as_ref()) {
+            taken.insert(topology.id.as_str());
+            taken.extend(topology.roles.iter().map(|r| r.output.as_str()));
+        }
+        for _ in 0..budget.saturating_sub(1) {
+            n = n.checked_add(1).ok_or_else(|| SketchError::Invalid("sketch identity counter exhausted".into()))?;
             let id = format!("{prefix}{n}");
-            if !self.id_taken(&id) {
+            if !taken.contains(id.as_str()) {
                 self.counters.insert(prefix.to_string(), n);
-                return id;
+                return Ok(id);
             }
         }
+        Err(SketchError::TooLarge)
     }
     pub(crate) fn id_taken(&self, id: &str) -> bool {
         self.points.iter().any(|p| p.id == id)
@@ -557,6 +593,7 @@ impl Sketch {
             || self.constraints.iter().any(|c| c.id == id)
             || self.links.iter().any(|l| l.id == id)
             || self.wires.iter().any(|w| w.id == id)
+            || self.offsets.iter().filter_map(|r| r.topology.as_ref()).any(|r| r.id == id || r.roles.iter().any(|role| role.output == id))
     }
 
     pub fn point_index(&self, id: &str) -> Option<usize> {
@@ -583,7 +620,7 @@ impl Sketch {
             Some(i) if self.id_taken(i) => return Err(SketchError::Duplicate(i.into())),
             Some("") => return Err(SketchError::Invalid("empty id".into())),
             Some(i) => i.to_string(),
-            None => self.fresh("p"),
+            None => self.fresh("p")?,
         };
         self.points.push(SPoint { id, pos: p, fixed: false, link: None });
         Ok(self.points.len() - 1)
@@ -594,7 +631,7 @@ impl Sketch {
             Some(i) if self.id_taken(i) => Err(SketchError::Duplicate(i.into())),
             Some("") => Err(SketchError::Invalid("empty id".into())),
             Some(i) => Ok(i.into()),
-            None => Ok(self.fresh(prefix)),
+            None => self.fresh(prefix),
         }
     }
 
@@ -701,7 +738,7 @@ impl Sketch {
             return Err(SketchError::TooLarge);
         }
         self.validate(&kind)?;
-        let id = self.fresh("k");
+        let id = self.fresh("k")?;
         self.constraints.push(Constraint { id: id.clone(), kind, param, driven: false, text: None });
         Ok(id)
     }
@@ -901,36 +938,68 @@ impl Sketch {
     /// Each with the extension segments from the corner to the nearest end of those curves, for
     /// drawing.
     pub fn virtual_corners(&self) -> Vec<(usize, Vec<(Vec2, Vec2)>)> {
-        let mut out = Vec::new();
-        for (i, p) in self.points.iter().enumerate().skip(1) {
-            if self.point_used_by_curve(i) {
+        const MAX_POINT_REFERENCES: usize = 1_000_000;
+        if self.points.len() > MAX_POINTS || self.constraints.len() > MAX_CONSTRAINTS || self.curves.len() > MAX_POINT_REFERENCES {
+            return Vec::new();
+        }
+        let mut remaining = MAX_POINT_REFERENCES;
+        for curve in &self.curves {
+            let count = match &curve.kind {
+                CurveKind::Line { .. } | CurveKind::Ellipse { .. } => 2,
+                CurveKind::Circle { .. } => 1,
+                CurveKind::Arc { .. } | CurveKind::Conic { .. } => 3,
+                CurveKind::Spline { pts, .. } => pts.len(),
+            };
+            let Some(left) = remaining.checked_sub(count) else { return Vec::new() };
+            remaining = left;
+        }
+        // Index curve usage once, including centres and spline interior points.
+        let mut used = vec![false; self.points.len()];
+        for curve in &self.curves {
+            for point in curve.kind.point_ids() {
+                if let Some(slot) = used.get_mut(point) {
+                    *slot = true;
+                }
+            }
+        }
+        let mut incidence = vec![Vec::new(); self.points.len()];
+        let mut seen = std::collections::HashSet::new();
+        for constraint in &self.constraints {
+            let ConstraintKind::PointOnCurve { p, c } = constraint.kind else { continue };
+            if p == 0 || used.get(p).copied() != Some(false) || !self.point(p).is_some_and(|p| p.is_finite()) {
                 continue;
             }
-            let on: Vec<usize> = self
-                .constraints
-                .iter()
-                .filter_map(|c| match c.kind {
-                    ConstraintKind::PointOnCurve { p, c } if p == i => Some(c),
-                    _ => None,
-                })
-                .filter(|c| matches!(self.curves.get(*c).map(|c| &c.kind), Some(CurveKind::Line { .. } | CurveKind::Arc { .. })))
-                .collect();
+            let Some(curve) = self.curves.get(c) else { continue };
+            if !matches!(curve.kind, CurveKind::Line { .. } | CurveKind::Arc { .. })
+                || curve.kind.point_ids().iter().any(|i| !self.point(*i).is_some_and(|p| p.is_finite()))
+            {
+                continue;
+            }
+            if seen.insert((p, c))
+                && let Some(on) = incidence.get_mut(p)
+            {
+                on.push(c);
+            }
+        }
+        let mut out = Vec::new();
+        for (i, on) in incidence.into_iter().enumerate().skip(1) {
             if on.len() < 2 {
                 continue;
             }
+            let Some(p) = self.point(i) else { continue };
             let mut ext = Vec::new();
             for c in on {
                 let Some((a, b)) = self.curves.get(c).and_then(|c| c.kind.ends()) else { continue };
                 let (Some(pa), Some(pb)) = (self.point(a), self.point(b)) else { continue };
-                let near = if p.pos.dist(pa) <= p.pos.dist(pb) { pa } else { pb };
+                let near = if p.dist(pa) <= p.dist(pb) { pa } else { pb };
                 // A line only needs one when the corner is beyond its ends.
                 let inside = matches!(self.curves.get(c).map(|c| &c.kind), Some(CurveKind::Line { .. })) && {
                     let d = pb - pa;
-                    let t = (p.pos - pa).dot(d) / d.dot(d).max(1e-300);
+                    let t = (p - pa).dot(d) / d.dot(d).max(1e-300);
                     (0.0..=1.0).contains(&t)
                 };
-                if !inside && p.pos.dist(near) > 1e-9 {
-                    ext.push((p.pos, near));
+                if !inside && p.dist(near) > 1e-9 {
+                    ext.push((p, near));
                 }
             }
             out.push((i, ext));

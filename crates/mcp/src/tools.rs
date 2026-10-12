@@ -58,7 +58,10 @@ pub fn tool_definitions() -> Vec<Value> {
              {center: [20,15], radius: 5}; sketch.dimension {entities: [curve id], value: \"width\"}; sketch.finish {}; solid.extrude \
              {distance: 20, operation: \"cut\"}; solid.fillet {edges: [[0,0,10]], radius: 3}; solid.box {length, \
              width, height}. Lengths are mm; expressions may use parameters and units (\"width / 2\", \"30 deg\"). Returns \
-             the command's result; failures leave the design unchanged.",
+             the command's result; failures leave the design unchanged. Sketch commands that add geometry return \
+             created: {points, curves, constraints, dimensions}: the ids of what they added, stable and not reused \
+             after a delete (undo rewinds the counters with the design), usable right away \
+             in sketch.dimension, sketch.constraint.* and sketch.delete.",
             obj(
                 json!({
                     "command": string("Command id (see list_commands)"),
@@ -148,7 +151,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "Look at the design",
             "Render the design and return it as a PNG image. Headless: a CPU render of the model, fitted to the view. \
              Connected to the app: a screenshot of the window (source \"window\", the default) or a render of the model \
-             with the app's camera (source \"model\"). `view` first turns the camera to a standard view.",
+             with the app's camera (source \"model\"). Both show an active section (inspect.section) with its cut face \
+             capped. `view` first turns the camera to a standard view.",
             obj(
                 json!({
                     "view": {"type": "string", "enum": VIEWS, "description": "Standard view (default: keep the current one; headless starts at iso)"},
@@ -465,7 +469,7 @@ fn screenshot(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
 fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Value), String> {
     if let Some(v) = str_arg(a, "view") {
         b.call("ui.view", json!({"view": v}))?;
-        // Turning to a standard view also frames the model (like a view cube click).
+        // Turning to a standard view also frames the model (like a axis view click).
         if v != "fit" && v != "home" {
             b.call("ui.view", json!({"view": "fit"}))?;
         }

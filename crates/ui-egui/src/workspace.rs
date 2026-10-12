@@ -100,6 +100,7 @@ pub fn panels(tab: &str) -> Option<&'static [&'static str]> {
 /// to the registry.
 pub fn layout<'a>(tab: &str, panel: &str, specs: &[&'a CommandSpec]) -> Option<(Vec<&'a CommandSpec>, usize)> {
     let (ids, promoted, own_tab): (&[&str], usize, &str) = match (tab, panel) {
+        ("SOLID", "CONFIGURE") => (&["parameters.change", "config.table"], 2, tab),
         ("SOLID" | "SHEET METAL" | "PLASTIC", "ASSEMBLE") => (ASSEMBLE, 3, tab),
         ("SHEET METAL", "CREATE") => (SHEET_CREATE, 3, tab),
         ("SHEET METAL", "MODIFY") => (SHEET_MODIFY, 2, tab),
@@ -144,6 +145,38 @@ mod tests {
     fn ids(tab: &str, panel: &str) -> Vec<&'static str> {
         let specs = solvecraft_engine::command_specs();
         layout(tab, panel, &specs).map(|(v, _)| v.iter().map(|c| c.id).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn configure_header_clicks_open_parameters_and_configurations_separately() {
+        use serde_json::json;
+        let mut h = crate::scenario::Harness::new();
+        let commands = ids("SOLID", "CONFIGURE");
+        assert_eq!(&commands[..2], &["parameters.change", "config.table"]);
+        assert!(commands.contains(&"config.configure"), "Configure remains available in the dropdown");
+        h.step(&json!({"widget":"Parameters"})).unwrap();
+        assert!(h.app.params.is_some(), "the ordinary Parameters button opens the editor");
+        assert!(h.app.dialog.is_none());
+        assert!(h.widget("User Parameters").is_some());
+        assert!(h.widget("Model Parameters").is_some());
+        // Exercise the editor's Add button, not a script-only parameter command.
+        let parameters = h.app.params.as_mut().unwrap();
+        parameters.new_name = "width".into();
+        parameters.new_expr = "25 mm".into();
+        h.frames(3);
+        h.step(&json!({"widget":"Add"})).unwrap();
+        let values = h.app.session.execute("parameters.list", &json!({})).unwrap();
+        assert!(values["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "width" && p["value"] == 25.0));
+        h.step(&json!({"click":{"handle":"params:close"}})).unwrap();
+        assert!(h.app.params.is_none());
+        h.step(&json!({"widget":"Configurations"})).unwrap();
+        assert!(h.app.params.is_none());
+        assert!(matches!(
+            h.app.dialog.as_ref().map(|d| &d.kind),
+            Some(crate::dialogs::Kind::Motion(crate::dialogs_motion::Mo::Configurations { .. }))
+        ));
+        assert!(h.widget("Add Column").is_some());
+        assert!(h.widget("Add Row").is_some());
     }
 
     /// Fusion's layout: joints on every tab's ASSEMBLE panel, sheet metal and plastic tabs

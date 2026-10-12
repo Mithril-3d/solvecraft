@@ -146,7 +146,11 @@ pub(crate) fn axis1(cx: &Ctx, id: u64) -> R<(mt::Point3, mt::Vector3)> {
     Ok((o, d))
 }
 
-fn knot_vec(mults: Option<&Param>, knots: Option<&Param>) -> R<mt::KnotVec> {
+/// `expected` is the knot count the control points and degree imply. Multiplicities are
+/// expanded into one value each, so the sum has to be checked before the expansion: 20 million
+/// knots of multiplicity 64 would build a 10 GB vector that the length check then rejects, and
+/// an allocation failure aborts the process where an error does not.
+fn knot_vec(mults: Option<&Param>, knots: Option<&Param>, expected: usize) -> R<mt::KnotVec> {
     let m: Vec<usize> = mults
         .and_then(Param::as_list)
         .ok_or("B-spline without knot multiplicities")?
@@ -156,6 +160,9 @@ fn knot_vec(mults: Option<&Param>, knots: Option<&Param>) -> R<mt::KnotVec> {
     let k: Vec<f64> = knots.and_then(Param::as_list).ok_or("B-spline without knots")?.iter().map(|x| num(Some(x), "knot")).collect::<R<_>>()?;
     if m.len() != k.len() || k.is_empty() || k.windows(2).any(|w| w.first() > w.get(1)) {
         return Err("inconsistent knot vector".into());
+    }
+    if m.len() > expected || m.iter().try_fold(0usize, |a, v| a.checked_add(*v)) != Some(expected) {
+        return Err("knot multiplicities do not match the control points".into());
     }
     mt::KnotVec::from_single_multi(k, m).map_err(|e| format!("knot vector: {e}"))
 }
@@ -238,7 +245,7 @@ fn bspline_curve(cx: &Ctx, e: &Entity) -> R<CurveGeo> {
     }
     let ctrl: Vec<mt::Point3> = ctrl_ids.iter().map(|c| point(cx, c.as_ref_id().ok_or("bad control point")?)).collect::<R<_>>()?;
     let kv = match knots {
-        Some((m, k)) => knot_vec(m, k)?,
+        Some((m, k)) => knot_vec(m, k, ctrl.len() + degree + 1)?,
         None => generated_knots(kind, ctrl.len(), degree)?,
     };
     if kv.len() != ctrl.len() + degree + 1 {
@@ -737,7 +744,7 @@ pub(crate) fn bspline_surface(cx: &Ctx, e: &Entity) -> R<mt::Surface> {
         return Err("ragged B-spline control net".into());
     }
     let (ku, kv) = match knots {
-        Some([mu, mv, ku, kv]) => (knot_vec(mu, ku)?, knot_vec(mv, kv)?),
+        Some([mu, mv, ku, kv]) => (knot_vec(mu, ku, nu + du + 1)?, knot_vec(mv, kv, nv + dv + 1)?),
         None => (generated_knots(kind, nu, du)?, generated_knots(kind, nv, dv)?),
     };
     if ku.len() != nu + du + 1 || kv.len() != nv + dv + 1 {

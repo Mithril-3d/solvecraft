@@ -116,18 +116,32 @@ fn construction_planes_follow_reflected_and_sheared_affine_images() {
 }
 
 #[test]
-fn material_changes_discard_producer_certificates() {
+fn material_changes_preserve_only_unchanged_planar_support_certificates() {
     let base = crate::box_solid(Vec3::ZERO, Vec3::new(10., 10., 10.)).unwrap().with_box_certificate(42).unwrap();
     let tool = crate::box_solid(Vec3::new(5., -1., -1.), Vec3::new(11., 11., 11.)).unwrap();
     let cut = crate::boolean(&base, &tool, crate::BoolOp::Cut).unwrap().unwrap();
     assert!((cut.tessellate(1e-4).unwrap().measure().volume - 500.).abs() < 1e-8);
-    assert!(cut.face_sources().into_iter().flatten().flatten().all(|source| matches!(
-        source,
-        FaceSource::ExtrudeSide { .. }
-            | FaceSource::ExtrudeCap { .. }
-            | FaceSource::Box { producer: None, .. }
-            | FaceSource::Imported { producer: None, .. }
-    )));
+    // Unchanged uniquely certified supports retain their role; a newly cut
+    // support must never inherit the removed opposite wall's source identity.
+    let mut retained = 0;
+    let mut new_wall = 0;
+    for index in 0..cut.face_count() {
+        let actual = cut.planar_face(index).unwrap();
+        let source = cut.face_sources().and_then(|s| s.get(index)).and_then(Option::as_ref);
+        if let Some(FaceSource::Box { producer: Some(42), axis, high, .. }) = source {
+            assert!(!(*axis == 0 && *high));
+            let canonical = cut.face_plane(index).unwrap();
+            assert!(actual.normal().dot(canonical.normal()) > 1. - 1e-10);
+            assert!(actual.height(canonical.origin).abs() < 1e-10);
+            retained += 1;
+        }
+        if actual.normal().x > 0.9 {
+            assert!((actual.origin.x - 5.).abs() < 1e-10);
+            assert!(!matches!(source, Some(FaceSource::Box { producer: Some(_), .. })));
+            new_wall += 1;
+        }
+    }
+    assert_eq!((retained, new_wall), (5, 1));
 }
 
 #[test]

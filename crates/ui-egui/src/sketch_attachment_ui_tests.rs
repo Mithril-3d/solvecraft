@@ -142,14 +142,16 @@ fn unsupported_modified_face_offers_explicit_fixed_plane_without_live_links() {
     let mut h = Harness::new();
     h.app.ui.show_origin = false;
     h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Modified"})).unwrap();
-    h.app.run("solid.fillet", json!({"edges":[[0,0,5]],"radius":1})).unwrap();
+    // An intentional split gives the +z source two distinct planar pieces. A
+    // strict attachment cannot claim the original whole-face certificate.
+    h.app.run("solid.split_face", json!({"body":"Modified","faces":[[5,5,10]],"plane":{"origin":[5,0,0],"normal":[1,0,0]}})).unwrap();
     let before = h.app.session.doc.to_json();
     let undo = h.app.session.undo.len();
     h.call("ui.view", json!({"view":"top"}));
     h.call("ui.view", json!({"view":"fit"}));
     h.settle();
     h.step(&json!({"start":"sketch.create"})).unwrap();
-    h.step(&json!({"click":{"world":[5,5,10]}})).unwrap();
+    h.step(&json!({"click":{"world":[2.5,5,10]}})).unwrap();
     assert!(h.app.session.active_sketch.is_none());
     assert!(h.app.dialog.as_ref().unwrap().error.is_some());
     assert_eq!(h.app.session.doc.to_json(), before);

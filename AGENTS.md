@@ -1,11 +1,18 @@
-# SolveCraft — instructions for agents
+# SolidCraft — instructions for agents
 
-SolveCraft is a clean-room, open-source, pure-Rust parametric 3D CAD application in the style of
-Autodesk Fusion: sketches with a constraint solver, a parametric timeline of features, a B-rep
-kernel, and a desktop UI that agents can drive. Siblings with the same conventions live next to
-it in `storytold/`: `cadcraft` (AutoCAD-style, the closest relative), `photocraft`, `vectorcraft`,
-`gridcraft`, `designcraft`, `wordcraft`, `deckcraft`, `soundcraft`. Repos don't share code; when
-code is adapted from a sibling (MIT OR Apache-2.0) it is noted in ATTRIBUTION.md.
+SolidCraft is a clean-room, open-source, pure-Rust parametric 3D CAD application:
+sketches with a constraint solver, a parametric timeline of features, a B-rep
+kernel, and a desktop UI that agents can drive. Projects published by
+[storytold](https://github.com/storytold) can serve as references for implementation conventions.
+Any code adapted from other projects (MIT OR Apache-2.0) is noted in ATTRIBUTION.md.
+
+## Product name and compatibility
+SolidCraft is the displayed product name; `solidcraft` is the repository name. Keep existing
+`solvecraft` crate/binary names, `.solvecraft` files, format markers, environment variables,
+settings/recovery paths and package IDs compatible. Published SolveCraft release artifacts
+and attribution records keep their historical names. Public docs/web/Flatpak deployments
+use project Pages `/solidcraft/`; do not add permanent old-name Pages aliases. See README's
+compatibility notes.
 
 ## Start every session here
 1. Read `plan/STATUS.md` (current milestone, next task), then the task in `plan/execution-plan.md`
@@ -20,7 +27,7 @@ code is adapted from a sibling (MIT OR Apache-2.0) it is noted in ATTRIBUTION.md
 `plan/` is gitignored (local only).
 
 ## Never crash
-People trust SolveCraft with their designs; a crash loses their work. **This outranks feature work.**
+People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
   `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
@@ -44,7 +51,7 @@ People trust SolveCraft with their designs; a crash loses their work. **This out
   copy or link GPL/LGPL/AGPL code**: OpenCASCADE, FreeCAD (incl. planegcs), SolveSpace,
   CadQuery/OCP, LibreCAD, QCAD — don't even read their sources. The sketch solver and the blend
   operations are our own.
-- **Assets — absolutely essential.** SolveCraft contains **no Autodesk iconography, images,
+- **Assets — absolutely essential.** SolidCraft contains **no Autodesk iconography, images,
   fonts or artwork — ever.** Every icon is drawn in code (`crates/ui-egui/src/icons.rs`). Any
   file asset must be original or openly licensed and **must have a row in ATTRIBUTION.md**
   (`cargo xtask assets` enforces it). Screenshots of Autodesk software are never committed.
@@ -64,7 +71,7 @@ People trust SolveCraft with their designs; a crash loses their work. **This out
 - **Rust only.** Units are millimetres and radians internally; Z is up.
 - **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests,
   assets, layers). Commit after every feature arc that builds.
-- **Publishing**: `origin` is github.com/bherbruck/solvecraft (private). After each commit that
+- **Publishing**: `origin` is github.com/bherbruck/solidcraft. After each commit that
   passes `cargo xtask ci`: `git pull --rebase origin main` (re-run ci if it brought changes),
   then `git push`. Never force-push. Never commit `plan/`, build dirs (`target*/`) or anything
   produced by Fusion (oracle STEP/STL/PNG); check `git ls-files` before pushing.
@@ -73,12 +80,16 @@ People trust SolveCraft with their designs; a crash loses their work. **This out
 
 ## Showing and following through on changes
 
-- Give issues and PRs concrete visual context whenever it helps explain what is broken or
-  changed, including kernel, geometry, assembly and backend work. Coding agents should run
-  the relevant example and capture a screenshot, short recording, diagram or before/after
-  model view themselves. Show the actual reproduction/result, annotate the focus when useful,
-  and pair it with brief expected/actual behavior; do not ask a human for evidence the agent
-  can produce. Changes with no useful visual explanation do not need media.
+- Help reviewers see what is broken or changed. For observable CAD, UI or model behavior,
+  issues and PRs must include actual descriptive screenshots or a short recording from a
+  small reproduction. This includes kernel, geometry, assembly and backend changes whose
+  effects can be shown in the app. Coding agents should run the app and capture this evidence
+  themselves; do not ask a human for evidence the agent can produce. Show the actual failure
+  or result, preferably before and after, with brief reproduction steps, expected/actual
+  behavior and annotations that point out the relevant detail.
+- Flowcharts and Mermaid diagrams cannot substitute for screenshots or recordings of visible
+  behavior. Use diagrams for architectural reasoning when actual screenshots cannot illustrate
+  the point. Changes with no useful observable behavior do not need screenshot or video evidence.
 - Use a small public-safe example and check for private designs, paths, account details or
   other sensitive content before sharing. Attach media to the issue/PR or link to an accessible
   recording; do not commit generated screenshots or videos just to provide review evidence.

@@ -219,6 +219,43 @@ fn flat_pattern_islands_fit_before_the_actual_command_panel() {
 }
 
 #[test]
+fn coincident_top_and_bottom_pocket_depths_share_a_readable_annotation() {
+    let mut app = plate();
+    app.run("sheet.flange", json!({"sketch":"Base"})).unwrap();
+    app.run("sketch.create", json!({"plane":"XY","name":"Retain"})).unwrap();
+    app.run("sketch.rectangle.two_point", json!({"p0":[20,20],"p1":[30,30]})).unwrap();
+    app.run("sketch.finish", json!({})).unwrap();
+    app.run("solid.extrude", json!({"sketch":"Retain","distance":1,"start_offset":0.5,"operation":"intersect"})).unwrap();
+    let flat = app.session.execute("sheet.flat_pattern", &json!({})).unwrap();
+    assert_eq!(flat["cutouts"], json!([]));
+    assert_eq!(flat["pockets"].as_array().unwrap().len(), 2);
+    let doc = app.session.doc.to_json();
+    app.start("sheet.flat_pattern");
+    let mut dialog = app.dialog.clone().unwrap();
+    let Kind::Sheet(Sm::FlatPattern { data, .. }) = &mut dialog.kind else { panic!("flat dialog") };
+    *data = Some(Ok(flat));
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("coincident-pocket-test")));
+        assert!(overlay(&painter, Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0)), &dialog));
+    });
+    output.textures_delta.clear();
+    let labels: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().contains("pocket:") => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels.len(), 1, "coincident depths must not overwrite one another");
+    assert!(labels[0].contains("Top pocket: 1 mm deep"));
+    assert!(labels[0].contains("Bottom pocket: 0.5 mm deep"));
+    assert!(labels[0].contains('\n'));
+    assert_eq!(app.session.doc.to_json(), doc);
+}
+
+#[test]
 fn pocket_export_button_uses_the_picker_and_preserves_depth_layers() {
     let mut h = crate::scenario::Harness::new();
     for (command, params) in [

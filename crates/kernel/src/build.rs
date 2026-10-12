@@ -179,7 +179,7 @@ pub fn extrude(plane: &Plane, regions: &[Region2], start: f64, end: f64) -> Resu
                             }
                             _ => None,
                         };
-                        Some(crate::FaceSource::ExtrudeSide { segment: **segment, plane: basis })
+                        Some(crate::FaceSource::ExtrudeSide { segment: **segment, plane: basis, coalesced: false })
                     } else {
                         None
                     };
@@ -785,7 +785,8 @@ fn resample(lp: &Loop2, n: usize, angles: &[f64]) -> Loop2 {
     Loop2 { segs }
 }
 
-/// Ruled loft through two or more planar sections (outer loops only).
+/// Ruled loft through two or more planar sections (outer loops only). The sections and the
+/// same sections in reverse order give the same body.
 pub fn loft(sections: &[(Plane, Loop2)]) -> Result<Body> {
     if sections.len() < 2 || sections.len() > 50 {
         return Err(KernelError::Invalid("a loft needs 2…50 sections".into()));
@@ -794,10 +795,21 @@ pub fn loft(sections: &[(Plane, Loop2)]) -> Result<Body> {
     if n == 0 || n > MAX_SEGS {
         return Err(KernelError::Invalid("empty section".into()));
     }
-    // Orient every section counter-clockwise about the first section's normal, then match
-    // segment counts and starting points to the section with the most segments.
-    let n0 = sections[0].0.normal();
-    let oriented: Vec<(Plane, Loop2)> = sections
+    // A canonical order, so that reversing the sections changes nothing: the one whose
+    // first-to-last step has a positive largest component. The side faces' parameterisation
+    // follows the order, and the boolean worked on one and failed on the other (a cut whose
+    // loft touches the body along an edge: an internal panic, or "shell not oriented and
+    // closed").
+    let centre = |(p, l): &(Plane, Loop2)| p.to_world(l.centroid());
+    let (Some(first), Some(last)) = (sections.first(), sections.last()) else { return Err(KernelError::Invalid("no sections".into())) };
+    let step = centre(last) - centre(first);
+    let big = [step.x, step.y, step.z].into_iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+    let ordered: Vec<&(Plane, Loop2)> = if big < 0.0 { sections.iter().rev().collect() } else { sections.iter().collect() };
+    // Orient every section counter-clockwise about the first section's normal (`Body::new`
+    // turns the solid outward), then match segment counts and starting points to the section
+    // with the most segments.
+    let n0 = ordered.first().map(|(p, _)| p.normal()).unwrap_or(Vec3::Z);
+    let oriented: Vec<(Plane, Loop2)> = ordered
         .iter()
         .map(|(p, l)| {
             let l = if p.normal().dot(n0) >= 0.0 { l.ccw() } else { l.ccw().reversed() };

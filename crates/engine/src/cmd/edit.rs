@@ -195,6 +195,29 @@ fn merge(dst: &mut Value, src: &Value, depth: usize) {
     }
 }
 
+/// `profiles` (also a loft section's) given as the feature commands take it (`"all"`,
+/// `[index]`, `[{curves}]`, `[{point}]`...) becomes the stored form; the stored form passes.
+fn command_profiles(set: &Value, cmd: &str) -> Result<Value> {
+    let conv = |v: &mut Value| -> Result<()> {
+        if let Some(pv) = v.get("profiles").filter(|x| x.get("type").is_none()) {
+            let sel = super::features::profiles(&json!({"profiles": pv}), cmd)?;
+            let sv = serde_json::to_value(sel).map_err(|e| EngineError::Other(e.to_string()))?;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("profiles".into(), sv);
+            }
+        }
+        Ok(())
+    };
+    let mut set = set.clone();
+    conv(&mut set)?;
+    if let Some(secs) = set.get_mut("sections").and_then(Value::as_array_mut) {
+        for sec in secs.iter_mut().take(10_000) {
+            conv(sec)?;
+        }
+    }
+    Ok(set)
+}
+
 /// Fields of a stored feature left out of its definition: bookkeeping timeline.edit recomputes, and
 /// the name and suppression, which timeline.rename and timeline.suppress change.
 const NOT_EDITABLE: &[&str] = &["id", "type", "name", "suppressed", "param_names", "edge_refs", "edge_names", "face_names"];
@@ -247,6 +270,7 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
     let set = p.get("set").filter(|v| v.is_object()).ok_or_else(|| bad(cmd, "`set` must be an object of fields"))?;
     let f = s.doc.feature(id).cloned().ok_or_else(|| bad(cmd, "feature"))?;
     let mut v = serde_json::to_value(&f).map_err(|e| EngineError::Other(e.to_string()))?;
+    let set = &command_profiles(set, cmd)?;
     merge(&mut v, set, 0);
     let mut nf: Feature = serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid feature: {e}")))?;
     nf.id = f.id;
@@ -272,6 +296,10 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
         let before = s.model.state_before(id);
         nf.edge_refs = solvecraft_doc::edge_refs(&before, body, a);
         nf.edge_names = solvecraft_doc::edge_names_for(&before, body, a);
+    }
+    // Profiles picked by index or point are kept by their curves, as when the feature was made.
+    if nf.kind.clone().profile_sels_mut() != f.kind.clone().profile_sels_mut() {
+        super::features::stable_profiles(s, &mut nf.kind)?;
     }
     // New face points: their faces' names now.
     if nf.kind.face_points() != f.kind.face_points() {

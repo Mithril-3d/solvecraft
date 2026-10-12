@@ -1,7 +1,7 @@
-# Contributing to SolveCraft
+# Contributing to SolidCraft
 
-SolveCraft is an open-source parametric 3D CAD app written in pure Rust, in the style of
-Autodesk Fusion. You sketch on a plane, constrain the sketch, turn profiles into solids, and
+SolidCraft is an open-source parametric 3D CAD app written in pure Rust.
+You sketch on a plane, constrain the sketch, turn profiles into solids, and
 change a parameter to watch the timeline rebuild. It runs as a desktop app (Windows, Linux), in
 the browser (wasm + WebGPU/WebGL2), headless from a CLI, and as an MCP server that AI agents can
 model with.
@@ -12,15 +12,22 @@ needed most.
 
 ## Get it running (about 10 minutes on a fast machine)
 
-You need stable Rust 1.90 or newer. For the web
+You need stable Rust 1.95 or newer (required by egui/eframe 0.36). For the web
 build you also need `rustup target add wasm32-unknown-unknown` and [`trunk`](https://trunkrs.dev).
 
 ```sh
-git clone https://github.com/bherbruck/solvecraft && cd solvecraft
+git clone https://github.com/bherbruck/solidcraft && cd solidcraft
 cargo run --release -p solvecraft -- --sample      # desktop app with a sample part
 cargo xtask test                                   # unit, engine and UI-scenario tests
 cargo xtask ci                                     # everything a PR must pass (see below)
 ```
+
+SolidCraft is the product and repository name. Cargo packages and executables retain
+their `solvecraft` names for compatibility with existing scripts and MCP clients.
+Build the desktop app with `cargo build --release -p solvecraft`, or the CLI with
+`cargo build --release -p solvecraft-cli`. Run the CLI with
+`cargo run --release -p solvecraft-cli -- commands` (or `target/release/solvecraft-cli commands`
+after building). There is no Cargo package named `solidcraft`.
 
 Web: `cd apps/solvecraft-web && trunk serve --release`, then open the printed URL (`?sample`
 opens the sample part, `?webgl` forces WebGL2). Saving and opening files in the browser needs
@@ -41,32 +48,21 @@ ERROR eframe::native::run: Exiting because of error: WGPU error: Failed to creat
 ERROR rfd::backend::xdg_desktop_portal::portal::libdbus: Can't connect to a portal: libdbus-1.so not found
 ```
 
-`nix develop` (the [`flake.nix`](flake.nix) in the repository root) puts the Wayland, X11,
-EGL-loader and D-Bus libraries on `LD_LIBRARY_PATH`, so `cargo run --release -p solvecraft` works
-from that shell as on any other distribution, file dialogs included. `nix run` builds the app and
-wraps the binary the same way. The Mesa drivers stay the system's, from `/run/opengl-driver`
-(`hardware.graphics.enable`): that is the driver stack the compositor runs on, and wgpu reaches the
-integrated GPU through the EGL loader. The shell deliberately brings no Rust toolchain — the one on
-`PATH` keeps its build cache, where a second `rustc` would make every build recompile the workspace
-from scratch; `nix develop .#rust` is there for a machine with no Rust at all.
+`nix develop` (the [`flake.nix`](flake.nix) in the repository root) supplies Wayland,
+X11, EGL, Vulkan-loader and D-Bus runtime libraries. It also exposes the NixOS
+driver manifests in `/run/opengl-driver/share`, so Vulkan can discover the system
+drivers. Enable `hardware.graphics.enable` on NixOS; other Linux distributions
+may need a matching [nixGL wrapper](https://github.com/nix-community/nixGL).
+The default development shell retains the Rust/C toolchain already on `PATH`;
+`nix develop .#rust` supplies the pinned toolchain and builds in `target/nix`.
 
-**Anti-aliasing on the OpenGL backend.** NixOS keeps the Vulkan ICD descriptions
-(`/run/opengl-driver/share/vulkan/icd.d`) off the Vulkan loader's search path, so wgpu picks its
-OpenGL backend on the integrated GPU. On that backend any multisampling above 1× — the default is
-4× — draws a black window: the UI still lays out and the control channel still answers, but every
-frame, `ui.screenshot` included, comes out empty. Set **Preferences ▸ Graphics ▸ Anti-aliasing** to
-1× and restart (the setting applies on the next start), or write it before the first run, since a
-black window is no way to reach the dialog:
-
-```sh
-mkdir -p ~/.local/share/solvecraft
-echo '{"msaa": 1}' > ~/.local/share/solvecraft/graphics.json
-```
-
-`apps/solvecraft/src/main.rs` reads that file (`graphics_path()`, eframe's storage dir) before the
-window opens; 2× and 4× are the same black window. The Vulkan backend is no way out of it either:
-`libvulkan.so.1` is not on `LD_LIBRARY_PATH`, so `WGPU_BACKEND=vulkan` exits with a
-`CreateSurfaceError` instead.
+To launch, use `nix run .#solidcraft -- --sample`. To install the app's terminal
+commands, desktop entry and generated icons, use `nix profile install .#solidcraft`.
+`nix build` alone creates a build result; it does not install a launcher in your
+desktop menu. The installed `solidcraft` command and compatible `solvecraft`
+command run the same wrapped app; `solvecraft-cli` is included as well. See
+[Nix installation and troubleshooting](docs/nix.md) for remote-flake commands,
+desktop integration and how to distinguish an old executable on `PATH`.
 
 ## How the code is laid out
 
@@ -97,7 +93,7 @@ The [README](README.md#architecture) has the layer table. The short version:
    tooltips, templates or materials, and we never commit files Fusion produced. Command ids are
    our own (`solid.fillet`, not Fusion's internal names).
 2. **No GPL/LGPL/AGPL code, not even reading it.** That rules out OpenCASCADE, FreeCAD
-   (including planegcs), SolveSpace, CadQuery/OCP, LibreCAD and QCAD. SolveCraft is
+   (including planegcs), SolveSpace, CadQuery/OCP, LibreCAD and QCAD. SolidCraft is
    MIT OR Apache-2.0, and its solver and blends are written from the maths. Permissive
    dependencies are fine. Note which one you're adding and why in the PR, and run
    `cargo xtask licences` so THIRD-PARTY-LICENSES.txt lists it (CI checks that it is current).
@@ -151,14 +147,14 @@ in the PR. `cargo xtask test` builds the tests with it and then runs every test 
 depend on wall-clock timing.
 
 **The Fusion oracle** is a set of 76 reference parts, each built in Fusion from a recipe.
-SolveCraft rebuilds the same recipe and compares volume, area and topology counts with Fusion's
+SolidCraft rebuilds the same recipe and compares volume, area and topology counts with Fusion's
 measurements; [docs/oracle.md](docs/oracle.md) has the current results. The recipes and
 measurements live outside the repo (`plan/`, gitignored), because they come from a Fusion
 install. If you work on geometry and want to check against it, ask in an issue.
 
 ## Sending a change
 
-1. Work is tracked in [GitHub issues](https://github.com/bherbruck/solvecraft/issues), labelled
+1. Work is tracked in [GitHub issues](https://github.com/bherbruck/solidcraft/issues), labelled
    by area (`area:kernel`, `area:sketch`, `area:doc`, `area:ui`, `area:infra`). Before starting,
    comment on the issue so it gets the `in progress` label and two people don't build the same
    thing. For anything bigger than a bug fix that has no issue yet, open one first.
@@ -168,15 +164,19 @@ install. If you work on geometry and want to check against it, ask in an issue.
 4. Reference the issue (`Fixes #12`). In the PR, say what you tested and how. For geometry work, include the measured numbers (and
    the expected ones).
 
-Words alone can leave a change hard to picture. When a screenshot, short demo, diagram or
-before/after model view helps explain what is broken or changed, please include that concrete
-context in the issue or PR. This applies to kernel, geometry, assembly and backend work as well
-as the UI. Coding agents should run the relevant example and capture the actual reproduction
-or result themselves, with a brief expected/actual explanation and annotations where useful;
-please don't ask a human for evidence the agent can produce. Changes with no useful visual
-explanation do not need media. Use a small example without private designs or sensitive
-details; attach the media or link to an accessible recording rather than committing generated
-review artifacts.
+Help reviewers see what the words mean. For observable CAD, UI or model behavior, please
+include actual descriptive screenshots or a short recording in the issue or PR. This evidence
+is required for changes or bugs that can be demonstrated in the app, including kernel,
+geometry, assembly and backend work. Coding agents should run a small reproduction and
+capture the evidence themselves; please don't ask a human for evidence the agent can produce.
+Show the actual failure or result, preferably before and after, with brief steps and
+expected/actual behavior. An arrow or annotation can help identify the detail that matters.
+
+Flowcharts and Mermaid diagrams cannot replace evidence of visible behavior. Diagrams are
+useful for architectural reasoning when actual screenshots cannot illustrate the point.
+Changes with no useful observable behavior do not need screenshot or video evidence. Use a
+small example without private designs or sensitive details; attach the media or link to an
+accessible recording rather than committing generated review artifacts.
 
 Keep checking upstream commits and the relevant PR's merge status throughout the work and
 before handoff. Integrate upstream merges, resolve conflicts without losing others' changes,
@@ -185,15 +185,15 @@ CI if it brought changes, and push without force. Report the upstream/PR state y
 any conflicts resolved and validation results. While a task remains active, follow an open
 PR through its status changes; at handoff, clearly identify anything still awaiting merge.
 
-Much of SolveCraft so far was written by AI coding agents (Claude) working in parallel, each
+Much of SolidCraft so far was written by AI coding agents (Claude) working in parallel, each
 owning one area, with a human setting direction and reporting bugs. Their working notes are in
 [AGENTS.md](AGENTS.md). Human contributors are just as welcome. Use whatever tools you like, as
 long as the change meets the rules above.
 
 ## Where help is wanted most
 
-See the [`help wanted`](https://github.com/bherbruck/solvecraft/labels/help%20wanted) and
-[`good first issue`](https://github.com/bherbruck/solvecraft/labels/good%20first%20issue) labels.
+See the [`help wanted`](https://github.com/bherbruck/solidcraft/labels/help%20wanted) and
+[`good first issue`](https://github.com/bherbruck/solidcraft/labels/good%20first%20issue) labels.
 In order of how much they'd help users:
 
 1. **Fillet and blend robustness.** Fillets are our own code (truck has no fillet operation).
@@ -202,7 +202,7 @@ In order of how much they'd help users:
    faces, and fillets that consume neighbouring faces.
 2. **Boolean robustness.** A random-design fuzzer currently gets about half of its designs
    through without a kernel error. Each failing seed is a reproducible bug.
-3. **Y-up / Z-up.** SolveCraft is Z-up only, so most STEP files (from SolidWorks, Onshape, or
+3. **Y-up / Z-up.** SolidCraft is Z-up only, so most STEP files (from SolidWorks, Onshape, or
    Fusion's default) open lying on their backs. Fusion solves this with a "default modeling
    orientation" preference.
 4. **Imported appearances.** Colours from STEP files are lost when a feature changes the
@@ -213,4 +213,4 @@ In order of how much they'd help users:
 ## Licence
 
 By contributing you agree that your contribution is licensed as MIT OR Apache-2.0, like the rest
-of SolveCraft. SolveCraft isn't affiliated with Autodesk. Fusion is a trademark of Autodesk, Inc.
+of SolidCraft. SolidCraft isn't affiliated with Autodesk. Fusion is a trademark of Autodesk, Inc.

@@ -6,7 +6,41 @@ fn cube_mesh(s: f64) -> Mesh {
     let triangles =
         vec![[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]];
     let n = triangles.len();
-    Mesh { normals: vec![Vec3::Z; 8], positions, triangles, tri_face: vec![0; n], edges: vec![], seams: vec![], edge_faces: vec![] }
+    Mesh {
+        normals: vec![Vec3::Z; 8],
+        positions,
+        triangles,
+        tri_face: vec![0; n],
+        edges: vec![],
+        seams: vec![],
+        smooth_edges: vec![],
+        sharp_edges: vec![],
+        edge_faces: vec![],
+    }
+}
+
+#[test]
+fn display_edge_masks_keep_identity_and_break_only_certified_sharp_patches() {
+    let mut mesh =
+        Mesh { edges: vec![vec![Vec3::ZERO, Vec3::Z]; 2], edge_faces: vec![vec![0, 1], vec![1, 2]], seams: vec![true, true], ..Mesh::default() };
+    let stored = serde_json::to_value(&mesh).unwrap();
+    assert_eq!(mesh.surface_patch(0), vec![0, 1, 2]);
+    mesh.smooth_edges = vec![true, false];
+    assert_eq!(mesh.surface_patch(0), vec![0, 1, 2]);
+    assert!(!mesh.shaded_edge_visible(0));
+    mesh.smooth_edges[0] = false;
+    mesh.sharp_edges = vec![true, false];
+    assert!(mesh.shaded_edge_visible(0));
+    assert!(mesh.edge_pickable(0));
+    assert!(!mesh.edge_pickable(1));
+    assert_eq!(mesh.surface_patch(0), vec![0]);
+    assert_eq!(mesh.surface_patch(1), vec![1, 2]);
+    assert_eq!(mesh.edges.len(), 2);
+    assert_eq!(mesh.face_edges(1), vec![0, 1]);
+    assert_eq!(serde_json::to_value(&mesh).unwrap(), stored);
+    let reopened: Mesh = serde_json::from_value(stored).unwrap();
+    assert!(reopened.smooth_edges.is_empty() && reopened.sharp_edges.is_empty());
+    assert!(Mesh::default().shaded_edge_visible(0));
 }
 
 #[test]

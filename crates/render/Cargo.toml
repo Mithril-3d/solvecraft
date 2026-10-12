@@ -1,6 +1,6 @@
 [package]
 name = "solvecraft-render"
-description = "SolveCraft view math (orbit camera, projection, picking rays) and a CPU rasterizer for headless snapshots"
+description = "SolidCraft view math (orbit camera, projection, picking rays) and a CPU rasterizer for headless snapshots"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,3 +12,6 @@ workspace = true
 solvecraft-geom = { workspace = true }
 serde = { workspace = true }
 image = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

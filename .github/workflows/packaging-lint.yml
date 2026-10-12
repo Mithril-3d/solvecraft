@@ -28,13 +28,19 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream libxml2-utils python3-yaml
+          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream libxml2-utils python3-yaml jq
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP" actionlint
       - name: actionlint
         run: '"$RUNNER_TEMP/actionlint" -color'
       - name: shellcheck
         run: shellcheck packaging/*.sh packaging/*/*.sh packaging/linux/AppRun
+      - name: Nightly release selection regression
+        run: python3 packaging/tests/nightly_test.py
+      - name: Windows executable icon validation regression
+        run: python3 packaging/tests/windows_icon_test.py
+      - name: Flatpak desktop smoke validation regression
+        run: python3 packaging/tests/flatpak_test.py
       - name: PowerShell
         shell: pwsh
         run: |

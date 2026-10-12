@@ -3,7 +3,7 @@
 //! A thin shell over [`solvecraft_engine::Session`]: panels read engine state and act through
 //! commands ([`SolveApp::run`]). Nothing here owns design data. The layout follows the familiar
 //! parametric-CAD desktop: application bar, a toolbar of workspace tabs and panels, the browser
-//! on the left, the 3D viewport with a view cube and navigation bar, the command dialog on the
+//! on the left, the 3D viewport with an axis view and navigation bar, the command dialog on the
 //! right of the viewport, the command palette and the timeline at the bottom.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
@@ -25,6 +25,8 @@ pub mod dialogs_plastic;
 pub mod dialogs_sheet;
 pub mod dialogs_surface;
 pub mod dim_view;
+#[cfg(test)]
+mod dimension_create_ui_tests;
 pub mod documents;
 pub mod drag_snap;
 pub mod fonts;
@@ -38,6 +40,7 @@ pub mod i18n;
 mod i18n_ui_tests;
 pub mod icons;
 pub mod inference;
+pub mod issue_report;
 pub mod keymap;
 #[cfg(test)]
 mod menu_tests;
@@ -58,6 +61,7 @@ mod status_tests {
         assert!(app.session.log.last().is_some_and(|l| l.starts_with("Redo: ") && !l.contains("edit.redo")), "{:?}", app.session.log.last());
     }
 }
+mod expression_complete;
 #[cfg(test)]
 mod extrude_edit_tests;
 mod file_load;
@@ -75,6 +79,8 @@ mod revolve_edit_tests;
 mod revolve_manipulator_tests;
 pub mod scenario;
 pub mod selection;
+#[cfg(test)]
+mod shell_face_sketch_ui_tests;
 pub mod shortcut_box;
 pub mod sketch3d;
 #[cfg(test)]
@@ -83,6 +89,9 @@ pub(crate) mod sketch_attachment_ui;
 #[cfg(test)]
 mod sketch_attachment_ui_tests;
 pub mod sketch_dims;
+pub(crate) mod sketch_display;
+#[cfg(test)]
+mod sketch_display_ui_tests;
 #[cfg(test)]
 mod sketch_edit_tests;
 pub mod sketch_palette;
@@ -95,6 +104,7 @@ pub mod toolbar;
 pub mod toolbar_custom;
 pub mod tools;
 pub mod viewport;
+mod viewport_layout;
 pub mod workspace;
 
 use std::sync::mpsc::Receiver;
@@ -129,7 +139,7 @@ pub struct UiState {
     pub visual_style: u8,
     /// A soft shadow on the ground under the model (seen from above).
     pub ground_shadow: bool,
-    /// The world's up axis (Z or Y; #3): the camera, view cube, home view and ground follow it.
+    /// The world's up axis (Z or Y; #3): the camera, axis view, home view and ground follow it.
     pub up_axis: solvecraft_engine::render::UpAxis,
     /// Sketches whose closed profiles are not shaded.
     pub hidden_profiles: Vec<u64>,
@@ -180,7 +190,7 @@ pub struct SolveApp {
     pub session: Session,
     pub ui: UiState,
     pub cam: Camera,
-    /// A view change in progress (view cube, Home, Fit); any mouse navigation cancels it.
+    /// A view change in progress (axis view, Home, Fit); any mouse navigation cancels it.
     pub cam_anim: Option<CameraAnim>,
     /// Seconds since start, as of this frame.
     pub now: f64,
@@ -206,6 +216,8 @@ pub struct SolveApp {
     pub keymap: keymap::Keymap,
     /// The Help menu and the About window.
     pub help: help::HelpState,
+    /// An editable local issue draft and optional captured app frame.
+    pub issue_report: issue_report::ReportState,
     /// Toolbar buttons the user pinned, removed or reordered.
     pub toolbar_custom: toolbar_custom::ToolbarCustom,
     /// Preferences kept between runs, and their window.
@@ -244,6 +256,7 @@ pub struct SolveApp {
     shot_token: u64,
     styled: bool,
     fitted: bool,
+    pending_fit: Option<(Camera, solvecraft_engine::geom::Aabb3, bool)>,
     /// The start page.
     pub home: home::HomeState,
     pub file_load: file_load::FileLoad,
@@ -272,6 +285,7 @@ impl SolveApp {
             sbox: shortcut_box::ShortcutBox::default(),
             keymap: keymap::Keymap::default(),
             help: help::HelpState::default(),
+            issue_report: issue_report::ReportState::default(),
             toolbar_custom: toolbar_custom::ToolbarCustom::default(),
             preferences: prefs::Prefs::default(),
             prefs_window: prefs::PrefsWindow::default(),
@@ -297,6 +311,7 @@ impl SolveApp {
             shot_token: 0,
             styled: false,
             fitted: false,
+            pending_fit: None,
             home: home::HomeState::default(),
             file_load: file_load::FileLoad::default(),
             docs: documents::Documents::default(),
@@ -430,6 +445,7 @@ impl SolveApp {
             Ok(_) => {
                 self.session.echo(format!("{} done", command_label(id)));
                 if matches!(id, "file.new" | "doc.open" | "doc.recover") {
+                    dim_view::cancel();
                     self.menu.props = None;
                     sketch_attachment_ui::clear(self);
                     // The old document is already replaced: discard its editor without
@@ -468,10 +484,11 @@ impl SolveApp {
     /// that have them, otherwise run it with defaults.
     pub fn start(&mut self, id: &str) {
         // A component moved without Capture Position: ask first (Capture, Revert or Cancel).
-        if browser::needs_capture(self, id) {
+        if browser::needs_capture(self, id) && !(id == "sketch.dimension" && self.session.active_sketch.is_some()) {
             self.tree.capture_prompt = Some(id.to_string());
             return;
         }
+        dim_view::cancel();
         self.tool = None;
         self.home.open = false;
         if matches!(id, "sketch.insert_dxf" | "sketch.insert_svg") {
@@ -531,6 +548,34 @@ impl SolveApp {
             self.last_command = Some((spec.id.to_string(), spec.label.to_string()));
         }
         if let Some(mut t) = tools::Tool::for_command(id) {
+            if let Some(params) = tools::constraint_preselection(id, &self.session.selection) {
+                if self.run(id, params).is_ok() {
+                    let _ = self.session.execute("select.clear", &json!({}));
+                    self.set_status("Constraint applied", false);
+                }
+                return;
+            }
+            // Curve-pair constraints can consume an exact preselection. Leave ambiguous
+            // selections to the ordinary pick tool; never silently constrain a subset.
+            if matches!(
+                id,
+                "sketch.constraint.parallel"
+                    | "sketch.constraint.perpendicular"
+                    | "sketch.constraint.equal"
+                    | "sketch.constraint.tangent"
+                    | "sketch.constraint.concentric"
+                    | "sketch.constraint.collinear"
+            ) && let [solvecraft_engine::Sel::SketchCurve { id: a }, solvecraft_engine::Sel::SketchCurve { id: b }] =
+                self.session.selection.as_slice()
+                && a != b
+            {
+                let params = json!({ "a": a, "b": b });
+                if self.run(id, params).is_ok() {
+                    let _ = self.session.execute("select.clear", &json!({}));
+                    self.set_status("Constraint applied", false);
+                }
+                return;
+            }
             if id == "sketch.dimension" {
                 t.picks = self
                     .session
@@ -625,6 +670,7 @@ impl SolveApp {
     /// Finish the active sketch: stop editing, restore the history marker Edit Sketch moved and
     /// return to the view from before the sketch.
     pub fn finish_sketch(&mut self) {
+        dim_view::cancel();
         self.tool = None;
         let _ = self.run("sketch.finish", json!({}));
         if let Some(marker) = self.pre_sketch_marker.take() {
@@ -715,6 +761,10 @@ impl SolveApp {
 
     pub fn fit_view(&mut self) {
         self.cam_anim = None;
+        self.viewport.orbit_snap = None;
+        self.viewport.orbit_free = None;
+        let bounds = solvecraft_engine::view::bounds(&self.session);
+        self.pending_fit = Some((self.cam, bounds, false));
         self.cam = self.fitted(self.cam);
     }
 
@@ -725,13 +775,41 @@ impl SolveApp {
             cam.target = solvecraft_engine::geom::Vec3::ZERO;
             cam.distance = 150.0;
         } else {
-            cam.fit(&b);
+            cam = self.fitted_bounds(cam, &b);
         }
         cam
     }
 
+    fn fitted_bounds(&self, mut cam: Camera, bounds: &solvecraft_engine::geom::Aabb3) -> Camera {
+        if let Some(layout) = &self.viewport.layout {
+            return viewport_layout::fit_bounds(cam, bounds, layout, self.ui.perspective).unwrap_or(cam);
+        }
+        let previous = cam;
+        cam.fit(bounds);
+        if cam.is_valid() { cam } else { previous }
+    }
+
+    fn resolve_fit(&mut self, ctx: &egui::Context) {
+        viewport::refresh_layout(self, ctx.pixels_per_point());
+        if self.viewport.layout.is_some()
+            && let Some((cam, bounds, animate)) = self.pending_fit.take()
+        {
+            let to = if bounds.is_empty() { self.fitted(cam) } else { self.fitted_bounds(cam, &bounds) };
+            if animate {
+                self.animate_to(to);
+            } else {
+                self.cam = to;
+                self.cam_anim = None;
+            }
+            ctx.request_repaint();
+        }
+    }
+
     /// Move the camera to `to` over half a second (ease in-out, orientation slerped).
     pub fn animate_to(&mut self, to: Camera) {
+        self.pending_fit = None;
+        self.viewport.orbit_snap = None;
+        self.viewport.orbit_free = None;
         if !to.is_valid() {
             return;
         }
@@ -749,17 +827,25 @@ impl SolveApp {
         self.cam_anim = Some(anim);
     }
 
-    /// Animated view changes for the view cube and navigation bar.
+    /// Animated view changes for the axis view and navigation bar.
     pub fn animate_view(&mut self, v: &str) {
+        self.pending_fit = None;
         let mut to = self.cam;
         match v {
             // With something selected, Fit frames the selection.
             "fit" => match viewport::selection_bounds(self) {
-                Some(b) => to.fit(&b),
-                None => to = self.fitted(to),
+                Some(b) => {
+                    self.pending_fit = Some((to, b, true));
+                    to = self.fitted_bounds(to, &b);
+                }
+                None => {
+                    self.pending_fit = Some((to, solvecraft_engine::view::bounds(&self.session), true));
+                    to = self.fitted(to);
+                }
             },
             "home" => {
                 to.set_view(StandardView::Iso);
+                self.pending_fit = Some((to, solvecraft_engine::view::bounds(&self.session), true));
                 to = self.fitted(to);
             }
             v => match StandardView::parse(v) {
@@ -767,12 +853,24 @@ impl SolveApp {
                 None => return,
             },
         }
+        let request = self.pending_fit.take();
         self.animate_to(to);
+        self.pending_fit = request;
     }
 
     /// Stop any view animation where it is (the user took over the camera).
     pub fn cancel_view_animation(&mut self) {
+        self.pending_fit = None;
         self.cam_anim = None;
+    }
+
+    /// Hand the view to an external navigation device without a pending mouse orbit or spin
+    /// immediately taking it back on the next frame.
+    pub fn begin_external_navigation(&mut self) {
+        self.cancel_view_animation();
+        self.viewport.orbit_snap = None;
+        self.viewport.orbit_free = None;
+        self.viewport.spin = false;
     }
 
     fn step_view_animation(&mut self, ctx: &egui::Context) {
@@ -810,14 +908,19 @@ impl SolveApp {
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         }
+        issue_report::tick(self, ctx);
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
-        toolbar::shortcuts(self, ctx);
+        if self.issue_report.draft.is_none() {
+            toolbar::shortcuts(self, ctx);
+        }
         recovery_ui::tick(self);
-        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-            let p = f.path().to_string_lossy().to_string();
-            if !p.is_empty() {
-                self.drop_path(&p);
+        if self.issue_report.draft.is_none() {
+            for f in ctx.input(|i| i.raw.dropped_files.clone()) {
+                let p = f.path().to_string_lossy().to_string();
+                if !p.is_empty() {
+                    self.drop_path(&p);
+                }
             }
         }
     }
@@ -851,16 +954,29 @@ impl SolveApp {
 
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        expression_complete::begin_frame(ui.ctx());
         let t0 = now_ms();
         let _language = crate::i18n::scope(&self.preferences.language);
+        let mut report_input = None;
+        issue_report::CadInput::block(self, ui, &mut report_input);
+        self.cad_ui(ui, &mut report_input);
+        drop(report_input);
+        issue_report::show(self, ui.ctx());
+        if !self.home.open {
+            agent_cursor::paint(self, ui.ctx());
+        }
+        self.frame_ms = now_ms() - t0;
+    }
+
+    fn cad_ui(&mut self, ui: &mut egui::Ui, report_input: &mut Option<issue_report::CadInput>) {
         scenario::clear_handles();
         toolbar::app_bar(self, ui);
+        issue_report::CadInput::block(self, ui, report_input);
         file_load::show(self, ui.ctx());
         documents::prompt(self, ui.ctx());
         if self.home.open {
             home::show(self, ui);
             if self.home.open {
-                self.frame_ms = now_ms() - t0;
                 return;
             }
         }
@@ -877,7 +993,9 @@ impl SolveApp {
             viewport::show(self, ui);
         });
         dialogs::show(self, ui.ctx());
+        issue_report::CadInput::block(self, ui, report_input);
         sketch_palette::show(self, ui.ctx());
+        self.resolve_fit(ui.ctx());
         params_dialog::show(self, ui.ctx());
         recovery_ui::show(self, ui.ctx());
         stand_up::show(self, ui.ctx());
@@ -888,14 +1006,19 @@ impl SolveApp {
         }
         shortcut_box::show(self, ui.ctx());
         prefs::show(self, ui.ctx());
-        agent_cursor::paint(self, ui.ctx());
-        self.frame_ms = now_ms() - t0;
     }
 
     fn drain_control(&mut self, ctx: &egui::Context) {
+        /// Requests run on this thread, so a flood would starve rendering. The rest stay
+        /// queued for the next frame.
+        const PER_FRAME: usize = 64;
+
         let Some(rx) = self.control_rx.take() else { return };
         // While the agent cursor acts out a request, later ones wait their turn.
-        while !self.agent.busy() {
+        for _ in 0..PER_FRAME {
+            if self.agent.busy() {
+                break;
+            }
             let Ok(req) = rx.try_recv() else { break };
             let reply = req.reply.clone();
             if agent_cursor::intercept(self, &req.method, &req.params, &reply) {
@@ -935,7 +1058,7 @@ impl SolveApp {
     }
 
     fn collect_screenshots(&mut self, ctx: &egui::Context) {
-        if self.pending_shots.is_empty() {
+        if self.pending_shots.is_empty() && !issue_report::pending(self) {
             return;
         }
         let events: Vec<_> = ctx.input(|i| {
@@ -952,6 +1075,7 @@ impl SolveApp {
                 .collect()
         });
         for (token, image) in events {
+            issue_report::receive(self, token, image.clone());
             if let Some(i) = self.pending_shots.iter().position(|(t, ..)| *t == token) {
                 let (_, path, reply, _) = self.pending_shots.remove(i);
                 let _ = reply.send(control::save_screenshot(&image, path.as_deref()));

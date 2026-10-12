@@ -141,15 +141,13 @@ fn resolve_uncached(
                 LinkKind::Intersect => section(plane, &mesh, Some(f)),
                 _ => {
                     let mut g = Vec::new();
-                    for e in order::face_edges(&mesh, f, plane)? {
-                        if mesh.seams.get(e).copied().unwrap_or(false) {
-                            continue;
-                        }
+                    let target = st.bodies.get(bi).ok_or_else(|| lost("the projection body"))?;
+                    for e in projection_face_edges(target, &mesh, f, plane)? {
                         if let Some(pts) = mesh.edges.get(e) {
                             g.extend(fit_world(plane, pts));
                         }
                     }
-                    g
+                    if certified_planar_construction(target, f as usize) { merge_family_lines(g)? } else { g }
                 }
             }
         }
@@ -293,20 +291,41 @@ fn resolve_named_face(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str
         section(plane, &mesh, Some(index))
     } else {
         let mut geom = Vec::new();
-        for edge in order::face_edges(&mesh, index, plane)? {
-            if mesh.seams.get(edge).copied().unwrap_or(false) {
-                continue;
-            }
+        for edge in projection_face_edges(target, &mesh, index, plane)? {
             if let Some(points) = mesh.edges.get(edge) {
                 geom.extend(fit_world(plane, points));
             }
         }
-        merge_split_circles(geom)
+        let geom = merge_split_circles(geom);
+        if certified_planar_construction(target, index as usize) { merge_family_lines(geom)? } else { geom }
     };
     if geom.is_empty() {
         return Err(DocError::Invalid("named face projects to nothing on this sketch plane".into()));
     }
     Ok(Resolved { geom, wires: Vec::new(), source: LinkSource::Face { body: body.into(), at }, moved: false, face_index })
+}
+
+fn projection_face_edges(body: &crate::ModelBody, mesh: &Mesh, index: u32, plane: &Plane) -> Result<Vec<usize>> {
+    let shell_plane = body
+        .body
+        .face_sources()
+        .and_then(|sources| sources.get(index as usize))
+        .is_some_and(|source| matches!(source, Some(solvecraft_kernel::FaceSource::ShellPlanar { .. })));
+    if shell_plane { order::raw_face_edges(mesh, index, plane) } else { order::face_edges(mesh, index, plane) }
+}
+
+fn certified_planar_construction(body: &crate::ModelBody, index: usize) -> bool {
+    body.body.face_sources().and_then(|sources| sources.get(index)).is_some_and(|source| {
+        matches!(
+            source,
+            Some(
+                solvecraft_kernel::FaceSource::ShellPlanar { producer: Some(_), .. }
+                    | solvecraft_kernel::FaceSource::Box { producer: Some(_), .. }
+                    | solvecraft_kernel::FaceSource::CertifiedExtrudeSide { plane: Some(_), .. }
+                    | solvecraft_kernel::FaceSource::CertifiedExtrudeCap { .. }
+            )
+        )
+    })
 }
 
 pub fn resolve_anchored_face(doc: &Document, st: &ModelState, plane: &Plane, kind: LinkKind, anchor: &crate::FaceAnchor) -> Result<Resolved> {
@@ -329,20 +348,30 @@ pub fn resolve_face_indices(st: &ModelState, plane: &Plane, kind: LinkKind, body
     }
     let selected: std::collections::BTreeSet<_> = indices.iter().copied().collect();
     let mut geometry = Vec::new();
-    for index in indices {
-        let index = u32::try_from(*index).map_err(|_| DocError::Invalid("anchored face index exceeds format bounds".into()))?;
-        if kind == LinkKind::Intersect {
+    if kind == LinkKind::Intersect {
+        for index in indices {
+            let index = u32::try_from(*index).map_err(|_| DocError::Invalid("anchored face index exceeds format bounds".into()))?;
             geometry.extend(section(plane, &mesh, Some(index)));
+        }
+    } else {
+        let edges = if let [index] = indices {
+            projection_face_edges(
+                body,
+                &mesh,
+                u32::try_from(*index).map_err(|_| DocError::Invalid("face index exceeds format bounds".into()))?,
+                plane,
+            )?
         } else {
-            for edge in order::face_edges(&mesh, index, plane)? {
-                if mesh.seams.get(edge).copied().unwrap_or(false) {
-                    continue;
-                }
-                if let Some(points) = mesh.edges.get(edge) {
-                    geometry.extend(fit_world(plane, points));
-                }
+            order::family_edges(&mesh, &selected, plane)?
+        };
+        for edge in edges {
+            if let Some(points) = mesh.edges.get(edge) {
+                geometry.extend(fit_world(plane, points));
             }
         }
+    }
+    if kind != LinkKind::Intersect && (indices.len() > 1 || indices.first().is_some_and(|index| certified_planar_construction(body, *index))) {
+        geometry = merge_family_lines(geometry)?;
     }
     let point = mesh
         .triangles
@@ -373,6 +402,75 @@ pub fn refresh_face_anchor_links(
     refresh_links_in(doc, vals, st, plane, sk, Some(anchor))
 }
 
+/// Remove degree-two straight stations introduced by coplanar face subdivision.
+/// The walk uses endpoint incidence; geometric sorting does not imply adjacency.
+fn merge_family_lines(geom: Vec<LinkGeom>) -> Result<Vec<LinkGeom>> {
+    if geom.len().saturating_mul(geom.len()).saturating_mul(3) > 10_000_000 {
+        return Err(DocError::Invalid("face family straight-boundary work limit exceeded".into()));
+    }
+    let ends = |curve: &LinkGeom| match curve {
+        LinkGeom::Line(a, b) | LinkGeom::Arc { a, b, .. } | LinkGeom::Conic { a, b, .. } => Some((*a, *b)),
+        LinkGeom::Spline { pts, periodic: false, .. } => pts.first().zip(pts.last()).map(|(a, b)| (*a, *b)),
+        _ => None,
+    };
+    let scale = geom.iter().filter_map(&ends).flat_map(|(a, b)| [a.len(), b.len()]).fold(1., f64::max);
+    let tol = scale * f64::EPSILON * 512.;
+    let mut used = vec![false; geom.len()];
+    let mut result = Vec::new();
+    for (index, curve) in geom.iter().enumerate() {
+        if used.get(index).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = used.get_mut(index) {
+            *slot = true;
+        }
+        let LinkGeom::Line(a, b) = curve else {
+            result.push(curve.clone());
+            continue;
+        };
+        let mut endpoints = [*a, *b];
+        for side in 0..2 {
+            let mut current = index;
+            for _ in 0..geom.len() {
+                let Some(point) = endpoints.get(side).copied() else { break };
+                let mut incidence = geom
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(other, curve)| ends(curve).filter(|(a, b)| a.dist(point) <= tol || b.dist(point) <= tol).map(|_| other));
+                let (Some(one), Some(two), None) = (incidence.next(), incidence.next(), incidence.next()) else { break };
+                let other = if one == current {
+                    two
+                } else if two == current {
+                    one
+                } else {
+                    break;
+                };
+                if used.get(other).copied().unwrap_or(true) {
+                    break;
+                }
+                let Some(LinkGeom::Line(a, b)) = geom.get(other) else { break };
+                let next = if a.dist(point) <= tol { *b } else { *a };
+                let Some(opposite) = endpoints.get(1 - side).copied() else { break };
+                let (Some(incoming), Some(outgoing)) = ((point - opposite).normalized(), (next - point).normalized()) else { break };
+                if incoming.dot(outgoing) <= 0. || incoming.cross(outgoing).abs() > f64::EPSILON * 512. {
+                    break;
+                }
+                if let Some(slot) = used.get_mut(other) {
+                    *slot = true;
+                }
+                if let Some(slot) = endpoints.get_mut(side) {
+                    *slot = next;
+                }
+                current = other;
+            }
+        }
+        if let (Some(a), Some(b)) = (endpoints.first(), endpoints.get(1)) {
+            result.push(LinkGeom::Line(*a, *b));
+        }
+    }
+    Ok(result)
+}
+
 pub fn refresh_links(doc: &Document, vals: &BTreeMap<String, Value>, st: &ModelState, plane: &Plane, sk: &mut Sketch) -> Vec<String> {
     refresh_links_in(doc, vals, st, plane, sk, None)
 }
@@ -394,6 +492,18 @@ fn refresh_links_in(
             && let (Some(name), LinkSource::Face { body, at }) = (&l.face_name, &mut source)
         {
             if let Some((index, p, split)) = st.body(body).and_then(|target| crate::naming::face_on_body(target, name, *at)) {
+                let stem = crate::naming::strip_piece(name);
+                let removed_piece = split
+                    && name != stem
+                    && st.body(body).is_some_and(|target| {
+                        (certified_planar_construction(target, index) || target.body.face_was_coalesced(index))
+                            && crate::naming::face_names(target).get(index).is_some_and(|current| current == stem)
+                    });
+                if removed_piece {
+                    sk.set_link_lost(&l.id, true);
+                    warn.push(format!("projected face piece `{name}` no longer exists; last geometry retained"));
+                    continue;
+                }
                 *at = p;
                 named_face = Some((body.clone(), index, p));
                 if split {

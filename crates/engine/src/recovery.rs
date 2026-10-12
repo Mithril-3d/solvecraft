@@ -100,7 +100,9 @@ pub fn load(dir: &Path, id: &str) -> Result<(Document, Entry)> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| EngineError::Other(format!("no recovered design `{id}`")))?;
-    let bytes = fs::read(file(dir, id, "solvecraft")).map_err(|e| EngineError::Other(format!("recovered design `{id}`: {e}")))?;
+    let path = file(dir, id, "solvecraft");
+    let bytes = solvecraft_io::vfs::read(&path.to_string_lossy(), solvecraft_io::MAX_DESIGN_BYTES)
+        .map_err(|e| EngineError::Other(format!("recovered design `{id}`: {e}")))?;
     Ok((solvecraft_io::read_design(&bytes)?, entry))
 }
 

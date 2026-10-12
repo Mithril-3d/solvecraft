@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  SolveCraft MSI (WiX Toolset v5, plus the UI and Util extensions). Built by package.ps1:
+  SolidCraft MSI (WiX Toolset v5, plus the UI and Util extensions). Built by package.ps1:
 
     wix build solvecraft.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
       -culture en-US -loc solvecraft.en-us.wxl -d Version=1.2.3 -d DisplayVersion=1.2.3-rc.1
@@ -8,33 +8,33 @@
 
   Per-machine install with a setup wizard: Welcome, install folder (Program Files\SolveCraft by
   default, remembered for upgrades), Ready, progress, and a Finish page with a ticked "Launch
-  SolveCraft" box. Installs a Start Menu shortcut, solvecraft-cli, the licence files (including
-  THIRD-PARTY-LICENSES.txt), makes SolveCraft the owner of `.solvecraft` and offers it under
+  SolidCraft" box. Installs a Start Menu shortcut, solvecraft-cli, the licence files (including
+  THIRD-PARTY-LICENSES.txt), makes SolidCraft the owner of `.solvecraft` and offers it under
   "Open with" for STEP, IGES, 3MF and STL. `msiexec /qn` installs silently.
   Adapted from PhotoCraft's (storytold/photocraft, Apache-2.0; see ATTRIBUTION.md).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
-      Name="SolveCraft"
-      Manufacturer="SolveCraft contributors"
+      Name="SolidCraft"
+      Manufacturer="SolidCraft contributors"
       Version="$(var.Version)"
       UpgradeCode="6A145FD6-D285-428D-AE84-A69570CDF4DB"
       Scope="perMachine"
       Compressed="yes"
       Language="1033">
-    <SummaryInformation Description="SolveCraft parametric 3D CAD" Manufacturer="SolveCraft contributors" />
+    <SummaryInformation Description="SolidCraft parametric 3D CAD" Manufacturer="SolidCraft contributors" />
     <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="A newer version of SolveCraft is already installed." />
+        DowngradeErrorMessage="A newer version of SolidCraft is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <!-- Advertised shortcuts to an .exe need an .exe icon identifier (ICE50). -->
     <Icon Id="SolvecraftIcon.exe" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="SolvecraftIcon.exe" />
-    <Property Id="ARPURLINFOABOUT" Value="https://bherbruck.github.io/solvecraft/" />
-    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/bherbruck/solvecraft/releases" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/bherbruck/solvecraft/issues" />
+    <Property Id="ARPURLINFOABOUT" Value="https://bherbruck.github.io/solidcraft/" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/bherbruck/solidcraft/releases" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/bherbruck/solidcraft/issues" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="SolveCraft" />
@@ -46,7 +46,7 @@
       <RegistrySearch Id="PreviousInstallFolder" Root="HKLM" Key="Software\SolveCraft" Name="InstallDir" Type="raw" />
     </Property>
 
-    <Feature Id="Main" Title="SolveCraft" Level="1">
+    <Feature Id="Main" Title="SolidCraft" Level="1">
       <ComponentGroupRef Id="SolvecraftFiles" />
     </Feature>
 
@@ -60,8 +60,8 @@
     </UI>
 
     <Property Id="SolvecraftVersion" Value="$(var.DisplayVersion)" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="SolveCraft $(var.DisplayVersion) is installed. You can start it any time from the Start menu." />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch SolveCraft" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="SolidCraft $(var.DisplayVersion) is installed. You can start it any time from the Start menu." />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch SolidCraft" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#SolvecraftExe]" />
     <!-- Runs in the wizard's own (unelevated) process, so the app starts as the user. -->
@@ -72,13 +72,13 @@
     <ComponentGroup Id="SolvecraftFiles" Directory="INSTALLFOLDER">
       <Component Id="SolvecraftApp" Guid="290BEF27-C200-4069-AA43-7DE6A39CDB0A">
         <File Id="SolvecraftExe" Source="$(var.BinDir)\solvecraft.exe" KeyPath="yes">
-          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="SolveCraft"
-              Description="SolveCraft parametric 3D CAD" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="SolidCraft"
+              Description="SolidCraft parametric 3D CAD" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
               Icon="SolvecraftIcon.exe" IconIndex="0" />
         </File>
 
-        <!-- .solvecraft: SolveCraft's own format; SolveCraft is its default app. -->
-        <ProgId Id="Solvecraft.Design" Description="SolveCraft Design" Icon="SolvecraftExe" IconIndex="0">
+        <!-- .solvecraft: SolidCraft's own format; SolidCraft is its default app. -->
+        <ProgId Id="Solvecraft.Design" Description="SolidCraft Design" Icon="SolvecraftExe" IconIndex="0">
           <Extension Id="solvecraft" ContentType="application/x-solvecraft">
             <Verb Id="open" Command="Open" TargetFile="SolvecraftExe" Argument="&quot;%1&quot;" />
           </Extension>
@@ -94,7 +94,7 @@
         <RegistryValue Root="HKLM" Key="Software\Classes\.stl\OpenWithProgids" Name="Solvecraft.Model" Value="" Type="string" />
 
         <!-- "Open with" app list and the Run dialog (Win+R "solvecraft"). -->
-        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solvecraft.exe" Name="FriendlyAppName" Value="SolveCraft" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solvecraft.exe" Name="FriendlyAppName" Value="SolidCraft" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solvecraft.exe\shell\open\command" Value="&quot;[#SolvecraftExe]&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solvecraft.exe\SupportedTypes" Name=".solvecraft" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solvecraft.exe\SupportedTypes" Name=".step" Value="" Type="string" />

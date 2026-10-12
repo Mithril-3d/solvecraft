@@ -82,7 +82,7 @@ fn classify(e: &EngineError) -> Outcome {
     match e {
         EngineError::Internal(..) => Outcome::new("panic", msg),
         EngineError::BadParams { .. } | EngineError::Disabled(..) | EngineError::UnknownCommand(_) => Outcome::new("rejected", msg),
-        // A failed boolean is a failure even when it says "not supported" (coincident faces on
+        // A failed boolean is a failure even when it says "not supported" (the planar fallback on
         // curved bodies): those are the cases to fix. Features the kernel doesn't do yet (a
         // fillet between curved faces) are limitations.
         // Picks the generator got wrong (a centroid off its face).

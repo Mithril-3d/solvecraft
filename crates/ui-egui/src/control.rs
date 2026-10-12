@@ -15,7 +15,8 @@
 //! - `ui.click {x, y, button?, shift?}`, `ui.move {x, y}`, `ui.scroll {x, y, delta}`: real
 //!   pointer input in screen points; `ui.key {key, cmd?, shift?}`, `ui.text {text}`
 //! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path, width?, height?}`: headless
-//!   CPU render of the model with the current camera (no window needed)
+//!   CPU render of the model with the current camera and the section the viewport shows (no
+//!   window needed)
 //! - `ui.menu {x?, y?, target?, close?}`: open a context menu at a point (the viewport's marking
 //!   menu, or a browser menu with `target: {type: body|sketch|component, …}`); without a point,
 //!   the open menu and its items. `ui.menuPick {item}` runs an item by id or label;
@@ -189,6 +190,8 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
         }
         "ui.view" => {
             let v = s("view").unwrap_or("home");
+            app.viewport.orbit_snap = None;
+            app.viewport.orbit_free = None;
             if p.get("animate").and_then(Value::as_bool).unwrap_or(false) {
                 if v != "fit" && v != "home" && StandardView::parse(v).is_none() {
                     return err(format!("unknown view `{v}`"));
@@ -196,7 +199,7 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 app.animate_view(v);
                 return ok(json!({ "animating": true, "to": app.cam_anim.map(|a| a.to) }));
             }
-            app.cam_anim = None;
+            app.cancel_view_animation();
             match v {
                 "fit" => app.fit_view(),
                 "home" => {
@@ -342,12 +345,6 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 };
             }
             let Some(rect) = app.viewport.rect else { return err("no viewport") };
-            if let Some(c) = p.get("cube") {
-                // A point on the view cube, in cube units (faces at ±1).
-                let n = |i: usize| c.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-                let q = crate::viewport::cube_point(app, rect, solvecraft_engine::geom::Vec3::new(n(0), n(1), n(2)));
-                return ok(json!([q.x, q.y]));
-            }
             let proj = crate::viewport::projection(app, rect);
             let num = |v: &Value, i: usize| v.get(i).and_then(Value::as_f64).unwrap_or(0.0);
             let world = if let Some(w) = p.get("world") {
@@ -523,7 +520,9 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "ui.render" => {
             let w = f("width").unwrap_or(1280.0).clamp(16.0, 8192.0) as usize;
             let h = f("height").unwrap_or(800.0).clamp(16.0, 8192.0) as usize;
-            let scene = solvecraft_engine::view::scene(&app.session, &app.cam);
+            // Cut by the section the viewport shows (an open Section Analysis dialog's preview,
+            // a sketch's Slice), not only the committed one.
+            let scene = solvecraft_engine::view::scene_with_section(&app.session, &app.cam, crate::viewport::section_plane(app));
             let Some(png) = render_png(&scene, &app.cam, w, h) else { return err("render failed") };
             match s("path") {
                 Some(path) => match std::fs::write(path, &png) {
@@ -561,5 +560,47 @@ pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
     match img.save(&path) {
         Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
         Err(e) => json!({"ok": false, "error": e.to_string()}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use solvecraft_engine::{Sel, Session};
+
+    use super::*;
+    use crate::Services;
+
+    fn render(app: &mut SolveApp, path: &std::path::Path) -> Vec<u8> {
+        let (req, _rx) = ControlRequest::new("ui.render", json!({"path": path.to_string_lossy(), "width": 200, "height": 140}));
+        match handle(app, &egui::Context::default(), &req) {
+            Outcome::Done(v) => assert_eq!(v["ok"], true, "{v}"),
+            Outcome::Screenshot { .. } => panic!("ui.render took a screenshot"),
+        }
+        std::fs::read(path).unwrap()
+    }
+
+    /// A model render shows the section the window shows: the open Section Analysis dialog's
+    /// preview too, not only a committed `inspect.section`.
+    #[test]
+    fn model_render_shows_the_section_dialog_preview() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        let mut app = SolveApp::new(s, Services::default());
+        let dir = std::env::temp_dir().join(format!("solvecraft-render-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let whole = render(&mut app, &dir.join("whole.png"));
+        app.session.selection = vec![Sel::Plane { name: "XZ".into() }];
+        app.start("inspect.section");
+        let Some(crate::dialogs::Kind::Section { offset, .. }) = app.dialog.as_mut().map(|d| &mut d.kind) else { panic!("no section dialog") };
+        *offset = "15 mm".into();
+        assert!(app.session.section.is_none() && crate::viewport::section_plane(&app).is_some());
+        let preview = render(&mut app, &dir.join("preview.png"));
+        assert!(whole != preview, "the model render ignores the section the window shows");
+        // Committed, it renders the same.
+        app.run("inspect.section", json!({"plane": "XZ", "offset": 15})).unwrap();
+        app.dialog = None;
+        assert!(render(&mut app, &dir.join("committed.png")) == preview, "the committed section renders differently");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

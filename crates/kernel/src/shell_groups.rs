@@ -79,6 +79,44 @@ fn triangles_meet(a: &[Vec3; 3], b: &[Vec3; 3], gap: f64) -> bool {
     true
 }
 
+/// Whether two closed meshes share material or touch: a boundary triangle of one comes within
+/// `gap` of one of the other's, or one encloses the other.
+pub(super) fn meshes_meet(a: &Mesh, b: &Mesh, gap: f64) -> Result<bool> {
+    if !gap.is_finite() || gap <= 0.0 {
+        return Err(failed("invalid contact clearance"));
+    }
+    let (ba, bb) = (a.bounds(), b.bounds());
+    if ba.is_empty() || bb.is_empty() || boxes_separate(ba, bb, gap) {
+        return Ok(false);
+    }
+    // Only triangles near the other body can touch it.
+    let near = |m: &Mesh, other: Aabb3| -> Result<Vec<([Vec3; 3], Aabb3)>> {
+        let mut out = Vec::new();
+        for t in &m.triangles {
+            let tri = m.tri(t).ok_or_else(|| failed("invalid contact triangle"))?;
+            let bounds = box_of(&tri);
+            if !boxes_separate(bounds, other, gap) {
+                out.push((tri, bounds));
+            }
+        }
+        Ok(out)
+    };
+    let (ta, tb) = (near(a, bb)?, near(b, ba)?);
+    let work = ta.len().checked_mul(tb.len()).ok_or_else(|| failed("contact work exceeds the limit"))?;
+    if work > MAX_PAIR_WORK {
+        return Err(failed("contact work exceeds the limit"));
+    }
+    for (x, xb) in &ta {
+        for (y, yb) in &tb {
+            if !boxes_separate(*xb, *yb, gap) && triangles_meet(x, y, gap) {
+                return Ok(true);
+            }
+        }
+    }
+    // No boundary contact: they meet only if one lies wholly inside the other.
+    Ok(b.positions.first().is_some_and(|p| a.contains(*p)) || a.positions.first().is_some_and(|p| b.contains(*p)))
+}
+
 pub(super) fn groups(meshes: &[Mesh], volumes: &[f64], gap: f64) -> Result<Vec<Vec<usize>>> {
     if meshes.is_empty() || meshes.len() != volumes.len() || meshes.len() > MAX_SHELLS {
         return Err(failed("shell count exceeds the grouping limit or is invalid"));

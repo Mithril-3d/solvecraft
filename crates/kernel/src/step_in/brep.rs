@@ -16,6 +16,10 @@ use crate::guard;
 const MAX_FACES: usize = 500_000;
 /// Most edges in one loop.
 const MAX_LOOP: usize = 100_000;
+/// Most boundary loops on one face. Each bound clones its edge handles into a new wire and the
+/// face extent then samples nine points per edge, so one face listing the same 100,000-edge
+/// loop a million times would hold 1e11 handles.
+const MAX_BOUNDS: usize = 10_000;
 
 /// A body read from a brep entity.
 pub(crate) struct BrepOut {
@@ -196,9 +200,18 @@ impl Builder {
         if !matches!(e.name(), "ADVANCED_FACE" | "FACE_SURFACE" | "FACE") {
             return Err(format!("unsupported face {}", e.name()));
         }
+        let bounds = refs(p.get(1));
+        if bounds.len() > MAX_BOUNDS {
+            return Err(format!("a face with more than {MAX_BOUNDS} boundary loops"));
+        }
         let mut wires = Vec::new();
-        for b in refs(p.get(1)) {
+        let mut edges = 0usize;
+        for b in bounds {
             if let Some(w) = self.bound(cx, b)? {
+                edges = edges.saturating_add(w.len());
+                if edges > MAX_LOOP {
+                    return Err(format!("a face with more than {MAX_LOOP} boundary edges"));
+                }
                 wires.push(w);
             }
         }
@@ -263,7 +276,13 @@ impl Builder {
                 .into_iter()
                 .map(|w| {
                     let edges: Vec<mt::Edge> = w.edge_iter().cloned().collect();
-                    let passes = |e: &mt::Edge| edges.iter().filter(|x| x.front().id() == e.front().id()).count();
+                    // Counted once: a loop may hold 100,000 edges, and asking per edge how
+                    // often its front vertex appears would scan them all again each time.
+                    let mut fronts: HashMap<_, usize> = HashMap::new();
+                    for e in &edges {
+                        *fronts.entry(e.front().id()).or_default() += 1;
+                    }
+                    let passes = |e: &mt::Edge| fronts.get(&e.front().id()).copied().unwrap_or(0);
                     match edges.first().map(passes) {
                         Some(n) if n > 1 => {
                             let start = edges.iter().position(|e| passes(e) == 1).unwrap_or(0);

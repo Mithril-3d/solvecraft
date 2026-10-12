@@ -10,7 +10,7 @@ fi
 # /releases/latest excludes prereleases. Include every published release instead,
 # including nightlies, and sort by publication time across all API pages.
 latest_tag="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-  --jq '[.[][] | select(.draft == false and .published_at != null)] | sort_by(.published_at) | last | .tag_name // empty')"
+  | jq -r '[.[][] | select(.draft == false and .published_at != null)] | sort_by(.published_at) | last | .tag_name // empty')"
 if [ -n "$latest_tag" ]; then
   # Resolve the tag itself, not target_commitish (which can be a moving branch).
   released_sha="$(git rev-parse --verify "refs/tags/$latest_tag^{commit}")"

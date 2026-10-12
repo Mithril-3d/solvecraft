@@ -1,5 +1,60 @@
 # Design loading
 
+## Cold geometry rebuilds after 0.3.1
+
+Three alternating cold-process comparisons on the same Windows machine and optimized
+`ci` profile, with no concurrent build, compare the unchanged 0.3.1 source with the
+straight-line projection and exact surface-refinement reuse changes:
+
+| Saved design | Before, median evaluation | After | Reduction |
+|---|---:|---:|---:|
+| Public sensor enclosure, 21 features, 52 KB | 11.96 s | 8.85 s | 26.0% |
+| Local Pi case assembly, 25 features, 2,990 bodies | 14.75 s | 11.57 s | 21.6% |
+
+These are geometry rebuild times, not complete desktop opening times. The public fixture
+can be generated with `solvecraft-cli run examples/acceptance/sensor_enclosure.json
+--save sensor.solvecraft --quiet`, then measured with `solvecraft-cli bench-open
+sensor.solvecraft`. Each benchmark starts a new process; this does not measure a warm
+timeline-cache hit. The local assembly is private and is not part of the repository.
+
+Straight segments now use guarded algebraic closest-point projection instead of sampling
+65 points and running Newton iterations. Other curve types retain their existing behavior.
+Curved-face refinement reuses derivative and midpoint evaluations with exact finite input
+keys and bounded, local caches. It keeps the original tolerance, seam and singularity
+checks, refinement passes, and triangle limits.
+
+Identity assembly placements retain the definition body's shared display-mesh cache.
+Changed placements continue to build separate meshes in their own coordinates. Face-name
+preparation remains eager during placement: deferring it merely shifted expensive work to
+thumbnails and the first face query, so that approach was excluded.
+
+Both saved fixtures retain exactly the same body names, face/edge/vertex/shell counts,
+bounds, volumes, and surface areas. Focused tests compare cached and uncached refinement
+coordinates and normals bit for bit on periodic, singular and transformed surfaces.
+
+For desktop phase profiling, set `SOLVECRAFT_PROFILE_OPEN=1` before launching the app.
+Interactive Open reports geometry, placement, tessellation, thumbnail and total worker
+times to stderr without logging the source path. Thumbnails were about 0.1 seconds of
+the slow assembly's open and were not the main bottleneck. Further cold Boolean and
+import costs remain; these changes do not make all documents open instantly.
+
+### Prepared assembly geometry and selection
+
+Prepared world geometry is now keyed by the document, evaluated model and exact placement
+context instead of the session revision. Selecting a face or edge, changing visibility,
+or moving the view no longer discards already prepared assembly bodies and meshes.
+Geometry edits, pending occurrence moves, authoring context changes, undo/redo and timeline
+rollback still invalidate the cache. Scratch sessions share prepared geometry while their
+inputs match, and adopting a computed session retains its warm cache.
+
+On the private 2,990-body Pi assembly, a matched Linux desktop control probe reduced an
+edge-selection round trip from 9.24 s to 0.57 s. Initial opening stayed essentially unchanged
+(33.54 s to 33.32 s); this fixes a separate selection stall, not cold geometry evaluation.
+Three fresh Windows desktop runs with the corrected cache measured a median 15.87 s to
+ready: 13.04 s geometry, 2.20 s placement, 0.53 s meshing and 0.07 s thumbnails. These used
+the optimized `ci` profile and actual Vulkan rendering, with isolated settings and caches.
+Linux and Windows timings are separate measurements and must not be compared as a speedup.
+
 `solvecraft-cli bench-open design.solvecraft` reports JSON lines for file reading,
 JSON decoding and migrations (including input-name repair), timeline evaluation, individual
 features, and world placement/display meshing. `--parse-only` stops before geometry evaluation.
@@ -136,7 +191,7 @@ Pi case in 15.2 s and 10.5 s. During those jobs, median `ui.inspect` round trips
 and 8.3 ms; the slowest were 33.7 ms and 28.6 ms. This fixes the window freeze, not the
 remaining cost of cold geometry evaluation.
 
-Recent thumbnails are 240 × 150 PNG files in `SolveCraft/thumbnails` under the platform
+Recent thumbnails are 240 Ã— 150 PNG files in `SolveCraft/thumbnails` under the platform
 cache directory (`LOCALAPPDATA` on Windows). Their keys include the source path, file size
 and modification time. Open and Save render from the model already in memory. Cached
 recents decode the PNG without reading or rebuilding a document, and run before cold

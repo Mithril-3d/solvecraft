@@ -77,7 +77,7 @@ jobs:
           fi
           case "$VERSION" in *-*) pre=true ;; *) pre=false ;; esac
           { echo "version=$VERSION"; echo "date=$(date -u +%Y-%m-%d)"; echo "prerelease=$pre"; } >>"$GITHUB_OUTPUT"
-          echo "### SolveCraft v$VERSION (\`${GITHUB_SHA::9}\`)" >>"$GITHUB_STEP_SUMMARY"
+          echo "### SolidCraft v$VERSION (\`${GITHUB_SHA::9}\`)" >>"$GITHUB_STEP_SUMMARY"
 
   # The app icon in every size, drawn by solvecraft-cli (no image files are committed), for the
   # Windows jobs: the ARM64 build is cross-compiled and can't run there to draw its own.
@@ -177,7 +177,7 @@ jobs:
       - name: Install flatpak-builder
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-common
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-common xvfb xauth weston dbus-x11
           # Ubuntu 24.04's AppArmor blocks the unprivileged user namespaces bubblewrap needs.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build the Flatpak bundle
@@ -357,7 +357,7 @@ jobs:
           sha256sum --check SHA256SUMS.txt
           # Stage all packages before publishing. Published tags are never replaced.
           gh release create "$tag" --draft --prerelease --latest=false \
-            --title "SolveCraft v$VERSION (nightly)" --target "$GITHUB_SHA" \
+            --title "SolidCraft v$VERSION (nightly)" --target "$GITHUB_SHA" \
             --notes-file ../notes.md --generate-notes -- *
           gh release edit "$tag" --draft=false --prerelease --latest=false
           echo "### Published nightly: $tag (\`${GITHUB_SHA::9}\`)" >>"$GITHUB_STEP_SUMMARY"
@@ -386,15 +386,15 @@ jobs:
             while IFS= read -r asset; do
               if [ -n "$asset" ]; then gh release delete-asset "$tag" "$asset" --yes; fi
             done <<<"$assets"
-            gh release edit "$tag" --draft --title "SolveCraft v$VERSION" \
+            gh release edit "$tag" --draft --title "SolidCraft v$VERSION" \
               --target "$GITHUB_SHA" --prerelease="$PRERELEASE"
             gh release upload "$tag" --clobber -- *
           else
-            gh release create "$tag" --draft --title "SolveCraft v$VERSION" \
+            gh release create "$tag" --draft --title "SolidCraft v$VERSION" \
               --target "$GITHUB_SHA" --notes-file ../notes.md --generate-notes "${pre[@]}" -- *
           fi
           {
-            echo "Draft **SolveCraft v$VERSION** at \`${GITHUB_SHA::9}\`:"
+            echo "Draft **SolidCraft v$VERSION** at \`${GITHUB_SHA::9}\`:"
             echo
             sed 's/^/    /' SHA256SUMS.txt
           } >>"$GITHUB_STEP_SUMMARY"

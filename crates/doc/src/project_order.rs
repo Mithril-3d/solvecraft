@@ -10,6 +10,36 @@ use crate::{DocError, Result};
 type Key = (i64, i64, i64);
 
 pub(super) fn face_edges(mesh: &Mesh, face: u32, plane: &Plane) -> Result<Vec<usize>> {
+    let edges = mesh.face_edges(face).into_iter().filter(|e| !mesh.seams.get(*e).copied().unwrap_or(false)).collect();
+    boundary_edges(mesh, edges, plane)
+}
+
+/// Full boundary of an explicitly selected analytic planar piece. Display seams
+/// hide subdivisions for picking, but cannot remove a raw piece's closing edge.
+pub(super) fn raw_face_edges(mesh: &Mesh, face: u32, plane: &Plane) -> Result<Vec<usize>> {
+    boundary_edges(mesh, mesh.face_edges(face), plane)
+}
+
+/// Exterior of an exact current face family. Shared topological edges are internal;
+/// geometric proximity never merges distinct edges or chooses a different face.
+pub(super) fn family_edges(mesh: &Mesh, selected: &std::collections::BTreeSet<usize>, plane: &Plane) -> Result<Vec<usize>> {
+    let mut edges = Vec::new();
+    for (index, faces) in mesh.edge_faces.iter().enumerate() {
+        let count = faces.iter().filter(|face| selected.contains(&(**face as usize))).count();
+        if count == 0 {
+            continue;
+        }
+        if faces.len() > 2 || (faces.len() == 2 && faces.first() == faces.get(1)) {
+            return Err(DocError::Invalid("face family has ambiguous edge adjacency".into()));
+        }
+        if count == 1 && !mesh.seams.get(index).copied().unwrap_or(false) {
+            edges.push(index);
+        }
+    }
+    boundary_edges(mesh, edges, plane)
+}
+
+fn boundary_edges(mesh: &Mesh, mut edges: Vec<usize>, plane: &Plane) -> Result<Vec<usize>> {
     let bounds = mesh.bounds();
     let origin = bounds.min;
     let local_origin = plane.to_local(origin);
@@ -21,7 +51,6 @@ pub(super) fn face_edges(mesh: &Mesh, face: u32, plane: &Plane) -> Result<Vec<us
         let p = p - origin;
         ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64)
     };
-    let mut edges: Vec<usize> = mesh.face_edges(face).into_iter().filter(|e| !mesh.seams.get(*e).copied().unwrap_or(false)).collect();
     if edges.iter().any(|e| !mesh.edges.get(*e).is_some_and(|p| p.len() >= 2 && p.iter().all(|p| p.is_finite()))) {
         return Err(DocError::Invalid("face projection has an invalid boundary edge".into()));
     }
@@ -118,6 +147,79 @@ pub(super) fn face_edges(mesh: &Mesh, face: u32, plane: &Plane) -> Result<Vec<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn face_family_omits_only_exact_shared_topological_edges() {
+        let mut mesh = Mesh::default();
+        for (a, b, faces) in [
+            ((0., 0.), (2., 0.), vec![0]),
+            ((2., 0.), (2., 1.), vec![0]),
+            ((2., 1.), (0., 1.), vec![0, 1]),
+            ((0., 1.), (0., 0.), vec![0]),
+            ((2., 1.), (2., 2.), vec![1]),
+            ((2., 2.), (0., 2.), vec![1]),
+            ((0., 2.), (0., 1.), vec![1]),
+        ] {
+            mesh.edges.push(vec![Vec3::new(a.0, a.1, 0.), Vec3::new(b.0, b.1, 0.)]);
+            mesh.positions.extend([Vec3::new(a.0, a.1, 0.), Vec3::new(b.0, b.1, 0.)]);
+            mesh.edge_faces.push(faces);
+        }
+        let selected = [0, 1].into_iter().collect();
+        let edges = family_edges(&mesh, &selected, &Plane::XY).unwrap();
+        assert_eq!(edges.len(), 6);
+        assert!(!edges.contains(&2));
+        let geometry: Vec<_> = edges.iter().flat_map(|edge| super::super::fit_world(&Plane::XY, &mesh.edges[*edge])).collect();
+        assert_eq!(super::super::merge_family_lines(geometry).unwrap().len(), 4);
+        assert_eq!(family_edges(&mesh, &[0].into_iter().collect(), &Plane::XY).unwrap().len(), 4);
+        mesh.edge_faces[2] = vec![0, 1, 2];
+        assert!(family_edges(&mesh, &selected, &Plane::XY).is_err());
+        mesh.edge_faces[2] = vec![0, 0];
+        assert!(family_edges(&mesh, &selected, &Plane::XY).is_err());
+    }
+
+    #[test]
+    fn distinct_crossing_boundaries_are_not_geometrically_cancelled() {
+        let mut mesh = Mesh::default();
+        for (face, x, y) in [(0, 0., 0.), (1, 1., 1.)] {
+            let corners = [Vec3::new(x, y, 0.), Vec3::new(x + 2., y, 0.), Vec3::new(x + 2., y + 2., 0.), Vec3::new(x, y + 2., 0.)];
+            mesh.positions.extend(corners);
+            for i in 0..4 {
+                mesh.edges.push(vec![corners[i], corners[(i + 1) % 4]]);
+                mesh.edge_faces.push(vec![face]);
+            }
+        }
+        let edges = family_edges(&mesh, &[0, 1].into_iter().collect(), &Plane::XY).unwrap();
+        assert_eq!(edges.len(), 8);
+        let geom: Vec<_> = edges.iter().flat_map(|edge| super::super::fit_world(&Plane::XY, &mesh.edges[*edge])).collect();
+        let mut sk = solvecraft_sketch::Sketch::new();
+        let link = sk
+            .add_link(solvecraft_sketch::LinkKind::Project, solvecraft_sketch::LinkSource::Face { body: "ambiguous".into(), at: Vec3::ZERO }, &geom)
+            .unwrap();
+        assert!(sk.update_link(&link, &geom).is_err());
+    }
+
+    #[test]
+    fn family_line_normalization_preserves_corners_arcs_branches_and_retracing() {
+        use solvecraft_geom::Vec2;
+        use solvecraft_sketch::LinkGeom;
+        let line = |a, b| LinkGeom::Line(Vec2::new(a, 0.), Vec2::new(b, 0.));
+        assert_eq!(super::super::merge_family_lines(vec![line(0., 1.), line(2., 1.)]).unwrap(), vec![line(0., 2.)]);
+        for geometry in [
+            vec![line(0., 1.), line(1., 0.5)],
+            vec![line(0., 1.), LinkGeom::Line(Vec2::new(1., 0.), Vec2::new(2., 1e-8))],
+            vec![line(0., 1.), line(1., 2.), LinkGeom::Line(Vec2::new(1., 0.), Vec2::new(1., 1.))],
+            vec![line(0., 1.), line(1., 2.), LinkGeom::Conic { a: Vec2::new(1., 0.), apex: Vec2::new(2., 1.), b: Vec2::new(3., 1.), rho: 0.5 }],
+            vec![
+                line(0., 1.),
+                line(1., 2.),
+                LinkGeom::Spline { pts: vec![Vec2::new(1., 0.), Vec2::new(2., 1.), Vec2::new(3., 1.)], control: false, degree: 2, periodic: false },
+            ],
+            vec![line(0., 1.), LinkGeom::Arc { c: Vec2::new(1., 1.), a: Vec2::new(1., 0.), b: Vec2::new(2., 1.) }],
+            vec![line(0., 1.), line(1.00001, 2.)],
+        ] {
+            assert_eq!(super::super::merge_family_lines(geometry.clone()).unwrap(), geometry);
+        }
+    }
 
     fn rectangles() -> Mesh {
         let mut mesh = Mesh::default();

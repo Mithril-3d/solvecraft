@@ -14,6 +14,12 @@ pub const MAX_IGES_BYTES: usize = 512 << 20;
 const MAX_ENTITIES: usize = 2_000_000;
 const MAX_DEPTH: usize = 32;
 const MAX_LIST: usize = 1_000_000;
+/// Entities visited and segments produced while expanding model curves. A composite curve
+/// (102) lists its children by pointer, and nothing stops a tree whose every node names the
+/// same child twice: 30 levels under the depth cap is 2^30 leaf visits and about 160 GB of
+/// segments. The depth cap alone does not see fan-out, and a node that produces no segment
+/// trips no output bound, so the visits are counted too.
+const MAX_CURVE_WORK: usize = 4 * MAX_ENTITIES;
 
 type R<T> = Result<T, String>;
 type V3 = [f64; 3];
@@ -249,7 +255,16 @@ fn parse(text: &str) -> R<Iges> {
         des.insert(2 * k + 1, de);
     }
     let mut params = HashMap::new();
+    // Nothing stops thousands of directory entries from naming the same parameter range, and
+    // each one materialises that range as its own string and token list. Keep the total text
+    // proportional to the parameter section the file actually carries.
+    let max_lines = p_lines.len().saturating_mul(4).saturating_add(1024);
+    let mut lines_used = 0usize;
     for (seq, de) in &des {
+        lines_used = lines_used.saturating_add(de.lines.max(1));
+        if lines_used > max_lines {
+            return Err("the file's parameter data is too large".into());
+        }
         let mut s = String::new();
         for l in de.pd..de.pd.saturating_add(de.lines.max(1)) {
             // Columns 1–64 run on (a long string may continue on the next line).
@@ -368,6 +383,10 @@ struct Tr<'a> {
     /// Sewing tolerance (mm).
     tol: f64,
     surf_cache: HashMap<(usize, [u64; 12]), u64>,
+    /// Entities visited and segments produced while expanding curves (see `MAX_CURVE_WORK`).
+    curve_work: usize,
+    /// Composite curves (102) on the path being expanded.
+    composites: Vec<i64>,
 }
 
 fn xf_key(x: &Xf) -> [u64; 12] {
@@ -442,6 +461,19 @@ impl<'a> Tr<'a> {
         if depth > MAX_DEPTH {
             return Err("curves nested too deeply".into());
         }
+        self.curve_work = self.curve_work.saturating_add(1);
+        if self.curve_work > MAX_CURVE_WORK {
+            return Err("the file's curves are too complex".into());
+        }
+        let out = self.curve_parts(seq, xf, depth)?;
+        self.curve_work = self.curve_work.saturating_add(out.len());
+        if self.curve_work > MAX_CURVE_WORK {
+            return Err("a curve has too many segments".into());
+        }
+        Ok(out)
+    }
+
+    fn curve_parts(&mut self, seq: i64, xf: &Xf, depth: usize) -> R<Vec<Seg>> {
         let de = self.de(seq)?;
         let x = xf.then(&self.own_xf(seq, 0)?);
         match de.typ {
@@ -479,13 +511,23 @@ impl<'a> Tr<'a> {
                 Ok(vec![Seg::along(cid, |t| at(a0 + (a1 - a0) * t))])
             }
             102 => {
+                // A composite curve that contains itself, directly or through another, would
+                // expand until the depth cap; refusing it on the way down is clearer.
+                if self.composites.contains(&seq) {
+                    return Err(format!("entity {seq}: composite curve contains itself"));
+                }
                 let n = self.i(seq, 1)?.clamp(0, MAX_LIST as i64) as usize;
                 let mut out = Vec::new();
-                for k in 0..n {
-                    let s = self.i(seq, 2 + k)?;
-                    out.extend(self.curve(s, &x, depth + 1)?);
-                }
-                Ok(out)
+                self.composites.push(seq);
+                let r = (|| {
+                    for k in 0..n {
+                        let s = self.i(seq, 2 + k)?;
+                        out.extend(self.curve(s, &x, depth + 1)?);
+                    }
+                    Ok(out)
+                })();
+                self.composites.pop();
+                r
             }
             126 => {
                 let nb = self.nurbs_curve(seq, &x)?;
@@ -833,7 +875,9 @@ struct Sewer {
 
 impl Sewer {
     fn vertex(&mut self, p: V3) -> usize {
-        let c = |x: f64| (x / self.tol).floor() as i64;
+        // Neighbouring buckets are this key plus or minus one, so leave room for that: a
+        // coordinate near f64's range saturates the cast and the addition would overflow.
+        let c = |x: f64| (x / self.tol).floor().clamp(-9e15, 9e15) as i64;
         let key = [c(p[0]), c(p[1]), c(p[2])];
         for dx in -1..=1 {
             for dy in -1..=1 {
@@ -1008,13 +1052,23 @@ fn write_shell(o: &mut Out, sw: &Sewer, faces: &[FaceB], styles: &mut Vec<(u64, 
 }
 
 /// IGES text restated as a STEP exchange (millimetres), with what could not be read.
+/// This was the one importer stage outside every panic guard, so a panic here reached the CLI
+/// and the wasm build, where nothing catches it.
 pub fn iges_to_step(text: &str) -> std::result::Result<(String, Vec<String>), String> {
+    crate::guard("IGES import", || translate(text).map_err(crate::KernelError::Invalid)).map_err(|e| match e {
+        crate::KernelError::Invalid(m) => m,
+        other => other.to_string(),
+    })
+}
+
+fn translate(text: &str) -> std::result::Result<(String, Vec<String>), String> {
     if text.len() > MAX_IGES_BYTES {
         return Err("IGES file too large".into());
     }
     let f = parse(text)?;
     let tol = (f.resolution * f.unit).clamp(1e-6, 0.05).max(1e-5);
-    let mut t = Tr { f: &f, o: Out { lines: Vec::new() }, warnings: Vec::new(), tol, surf_cache: HashMap::new() };
+    let mut t =
+        Tr { f: &f, o: Out { lines: Vec::new() }, warnings: Vec::new(), tol, surf_cache: HashMap::new(), curve_work: 0, composites: Vec::new() };
     // Header: units and context.
     let mm = t.o.add("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
     let rad = t.o.add("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))");
@@ -1110,7 +1164,7 @@ pub fn iges_to_step(text: &str) -> std::result::Result<(String, Vec<String>), St
         t.o.add(format!("STYLED_ITEM('color',(#{psa}),#{item})"));
     }
     let mut s = String::from(
-        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('IGES import'),'2;1');\nFILE_NAME('','',(''),(''),'SolveCraft IGES','','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n",
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('IGES import'),'2;1');\nFILE_NAME('','',(''),(''),'SolidCraft IGES','','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n",
     );
     for (i, l) in t.o.lines.iter().enumerate() {
         let _ = writeln!(s, "#{}={l};", i + 1);

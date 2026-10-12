@@ -1,0 +1,67 @@
+[
+  {
+    "note": "Signed axis tips own one highlight at a time and choose principal views."
+  },
+  {
+    "call": "ui.view",
+    "params": {
+      "view": "home"
+    }
+  },
+  {
+    "move": {
+      "handle": "axis_view:z"
+    }
+  },
+  {
+    "expect": {
+      "count": {
+        "name": "axis_view_highlights",
+        "value": 1
+      },
+      "shown_handles": [
+        "axis_view_hover:z"
+      ]
+    }
+  },
+  {
+    "click": {
+      "handle": "axis_view:z"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 0,
+        "pitch_deg": 90
+      }
+    }
+  },
+  {
+    "click": {
+      "handle": "axis_view:-y"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 0,
+        "pitch_deg": 0
+      }
+    }
+  },
+  {
+    "move": [
+      800,
+      500
+    ]
+  },
+  {
+    "expect": {
+      "count": {
+        "name": "axis_view_highlights",
+        "value": 0
+      }
+    }
+  }
+]

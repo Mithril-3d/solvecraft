@@ -47,9 +47,17 @@ DXF pocket boundaries use `POCKET_BOTTOM_Z…_TO_…_MM`, `POCKET_TOP_Z…_TO_�
 `POCKET_INTERNAL_Z…_TO_…_MM` layers. These are machining operations, so do not treat every
 pocket layer as a through-cut contour when importing the drawing into a CAM tool.
 
-Extrude Intersect on a straight base or an unfolded sheet retains the exact planar material,
-including interior holes and detached islands. A completely empty intersection removes the
-sheet and its metadata together. Pocket profiles can move with planar panels when forming,
+Extrude Intersect on a straight base or an unfolded sheet retains the material inside both
+the current tool footprint and its depth interval, including interior holes, detached islands
+and earlier pockets. A shallow intersection records the removed layers above and below the
+retained material as top and bottom pockets. The sheet rule keeps the original stock gauge;
+the remaining solid can be thinner. A completely empty intersection removes the sheet and
+its metadata together. DXF records pocket depth in its layer names; importing that DXF as
+ordinary sketch geometry does not reconstruct the machining depths automatically. Each
+positive retained or removed depth layer must meet the kernel's 0.000001 mm extrusion
+resolution; smaller layers report an error rather than being rounded away. To Object can
+retain a tool that trims to a straight prism, using its actual trimmed footprint. A curved
+tool with varying depth is refused before changing sheet geometry. Pocket profiles can move with planar panels when forming,
 but a pocket crossing a bend zone cannot yet be refolded. Machining folded bend material,
 tapered sheet cuts and other unsupported 3D sheet Cut/Intersect operations report an error before changing
 the design; they cannot silently restore removed material during a later sheet rebuild.

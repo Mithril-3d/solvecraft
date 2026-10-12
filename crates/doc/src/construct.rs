@@ -105,6 +105,10 @@ pub(crate) struct Ctx<'a> {
     pub doc: &'a Document,
     pub vals: &'a BTreeMap<String, Value>,
     pub st: &'a ModelState,
+    /// How deep the plane resolution that led here already is. A plane built from model
+    /// geometry resolves its sides through the document again, so the count has to continue
+    /// across that hop; restarting it lets a plane that refers to itself recurse forever.
+    pub depth: usize,
 }
 
 fn bad(m: impl Into<String>) -> DocError {
@@ -281,7 +285,7 @@ pub(crate) fn line(ctx: &Ctx, g: &GeoRef) -> Result<(Vec3, Vec3)> {
 /// A reference as a plane.
 pub(crate) fn plane(ctx: &Ctx, g: &GeoRef) -> Result<Plane> {
     match g {
-        GeoRef::Plane { plane } => ctx.doc.resolve_plane_in(ctx.vals, plane, 0, Some(ctx.st)),
+        GeoRef::Plane { plane } => ctx.doc.resolve_plane_in(ctx.vals, plane, ctx.depth + 1, Some(ctx.st)),
         GeoRef::Face { at, name } => {
             let (b, fi, q) = face_of(ctx.st, *at, name)?;
             match kernel::face_surface(&b.body, fi) {
@@ -527,7 +531,7 @@ pub(crate) fn resolve_geo_plane(ctx: &Ctx, p: &PlaneRef) -> Result<Plane> {
             let (p, tan) = along(&path_points(ctx, path)?, t).ok_or_else(|| bad("the path has no length"))?;
             Plane::from_normal(p, tan).ok_or_else(degenerate)
         }
-        _ => ctx.doc.resolve_plane_in(ctx.vals, p, 0, Some(ctx.st)),
+        _ => ctx.doc.resolve_plane_in(ctx.vals, p, ctx.depth + 1, Some(ctx.st)),
     }
 }
 

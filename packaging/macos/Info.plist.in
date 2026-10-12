@@ -7,9 +7,9 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>SolveCraft</string>
+  <string>SolidCraft</string>
   <key>CFBundleName</key>
-  <string>SolveCraft</string>
+  <string>SolidCraft</string>
   <key>CFBundleExecutable</key>
   <string>SolveCraft</string>
   <key>CFBundleIdentifier</key>
@@ -41,7 +41,7 @@
   <array>
     <dict>
       <key>CFBundleTypeName</key>
-      <string>SolveCraft design</string>
+      <string>SolidCraft design</string>
       <key>CFBundleTypeExtensions</key>
       <array><string>solvecraft</string></array>
       <key>CFBundleTypeRole</key>

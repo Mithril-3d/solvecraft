@@ -64,6 +64,13 @@ pub struct Mesh {
     /// Per edge: a seam between two pieces of the same smooth surface (not drawn).
     #[serde(default)]
     pub seams: Vec<bool>,
+    /// Display-only tangent joins. Edge identities, picking and face groups stay intact.
+    #[serde(skip)]
+    pub smooth_edges: Vec<bool>,
+    /// Display-protected boundaries: certified current creases or authored splits.
+    /// Overrides coarse seam fits; not a geometric/topological authority.
+    #[serde(skip)]
+    pub sharp_edges: Vec<bool>,
     /// Per edge: the B-rep faces it bounds (one or two).
     #[serde(default)]
     pub edge_faces: Vec<Vec<u32>>,
@@ -78,6 +85,15 @@ pub struct MeshMeasure {
 }
 
 impl Mesh {
+    /// Visibility in shaded edge presentation, independent of selection/topology.
+    pub fn shaded_edge_visible(&self, index: usize) -> bool {
+        self.edge_pickable(index) && !self.smooth_edges.get(index).copied().unwrap_or(false)
+    }
+
+    pub fn edge_pickable(&self, index: usize) -> bool {
+        !self.seams.get(index).copied().unwrap_or(false) || self.sharp_edges.get(index).copied().unwrap_or(false)
+    }
+
     /// Edges bounding face `f`.
     pub fn face_edges(&self, f: u32) -> Vec<usize> {
         self.edge_faces.iter().enumerate().filter(|(_, fs)| fs.contains(&f)).map(|(i, _)| i).collect()
@@ -88,7 +104,10 @@ impl Mesh {
         let mut todo = vec![face];
         while let Some(f) = todo.pop() {
             for (ei, fs) in self.edge_faces.iter().enumerate() {
-                if !self.seams.get(ei).copied().unwrap_or(false) || !fs.iter().any(|x| *x as usize == f) {
+                if !self.seams.get(ei).copied().unwrap_or(false)
+                    || self.sharp_edges.get(ei).copied().unwrap_or(false)
+                    || !fs.iter().any(|x| *x as usize == f)
+                {
                     continue;
                 }
                 for &next in fs {
@@ -176,7 +195,7 @@ impl Mesh {
         while let Some(cur) = todo.pop() {
             let Some(ce) = ends(cur) else { continue };
             for (i, _) in self.edges.iter().enumerate() {
-                if chain.contains(&i) || self.seams.get(i).copied().unwrap_or(false) {
+                if chain.contains(&i) || !self.edge_pickable(i) {
                     continue;
                 }
                 let Some(ne) = ends(i) else { continue };

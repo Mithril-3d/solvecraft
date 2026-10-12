@@ -436,6 +436,54 @@ fn coil_and_loft_to_a_point() {
     assert!(s.execute("solid.loft", &json!({"sections": [{"sketch": "Base"}, {"sketch": "Top", "point": "nope"}]})).is_err());
 }
 
+/// A 3 mm shelled basin (100 x 60 x 30, open top) with a fall lofted from its whole outline
+/// 10 up down to a drain pad (`pad`: corners, 1 up), in either section order. The loft's top
+/// edges lie on the outer walls; the cut used to fail for one order of the sections (an
+/// `Option::unwrap()` panic inside the kernel, or "shell not oriented and closed").
+fn basin_fall(pad: [f64; 4], reverse: bool, op: &str) -> (Session, std::result::Result<Value, String>) {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 30, "corner": [0, 0, 0]}));
+    run(&mut s, "solid.shell", json!({"faces": [[50, 30, 30]], "thickness": 3}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Rim"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 60]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 1], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Pad"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [pad[0], pad[1]], "p1": [pad[2], pad[3]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let mut secs = vec![json!({"sketch": "Rim"}), json!({"sketch": "Pad"})];
+    if reverse {
+        secs.reverse();
+    }
+    let r = s.execute("solid.loft", &json!({"sections": secs, "operation": op})).map_err(|e| e.to_string());
+    (s, r)
+}
+
+#[test]
+fn loft_cut_through_a_shelled_basin_in_either_order() {
+    // What is left after the cut: the basin less the loft's part of the floor and walls
+    // (integrated over the height), the same for a pad in any corner.
+    let want = 41582.028;
+    for pad in [[80.0, 40.0, 90.0, 50.0], [10.0, 40.0, 20.0, 50.0], [10.0, 10.0, 20.0, 20.0], [80.0, 10.0, 90.0, 20.0]] {
+        for reverse in [false, true] {
+            let (mut s, r) = basin_fall(pad, reverse, "cut");
+            assert!(r.is_ok(), "{pad:?} reverse {reverse}: {r:?}");
+            let v = volume(&mut s);
+            assert!((v - want).abs() < 1.0, "{pad:?} reverse {reverse}: {v} vs {want}");
+            assert_eq!(measure(&mut s)["body_count"], 1);
+        }
+    }
+    // As a new body and joined: a valid solid of positive volume either way.
+    for op in ["new", "join"] {
+        let mut vols = Vec::new();
+        for reverse in [false, true] {
+            let (mut s, r) = basin_fall([80.0, 40.0, 90.0, 50.0], reverse, op);
+            assert!(r.is_ok(), "{op} reverse {reverse}: {r:?}");
+            vols.push(volume(&mut s));
+        }
+        assert!(vols[0] > 42948.0 && rel(vols[0], vols[1]) < 1e-6, "{op}: {vols:?}");
+    }
+}
+
 #[test]
 fn cylinder_auto_inference_saves_a_profile_anchor_and_replays_both_depth_signs() {
     use solvecraft_geom::Vec3;

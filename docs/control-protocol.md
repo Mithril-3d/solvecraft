@@ -6,6 +6,14 @@ line `{"id": …, "ok": true, "result": …}` or `{"id": …, "ok": false, "erro
 handled on the UI thread between frames; pointer and keyboard input is injected as real egui
 events, one pointer event per frame.
 
+The channel is untrusted input. A request line may be at most 16 MiB; a longer one is answered
+with `{"ok": false, "error": "request too large"}` and the connection is closed, as are
+connections that send eight lines that are not JSON. At most 16 connections are served at once
+(further ones get `{"ok": false, "error": "too many connections"}`), at most 64 queued requests
+run per frame so a flood cannot starve drawing, and a request that the UI thread has not
+answered within 60 seconds is replied to with `{"ok": false, "error": "timeout"}`. The same
+16 MiB line limit applies to the MCP server.
+
 ## Engine
 
 | Method | Params | Result |
@@ -16,6 +24,18 @@ events, one pointer event per frame.
 | `document.inspect` | `measure?`: bool | parameters, timeline (errors, timings), bodies, sketches, selection |
 
 Commands never open dialogs when run this way. `solvecraft-cli commands` prints the same registry.
+
+Every `sketch.*` command that changes a sketch adds `created: {points, curves, constraints,
+dimensions}` to its result (and `wires` for 3D curves): the ids of what it added, in creation
+order, next to whatever else the command returns (`curves`, `sides`, `corners`…). Sketch ids are
+stable and never reused, even after a delete (`l1`, `l2`, then `l3` once `l2` is gone; only undo
+rolls the numbering back with the design), so they can go straight into later commands:
+
+```text
+{"id":7,"method":"engine.execute","params":{"command":"sketch.line","params":{"points":[[0,0],[40,0]]}}}
+→ {"curves":["l1"],"created":{"points":["l1.start","l1.end"],"curves":["l1"],"constraints":["k1"],"dimensions":[]},…}
+{"id":8,"method":"engine.execute","params":{"command":"sketch.dimension","params":{"entities":["l1"],"value":50}}}
+```
 
 ## UI
 
@@ -37,20 +57,20 @@ Commands never open dialogs when run this way. `solvecraft-cli commands` prints 
 | `ui.sketchToScreen` | `points`: `[[x, y]…]` in active-sketch coordinates | their screen points (null when behind the camera) |
 | `ui.dialogInput` | `index` | what clicking an input's Select chip does: picks go to that input |
 | `ui.at` | `world: [x,y,z]` \| `sketch: [x,y]` \| `plane: "XY"` \| `axis: "Z"` \| `dimension: "d1"` (its value text) \| `handle: "arrow"` (a manipulator handle, see `scenario::publish_handle`) | the screen point (a scenario step's target; see `crates/ui-egui/src/scenario.rs`) |
-| `ui.handles` | `prefix?` | the handles drawn last frame, `[{name, x, y}]`: toolbar buttons and drop-down items `toolbar:<command id>`, panel labels `panel:<tab>:<panel>`, browser rows `row:<label>` and fold arrows `fold:<label>`, manipulator handles |
+| `ui.handles` | `prefix?` | the handles drawn last frame, `[{name, x, y}]`: toolbar buttons and drop-down items `toolbar:<command id>`, panel labels `panel:<tab>:<panel>`, browser rows `row:<label>` and fold arrows `fold:<label>`, manipulator handles; orientation tips `axis_view:x`, `axis_view:-x` (and y/z) |
 | `ui.editFeature` | `feature` (id or name) | what double-clicking a timeline item does: rolls back to it and opens its dialog filled in (sketches open in sketch mode) |
 | `ui.scroll` | `x`, `y`, `delta?` | wheel zoom at the cursor |
 | `ui.key` | `key` (egui key name, `Enter`, `Escape`…), `cmd?`, `shift?` | |
 | `ui.text` | `text` | typed text |
 | `ui.screenshot` | `path?` | PNG of the window (needs a presented frame) |
-| `ui.render` | `path`, `width?`, `height?` | CPU render of the model with the current camera (no window needed) |
+| `ui.render` | `path`, `width?`, `height?` | CPU render of the model with the current camera (no window needed); cut by the section the viewport shows (`inspect.section`, an open Section Analysis dialog's preview, a sketch's Slice), with the cut face capped |
 | `ui.confirm` | `accept?`: bool | answers the Delete confirmation (shown when a delete takes other features with it or makes some fail); without `accept`, what it lists |
 | `ui.documents` | `action?`: `new`, `switch`, `close`, `quit`; `index?`; `force?` (close without asking); `answer?`: `save`, `dont_save`, `cancel` (answers "save changes?") | the open designs (tabs): names, unsaved flags, the active one, a pending "save changes?" prompt, whether a quit is asking |
 | `ui.file` | `path`; `insert?`: bool | starts an interactive background Open or Insert; poll `ui.inspect.file_busy` for completion; the window stays responsive |
 | `ui.home` | `open?`: bool; `sample?`: index | the start page: show or hide it, open a built-in sample (once built); returns `open` and the recent designs |
 | `ui.shortcut` | `command`, `key?`, `replace?` | a command's key, or rebinds it (`""` clears; a key another command uses is refused unless `replace`) |
 | `ui.help` | `item?`: `about`, `shortcuts` (read only), `report` (copies diagnostics) | the version, commit, build date and diagnostic text |
-| `ui.prefs` | any of `default_units`, `nav` (`fusion`, `solidworks`, `inventor`, `alias`, `tinkercad`), `zoom_reverse`, `zoom_to_cursor`, `orbit_cursor`, `look_at_anim`, `look_at_speed`, `msaa`, `length_decimals`, `angle_decimals`, `theme` (`dark`, `light`, `system`), `language` (`en`, `ja`; see [localization](localization.md)), `ui_scale`, `up_axis` (`z`, `y`), `offer_stand_up`; `open` (a page: General, Navigation, Keyboard Shortcuts, Design, Graphics, Sketch, Selection) opens the Preferences dialog there; `button`: `ok`, `cancel`, `apply`, `defaults`; `stand_up: true` stands up a just-opened Y-up file | sets preferences (kept between runs), returns them all plus `dialog` (the open page or null), `dark` and `stand_up_offer` |
+| `ui.prefs` | any of `default_units`, `nav` (`fusion`, `solidworks`, `inventor`, `alias`, `tinkercad`), `zoom_reverse`, `zoom_to_cursor`, `smooth_wheel_zoom` (default true), `orbit_cursor`, `look_at_anim`, `look_at_speed`, `msaa`, `length_decimals`, `angle_decimals`, `theme` (`dark`, `light`, `system`), `language` (`en`, `ja`; see [localization](localization.md)), `ui_scale`, `up_axis` (`z`, `y`), `offer_stand_up`; `open` (a page: General, Navigation, Keyboard Shortcuts, Design, Graphics, Sketch, Selection) opens the Preferences dialog there; `button`: `ok`, `cancel`, `apply`, `defaults`; `stand_up: true` stands up a just-opened Y-up file | sets preferences (kept between runs), returns them all plus `dialog` (the open page or null), `dark` and `stand_up_offer` |
 | `ui.capture` | `action?`: `capture`, `revert`, `cancel` | answers the Capture Position question (asked when a command starts or the design is saved while components were moved without capturing); without `action`, what waits |
 | `ui.window` | `action`: minimize, maximize, restore, toggle, close | what the title bar's caption buttons do (on Windows and Linux the application bar is the title bar); close asks about unsaved designs first |
 | `ui.agent_cursor` | `show` (bool), `speed`: a number from 1 to 5 (times the normal speed) or `"instant"` (no animation: the command runs at once and the pointer jumps to where it acted), `follow_camera` (bool); all optional | the settings. While the cursor is shown, `engine.execute` first glides to the command's toolbar button and to each pick, then runs and replies; later requests wait their turn. `"animate": false` on a call skips it |
@@ -71,3 +91,11 @@ channel; see [mcp.md](mcp.md).
 {"id":4,"method":"engine.execute","params":{"command":"solid.fillet","params":{"edges":[[0,0,10]],"radius":3}}}
 {"id":5,"method":"ui.screenshot","params":{"path":"/tmp/part.png"}}
 ```
+
+Hold Shift during an orbit gesture to snap to the nearest standard or diagonal view. This applies to
+right-drag, the Orbit navigation tool, and dragging the axis view. Under the default preset,
+Shift+middle also orbits with snapping; middle alone pans. Axis-view tips use world coordinates,
+regardless of the up-axis preference. Clicking an aligned tip again flips to its opposite.
+
+Shift-orbit snapping includes 45-degree edge views and isometric corner views, with a
+lightly damped spring transition and a small boundary margin to prevent flicker.

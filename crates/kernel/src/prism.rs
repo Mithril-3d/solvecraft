@@ -120,68 +120,110 @@ struct Prism {
     regions: Vec<Region2>,
 }
 
-/// Edges of a cap face as 2D segments (lines and arcs only).
-fn seg2(e: &mt::Edge, plane: &Plane, tol: f64) -> Option<Vec<Seg2>> {
-    use mt::{BoundedCurve, ParametricCurve};
-    let c = e.oriented_curve();
-    let (t0, t1) = c.range_tuple();
-    let pts: Vec<Vec2> = (0..=16).map(|k| plane.to_local(from_p3(c.subs(t0 + (t1 - t0) * k as f64 / 16.0)))).collect();
-    let (a, b) = (*pts.first()?, *pts.last()?);
-    let closed = a.dist(b) < tol;
-    let seg_dist = |p: Vec2| {
-        let ab = b - a;
-        let t = ((p - a).dot(ab) / ab.dot(ab).max(1e-300)).clamp(0.0, 1.0);
-        (a + ab * t).dist(p)
+/// Certify that a curved wall is swept along `d` from its surface representation.
+/// Seam vertices alone cannot establish this: a half-cylinder's seam normals can
+/// both be perpendicular to a transverse direction, silently filling its hole.
+fn wall_along(surface: &mt::Surface, d: Vec3, tol: f64, remaining: &mut usize) -> bool {
+    if let mt::Surface::RevolutedCurve(processor) = surface {
+        let revolution = processor.entity();
+        let mt::Curve::Line(line) = revolution.entity_curve() else { return false };
+        let axis = revolution.axis();
+        let meridian = line.1 - line.0;
+        let local_axis = Vec3::new(axis.x, axis.y, axis.z);
+        let local_meridian = Vec3::new(meridian.x, meridian.y, meridian.z);
+        let (Some(a), Some(m)) = (local_axis.normalized(), local_meridian.normalized()) else { return false };
+        if a.cross(m).len() > 1e-9 {
+            return false; // A conical meridian is not a cylindrical wall.
+        }
+        let placed = *processor.transform() * mt::Vector4::new(axis.x, axis.y, axis.z, 0.0);
+        return placed.w.abs() < 1e-12 && Vec3::new(placed.x, placed.y, placed.z).normalized().is_some_and(|a| a.cross(d).len() < 1e-9);
+    }
+    let dimensions = match surface {
+        mt::Surface::BSplineSurface(s) => (s.control_points().len(), s.control_points().first().map_or(0, Vec::len)),
+        mt::Surface::NurbsSurface(s) => (s.control_points().len(), s.control_points().first().map_or(0, Vec::len)),
+        _ => return false,
     };
-    if !closed && pts.iter().all(|p| seg_dist(*p) < tol) {
-        return Some(vec![Seg2::Line { a, b }]);
+    let (rows, cols) = dimensions;
+    let count = rows.saturating_mul(cols);
+    let rectangular = match surface {
+        mt::Surface::BSplineSurface(s) => s.control_points().iter().all(|r| r.len() == cols),
+        mt::Surface::NurbsSurface(s) => s.control_points().iter().all(|r| r.len() == cols),
+        _ => false,
+    };
+    if rows < 2 || cols < 2 || count > 16_384 || !rectangular {
+        return false;
     }
-    // Circle through three samples.
-    let (p, q, r) = (a, *pts.get(5)?, *pts.get(11)?);
-    let d = 2.0 * (p.x * (q.y - r.y) + q.x * (r.y - p.y) + r.x * (p.y - q.y));
-    if d.abs() < 1e-300 {
-        return None;
-    }
-    let sq = |v: Vec2| v.x * v.x + v.y * v.y;
-    let cx = (sq(p) * (q.y - r.y) + sq(q) * (r.y - p.y) + sq(r) * (p.y - q.y)) / d;
-    let cy = (sq(p) * (r.x - q.x) + sq(q) * (p.x - r.x) + sq(r) * (q.x - p.x)) / d;
-    let center = Vec2::new(cx, cy);
-    let radius = center.dist(a);
-    if !pts.iter().all(|x| (x.dist(center) - radius).abs() < tol) {
-        return None;
-    }
-    let ang = |v: Vec2| (v - center).angle();
-    let start = ang(a);
-    // Signed sweep by unwrapping the samples.
-    let mut sweep = 0.0;
-    let mut prev = start;
-    for x in pts.iter().skip(1) {
-        let mut da = ang(*x) - prev;
-        while da > std::f64::consts::PI {
-            da -= std::f64::consts::TAU;
+    let Some(left) = remaining.checked_sub(count.saturating_mul(2)) else { return false };
+    *remaining = left;
+    let points: Vec<Vec<(Vec3, f64)>> = match surface {
+        mt::Surface::BSplineSurface(s) => s.control_points().iter().map(|r| r.iter().map(|p| (from_p3(*p), 1.0)).collect()).collect(),
+        mt::Surface::NurbsSurface(s) => {
+            s.control_points().iter().map(|r| r.iter().map(|p| (Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w), p.w)).collect()).collect()
         }
-        while da < -std::f64::consts::PI {
-            da += std::f64::consts::TAU;
+        _ => return false,
+    };
+    if points.iter().any(|r| r.len() != cols)
+        || points.iter().flatten().any(|(p, w)| !w.is_finite() || *w <= 0.0 || [p.x, p.y, p.z].iter().any(|x| !x.is_finite()))
+    {
+        return false;
+    }
+    let max_weight = points.iter().flatten().map(|p| p.1).fold(0.0, f64::max);
+    if points.iter().flatten().any(|p| p.1 / max_weight < 1e-12) {
+        return false;
+    }
+    // Either parameter can be the extrusion direction. Projected positions must
+    // be invariant in that parameter; rational weights must also separate into
+    // a product of one factor per parameter, otherwise mixed weights bend the wall.
+    for transpose in [false, true] {
+        let (groups, length) = if transpose { (cols, rows) } else { (rows, cols) };
+        let at = |i: usize, j: usize| if transpose { points[j][i] } else { points[i][j] };
+        let mut valid = true;
+        let mut extended = false;
+        for i in 0..groups {
+            let (base, base_w) = at(i, 0);
+            for j in 0..length {
+                let (p, w) = at(i, j);
+                let delta = p - base;
+                let magnitude = [p.x.abs(), p.y.abs(), p.z.abs(), base.x.abs(), base.y.abs(), base.z.abs()].into_iter().fold(1.0, f64::max);
+                if delta.cross(d).len() > tol * 1e-3 + magnitude * f64::EPSILON * 128.0 {
+                    valid = false;
+                    break;
+                }
+                extended |= delta.dot(d).abs() > tol * 1e-3;
+                let lhs = w / max_weight * (at(0, 0).1 / max_weight);
+                let rhs = base_w / max_weight * (at(0, j).1 / max_weight);
+                if (lhs - rhs).abs() > 1e-12 * lhs.abs().max(rhs.abs()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                break;
+            }
         }
-        sweep += da;
-        prev = ang(*x);
+        if valid && extended {
+            return true;
+        }
     }
-    if closed {
-        let h = sweep / 2.0;
-        return Some(vec![Seg2::Arc { center, radius, start, sweep: h }, Seg2::Arc { center, radius, start: start + h, sweep: h }]);
-    }
-    Some(vec![Seg2::Arc { center, radius, start, sweep }])
+    false
 }
 
 /// The body as a prism along `d` (unit), seen in `plane` (normal `d`).
 fn prism_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Prism> {
-    use mt::{ParametricSurface3D, SearchNearestParameter};
+    // A simple extrusion with N section edges has N walls plus its cap faces.
+    // Even disconnected two-arc sections need at most 2N faces. Keep that
+    // complete planar arrangement envelope, independently of stepped limits.
+    let mut remaining_faces = MAX_PLANAR_SEGMENTS * 2;
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     let mut tops: Vec<&mt::Face> = Vec::new();
     let mut top_h = Vec::new();
     let mut bottom_h = Vec::new();
+    let mut wall_work = 262_144;
+    let mut curve_work = 2_000_000usize;
     for f in b.solid.face_iter() {
+        remaining_faces = remaining_faces.checked_sub(1)?;
+        curve_work = curve_work.checked_sub(1)?;
         let surf = f.oriented_surface();
         if let mt::Surface::Plane(p) = &surf {
             let n = p.normal();
@@ -203,15 +245,8 @@ fn prism_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Prism> {
             }
             continue;
         }
-        // Walls: normals square to d at sampled boundary points.
-        for w in f.boundaries() {
-            for v in w.vertex_iter() {
-                let (u, s) = surf.search_nearest_parameter(v.point(), None, 50)?;
-                let n = surf.normal(u, s);
-                if Vec3::new(n.x, n.y, n.z).dot(d).abs() > 1e-7 {
-                    return None;
-                }
-            }
+        if !wall_along(&surf, d, tol, &mut wall_work) {
+            return None;
         }
     }
     // One height for every top (and bottom) cap.
@@ -219,12 +254,17 @@ fn prism_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Prism> {
         return None;
     }
     let mut regions = Vec::new();
+    let mut remaining_segments = MAX_PLANAR_SEGMENTS;
+    let mut remaining_loops = MAX_PLANAR_SEGMENTS;
     for f in tops {
         let mut loops = Vec::new();
         for w in f.boundaries() {
+            remaining_loops = remaining_loops.checked_sub(1)?;
             let mut segs = Vec::new();
             for e in w.edge_iter() {
-                segs.extend(seg2(e, plane, tol)?);
+                let segments = crate::prism_curve::segment(e, plane, tol, &mut curve_work)?;
+                remaining_segments = remaining_segments.checked_sub(segments.len())?;
+                segs.extend(segments);
             }
             loops.push(Loop2 { segs });
         }
@@ -643,11 +683,105 @@ fn sew_stack(plane: &Plane, d: Vec3, pa: &Prism, pb: &Prism, tol: f64) -> Option
         };
         slabs.push(oriented(&s));
     }
-    sew_sections(plane, d, &levels, &slabs, tol)
+    sew_sections(plane, d, &levels, &slabs, tol, false)
 }
 
 /// Sew the exact sections between successive levels, including empty gaps.
-fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64) -> Option<Result<Body>> {
+fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64, coalesce: bool) -> Option<Result<Body>> {
+    if levels.len() != slabs.len() + 1
+        || slabs.len() > 128
+        || plane.normal().dot(d) < 1. - 1e-12
+        || levels.iter().any(|z| !z.is_finite())
+        || levels.windows(2).any(|z| z[0] >= z[1])
+    {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    let mut start = None;
+    for (i, slab) in slabs.iter().enumerate() {
+        if slab.is_empty() {
+            if let Some(first) = start.take() {
+                blocks.push((first, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(first) = start {
+        blocks.push((first, slabs.len()));
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some((|| {
+        let mut pieces = Vec::new();
+        let mut remaining_constructed_faces = MAX_PLANAR_SEGMENTS * 2;
+        let mut remaining_faces = MAX_PLANAR_SEGMENTS * 2;
+        for (first, end) in blocks {
+            let section = slabs.get(first).ok_or_else(|| KernelError::Failed("missing prism section".into()))?;
+            if slabs[first..end].iter().all(|s| s == section) {
+                let edge_count = section.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).flat_map(|l| &l.segs).fold(0usize, |n, s| {
+                    n.saturating_add(match s {
+                        Seg2::Arc { sweep, .. } if sweep.abs() > 1.5 * std::f64::consts::PI => 2,
+                        _ => 1,
+                    })
+                });
+                remaining_constructed_faces = remaining_constructed_faces
+                    .checked_sub(edge_count.saturating_add(section.len().saturating_mul(2)))
+                    .ok_or_else(|| KernelError::Failed("prism construction face budget".into()))?;
+                // This is a NEW exact extrusion of the current Boolean section,
+                // not copied lineage from either operand's old footprint.
+                for piece in crate::extrude(plane, section, levels[first], levels[end])? {
+                    remaining_faces =
+                        remaining_faces.checked_sub(piece.face_count()).ok_or_else(|| KernelError::Failed("prism output face budget".into()))?;
+                    pieces.push(piece);
+                }
+            } else {
+                let piece = sew_connected_sections(plane, d, &levels[first..=end], &slabs[first..end], tol, coalesce)
+                    .ok_or_else(|| KernelError::Failed("stepped prism construction failed".into()))??;
+                remaining_faces =
+                    remaining_faces.checked_sub(piece.face_count()).ok_or_else(|| KernelError::Failed("prism output face budget".into()))?;
+                pieces.push(piece);
+            }
+        }
+        let mut old = std::collections::HashMap::new();
+        let mut shells = Vec::new();
+        let mut remaining_map_faces = MAX_PLANAR_SEGMENTS * 2;
+        for piece in &pieces {
+            for (index, face) in piece.solid.face_iter().enumerate() {
+                remaining_map_faces = remaining_map_faces.checked_sub(1).ok_or_else(|| KernelError::Failed("prism output face budget".into()))?;
+                let source = piece.face_sources().and_then(|s| s.get(index)).and_then(Option::as_ref);
+                if old.insert(face.id(), Some((face.orientation(), source))).is_some() {
+                    old.insert(face.id(), None);
+                }
+            }
+            shells.extend(piece.solid.boundaries().iter().cloned());
+        }
+        let body = Body::new(crate::body::Solid::try_new(shells).map_err(|e| KernelError::Failed(format!("prism compound: {e}")))?)?;
+        let sources = body
+            .solid
+            .face_iter()
+            .map(|face| match old.get(&face.id()) {
+                Some(Some((orientation, source))) if *orientation == face.orientation() => source.cloned(),
+                _ => None,
+            })
+            .collect();
+        Ok(body.with_face_sources(Some(std::sync::Arc::new(sources))))
+    })())
+}
+
+/// Stable exact identity for the bounded analytic segment subset.
+fn wall_key(s: &Seg2) -> Option<[u64; 6]> {
+    let bits = |v: f64| v.is_finite().then(|| if v == 0. { 0 } else { v.to_bits() });
+    match s {
+        Seg2::Line { a, b } => Some([0, bits(a.x)?, bits(a.y)?, bits(b.x)?, bits(b.y)?, 0]),
+        Seg2::Arc { center, radius, start, sweep } => Some([1, bits(center.x)?, bits(center.y)?, bits(*radius)?, bits(*start)?, bits(*sweep)?]),
+        _ => None,
+    }
+}
+
+/// A genuinely stepped connected axial block has no single extrusion footprint.
+fn sew_connected_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64, coalesce: bool) -> Option<Result<Body>> {
     use crate::sew::{EdgeSpec, FaceSpec, SurfSpec};
     // Faces at each level: up where the slab below sticks out, down where the one above does.
     let diff = |x: &[Region2], y: &[Region2]| -> Option<Vec<Region2>> {
@@ -681,29 +815,91 @@ fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], 
             _ => EdgeSpec::Line { a: at(sg.start(), z), b: at(sg.end(), z) },
         }
     };
-    let mut faces: Vec<FaceSpec> = Vec::new();
-    for (i, s) in slabs.iter().enumerate() {
-        let (z0, z1) = (*levels.get(i)?, *levels.get(i + 1)?);
-        for lp in loops_of(s) {
+    // Exact oriented generated segments alone define a run. No support fitting,
+    // proximity matching, or old face lineage is used here.
+    let mut runs: Vec<(usize, usize, Seg2)> = Vec::new();
+    let mut last = std::collections::BTreeMap::new();
+    let mut remaining = MAX_PLANAR_SEGMENTS * 2;
+    for (i, slab) in slabs.iter().enumerate() {
+        for lp in loops_of(slab) {
             for sg0 in &lp.segs {
                 for sg in split_seg(sg0, &pts, tol)? {
-                    let (a, b) = (sg.start(), sg.end());
-                    let lp3 = vec![
-                        edge(&sg, z0),
-                        EdgeSpec::Line { a: at(b, z0), b: at(b, z1) },
-                        edge(&sg.reversed(), z1),
-                        EdgeSpec::Line { a: at(a, z1), b: at(a, z0) },
-                    ];
-                    let tangent = plane.dir_to_world(sg.derivative(0.5));
-                    let outward = tangent.cross(d).normalized()?;
-                    let surface = match sg {
-                        Seg2::Arc { .. } => SurfSpec::Extruded { a: at(a, z0), b: at(b, z0), mid: at(sg.point_at(0.5), z0), dir: d * (z1 - z0) },
-                        _ => SurfSpec::Plane,
-                    };
-                    faces.push(FaceSpec { loops: vec![lp3], surface, probe: Some((at(sg.point_at(0.5), (z0 + z1) / 2.0), outward)) });
+                    remaining = remaining.checked_sub(1)?;
+                    let key = wall_key(&sg)?;
+                    if coalesce {
+                        if let Some(&index) = last.get(&key) {
+                            let run: &mut (usize, usize, Seg2) = runs.get_mut(index)?;
+                            if run.1 == i {
+                                run.1 = i + 1;
+                                continue;
+                            }
+                            // Duplicate oriented boundaries in one slab are not
+                            // a valid reason to reconstruct a larger wall.
+                            if run.1 == i + 1 {
+                                return None;
+                            }
+                        }
+                        last.insert(key, runs.len());
+                    }
+                    runs.push((i, i + 1, sg));
                 }
             }
         }
+    }
+    let mut faces: Vec<FaceSpec> = Vec::new();
+    let mut sources = Vec::new();
+    let frame_is_orthonormal = plane.origin.is_finite()
+        && plane.x.is_finite()
+        && plane.y.is_finite()
+        && d.is_finite()
+        && (plane.x.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && (plane.y.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && (d.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && plane.x.dot(plane.y).abs() <= 64. * f64::EPSILON
+        && plane.x.dot(d).abs() <= 64. * f64::EPSILON
+        && plane.y.dot(d).abs() <= 64. * f64::EPSILON;
+    for (first, end, sg) in runs {
+        let (z0, z1) = (levels[first], levels[end]);
+        let (a, b) = (sg.start(), sg.end());
+        let mut lp3 = Vec::with_capacity(2 + 2 * (end - first));
+        lp3.push(edge(&sg, z0));
+        // Keep station vertices at both ends: neighboring stepped walls/caps
+        // must share complete edges rather than create T-junctions.
+        for k in first..end {
+            lp3.push(EdgeSpec::Line { a: at(b, levels[k]), b: at(b, levels[k + 1]) });
+        }
+        lp3.push(edge(&sg.reversed(), z1));
+        for k in (first..end).rev() {
+            lp3.push(EdgeSpec::Line { a: at(a, levels[k + 1]), b: at(a, levels[k]) });
+        }
+        let outward = plane.dir_to_world(sg.derivative(0.5)).cross(d).normalized()?;
+        let surface = match sg {
+            Seg2::Arc { .. } => SurfSpec::Extruded { a: at(a, z0), b: at(b, z0), mid: at(sg.point_at(0.5), z0), dir: d * (z1 - z0) },
+            _ => SurfSpec::Plane,
+        };
+        faces.push(FaceSpec { loops: vec![lp3], surface, probe: Some((at(sg.point_at(0.5), (z0 + z1) / 2.0), outward)) });
+        // Axis-aligned generated lines have a common oriented support frame
+        // independent of axial stations or along-line endpoint interpolation.
+        let generated_plane = if coalesce
+            && frame_is_orthonormal
+            && let Seg2::Line { a, b } = sg
+        {
+            let (origin, x) = if a.y == b.y && a.x != b.x {
+                (at(Vec2::new(0., a.y), 0.), plane.x * (b.x - a.x).signum())
+            } else if a.x == b.x && a.y != b.y {
+                (at(Vec2::new(a.x, 0.), 0.), plane.y * (b.y - a.y).signum())
+            } else {
+                (Vec3::ZERO, Vec3::ZERO)
+            };
+            (origin.is_finite() && x.len2() > 0.).then_some(Plane { origin, x, y: d })
+        } else {
+            None
+        };
+        sources.push((generated_plane.is_some() || end > first + 1).then_some(crate::FaceSource::ExtrudeSide {
+            segment: sg,
+            plane: generated_plane,
+            coalesced: end > first + 1,
+        }));
     }
     for (z, up, rs) in &caps {
         for r in rs {
@@ -717,9 +913,14 @@ fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], 
                 loops.push(segs.iter().map(|sg| edge(sg, *z)).collect::<Vec<_>>());
             }
             faces.push(FaceSpec { loops, surface: SurfSpec::Plane, probe: None });
+            sources.push(None);
         }
     }
-    Some(crate::sew::sew_touching(&faces))
+    Some(crate::sew::sew_touching_with_sources(&faces, &sources).and_then(
+        |body| {
+            if coalesce { body.regularize_generated_planar_faces() } else { Ok(body) }
+        },
+    ))
 }
 
 fn simple_prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
@@ -727,13 +928,18 @@ fn simple_prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<
     let tol = (size * 1e-7).max(1e-9) * 10.0;
     // Candidate directions: a's planar face normals (each line once).
     let mut dirs: Vec<Vec3> = Vec::new();
+    let mut remaining_direction_faces = MAX_PLANAR_SEGMENTS * 2;
     for f in a.solid.face_iter() {
+        remaining_direction_faces = remaining_direction_faces.checked_sub(1)?;
         if let mt::Surface::Plane(p) = f.oriented_surface() {
             let n = p.normal();
             if let Some(n) = Vec3::new(n.x, n.y, n.z).normalized()
                 && !dirs.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-9)
             {
                 dirs.push(if n.dot(Vec3::new(1e-3, 1e-6, 1.0)) < 0.0 { -n } else { n });
+                if dirs.len() == 8 {
+                    break;
+                }
             }
         }
     }
@@ -792,7 +998,6 @@ fn simple_prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<
 /// A stepped extrusion (case floor plus walls), recovered from its cap events.
 /// Downward caps add a section above their level; upward caps remove one.
 fn stack_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Vec<Prism>> {
-    use mt::{ParametricSurface3D, SearchNearestParameter};
     if let Some(p) = prism_of(b, d, plane, tol) {
         return Some(vec![p]);
     }
@@ -800,6 +1005,8 @@ fn stack_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Vec<Prism>> {
         return None;
     }
     let mut events = Vec::new();
+    let mut wall_work = 262_144;
+    let mut curve_work = 2_000_000;
     for f in b.solid.face_iter() {
         let surf = f.oriented_surface();
         if let mt::Surface::Plane(p) = &surf {
@@ -810,7 +1017,7 @@ fn stack_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Vec<Prism>> {
                 for w in f.boundaries() {
                     let mut segs = Vec::new();
                     for e in w.edge_iter() {
-                        segs.extend(seg2(e, plane, tol)?);
+                        segs.extend(crate::prism_curve::segment(e, plane, tol, &mut curve_work)?);
                     }
                     loops.push(Loop2 { segs });
                 }
@@ -823,13 +1030,8 @@ fn stack_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Vec<Prism>> {
                 return None;
             }
         } else {
-            // Curved walls must be extruded along d, not slanted or rounded caps.
-            for v in f.vertex_iter() {
-                let (u, w) = surf.search_nearest_parameter(v.point(), None, 50)?;
-                let n = surf.normal(u, w);
-                if Vec3::new(n.x, n.y, n.z).dot(d).abs() > 1e-7 {
-                    return None;
-                }
+            if !wall_along(&surf, d, tol, &mut wall_work) {
+                return None;
             }
         }
     }
@@ -862,9 +1064,9 @@ fn stack_of(b: &Body, d: Vec3, plane: &Plane, tol: f64) -> Option<Vec<Prism>> {
 }
 
 fn stack_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
-    // Common-cap joins and partial-depth cuts of aligned stepped prisms can
+    // Common-cap joins and overlapping partial-depth cuts of aligned stepped prisms can
     // retain their exact section boundaries instead of intersecting meshes.
-    // Other extents retain their existing B-rep path.
+    // Nonaligned bodies retain their existing B-rep path.
     if !matches!(op, BoolOp::Union | BoolOp::Cut) {
         return None;
     }
@@ -892,8 +1094,12 @@ fn stack_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>>
         let pa = stack_of(a, d, &plane, tol)?;
         let pb = stack_of(b, d, &plane, tol)?;
         let (ea, eb) = (ends(&pa), ends(&pb));
-        if (ea.0 - eb.0).abs() >= tol && (ea.1 - eb.1).abs() >= tol {
-            return None;
+        match op {
+            BoolOp::Union if (ea.0 - eb.0).abs() >= tol && (ea.1 - eb.1).abs() >= tol => return None,
+            // A cut tool may extend past a cap into empty space. Exact slab sections
+            // discard that space rather than intersecting coincident cylinder walls.
+            BoolOp::Cut if ea.1 <= eb.0 + tol || eb.1 <= ea.0 + tol => return None,
+            _ => {}
         }
         Some((d, plane, pa, pb))
     })?;
@@ -931,7 +1137,21 @@ fn stack_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>>
     if slabs.iter().all(Vec::is_empty) {
         return Some(Ok(None));
     }
-    sew_sections(&plane, d, &levels, &slabs, tol).map(|r| r.map(Some))
+    sew_sections(
+        &plane,
+        d,
+        &levels,
+        &slabs,
+        tol,
+        op == BoolOp::Cut
+            && !a.regularization_protected
+            && !b.regularization_protected
+            && a.split_keep().is_empty()
+            && b.split_keep().is_empty()
+            && a.paint().is_none_or(|p| p.faces.is_empty())
+            && b.paint().is_none_or(|p| p.faces.is_empty()),
+    )
+    .map(|r| r.map(Some))
 }
 
 pub(crate) fn prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
@@ -943,6 +1163,373 @@ mod planar_tests {
     use super::*;
     fn rectangle(a: Vec2, b: Vec2) -> Region2 {
         Region2 { outer: Loop2::polygon(&[a, Vec2::new(b.x, a.y), b, Vec2::new(a.x, b.y)]), holes: vec![] }
+    }
+    #[test]
+    fn simple_prism_retains_large_analytic_section_budget() {
+        let count = 2050;
+        let radius = 1000.;
+        let points: Vec<_> = (0..count)
+            .map(|i| {
+                let angle = std::f64::consts::TAU * i as f64 / count as f64;
+                Vec2::new(radius * angle.cos(), radius * angle.sin())
+            })
+            .collect();
+        let region = Region2 { outer: Loop2::polygon(&points), holes: vec![] };
+        let stock = crate::extrude(&Plane::XY, &[region], 0., 2.).unwrap().pop().unwrap();
+        assert_eq!(stock.face_count(), count + 2);
+        assert!(stock.face_count() > 2048 && stock.validity().is_empty());
+        let before: Vec<_> = stock.solid.vertex_iter().map(|v| (v.id(), v.point())).collect();
+        let recovered = prism_of(&stock, Vec3::Z, &Plane::XY, 1e-5).expect("large simple line prism remains supported");
+        assert_eq!(recovered.regions.len(), 1);
+        assert_eq!(recovered.regions[0].outer.segs.len(), count);
+        assert!(recovered.regions[0].outer.segs.iter().all(|s| matches!(s, Seg2::Line { .. })));
+        let area = count as f64 * radius * radius * (std::f64::consts::TAU / count as f64).sin() / 2.;
+        assert!((recovered.regions[0].area() - area).abs() < area * 1e-12);
+        assert!((recovered.lo - 0.).abs() < 1e-8 && (recovered.hi - 2.).abs() < 1e-8);
+        let cutter = crate::box_solid(Vec3::new(-1001., -1001., -1.), Vec3::new(1001., 1001., 3.)).unwrap();
+        assert!(
+            simple_prism_boolean(&stock, &cutter, BoolOp::Cut)
+                .expect("large analytic section routes through the exact simple path")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stock.solid.vertex_iter().map(|v| (v.id(), v.point())).collect::<Vec<_>>(), before);
+    }
+    #[test]
+    fn curved_stop_cut_constructs_fresh_current_cap_for_only_uniform_lump() {
+        let cylinder = crate::cylinder(Vec3::new(25., 25., 0.), Vec3::Z, 2., 20.).unwrap();
+        let stop = crate::box_solid(Vec3::new(19., 19., 1.), Vec3::new(31., 31., 2.)).unwrap();
+        let roof = crate::boolean(&cylinder, &stop, BoolOp::Union).unwrap().unwrap();
+        let original = rectangle(Vec2::new(20., 20.), Vec2::new(30., 30.));
+        let tool = crate::extrude(&Plane::XY, &[original], 0., 25.).unwrap().pop().unwrap();
+        let before_tool = crate::step_export(&[&tool], "tool").unwrap();
+        let before_roof = crate::step_export(&[&roof], "roof").unwrap();
+        let trimmed = crate::boolean(&tool, &roof, BoolOp::Cut).unwrap().unwrap();
+        let lumps = trimmed.lumps().unwrap();
+        assert_eq!(lumps.len(), 2);
+        let mut lower = 0;
+        let mut upper = 0;
+        for lump in &lumps {
+            assert!(lump.validity().is_empty());
+            let mesh = lump.tessellate(1e-5).unwrap();
+            if mesh.contains(Vec3::new(21., 21., 0.5)) {
+                lower += 1;
+                assert!(!mesh.contains(Vec3::new(25., 25., 0.5)));
+                assert!(!mesh.contains(Vec3::new(21., 21., 1.5)));
+                assert!((mesh.measure().volume - (100. - 4. * std::f64::consts::PI)).abs() < 0.002);
+                let sources = lump.face_sources().expect("fresh actual extrusion has complete sources");
+                assert_eq!(sources.len(), lump.face_count());
+                assert!(sources.iter().all(Option::is_some));
+                let mut caps = 0;
+                for source in sources.iter().flatten() {
+                    match source {
+                        crate::FaceSource::ExtrudeCap { region, plane, .. } => {
+                            assert_eq!(region.holes.len(), 1);
+                            assert!((region.area() - (100. - 4. * std::f64::consts::PI)).abs() < 1e-8);
+                            assert!(plane.normal().z.abs() > 1. - 1e-10);
+                            assert!((plane.origin.z - if plane.normal().z > 0. { 1. } else { 0. }).abs() < 1e-8);
+                            caps += 1;
+                        }
+                        crate::FaceSource::ExtrudeSide { .. } => {}
+                        _ => panic!("old producer lineage must not survive a changed Boolean footprint"),
+                    }
+                }
+                assert_eq!(caps, 2);
+            } else {
+                upper += 1;
+                assert!(mesh.contains(Vec3::new(21., 21., 3.)));
+                assert!(!mesh.contains(Vec3::new(25., 25., 3.)));
+                assert!(mesh.contains(Vec3::new(25., 25., 22.)));
+                assert!(
+                    lump.face_sources().is_none_or(|s| s
+                        .iter()
+                        .all(|s| s.is_none() || matches!(s, Some(crate::FaceSource::ExtrudeSide { coalesced: true, plane: None, .. })))),
+                    "genuinely stepped geometry has no durable certificate"
+                );
+                assert!((mesh.measure().volume - (18. * (100. - 4. * std::f64::consts::PI) + 500.)).abs() < 0.02);
+            }
+        }
+        assert_eq!((lower, upper), (1, 1));
+        assert_eq!(crate::step_export(&[&tool], "tool").unwrap(), before_tool);
+        assert_eq!(crate::step_export(&[&roof], "roof").unwrap(), before_roof);
+    }
+    fn stepped_tab_stock() -> Body {
+        let stock = crate::box_solid(Vec3::new(-20., -15., 0.), Vec3::new(20., 15., 24.)).unwrap();
+        let tab = crate::box_solid(Vec3::new(-12., -25., 8.), Vec3::new(-4., -15., 16.)).unwrap();
+        crate::boolean(&stock, &tab, BoolOp::Union).unwrap().unwrap()
+    }
+
+    fn coplanar_joins(body: &Body) -> usize {
+        let faces: Vec<_> = body.solid.face_iter().collect();
+        let mut adjacency = std::collections::HashMap::<_, Vec<usize>>::new();
+        for (i, face) in faces.iter().enumerate() {
+            for edge in face.edge_iter() {
+                adjacency.entry(edge.id()).or_default().push(i);
+            }
+        }
+        adjacency
+            .values()
+            .filter(|faces| {
+                let [a, b] = faces.as_slice() else { return false };
+                let (Some(pa), Some(pb)) = (body.planar_face(*a), body.planar_face(*b)) else { return false };
+                let (na, nb) = (pa.normal(), pb.normal());
+                na.dot(nb) > 1. - 1e-12 && (pb.origin - pa.origin).dot(na).abs() < 1e-10
+            })
+            .count()
+    }
+
+    #[test]
+    fn shell_of_joined_stepped_tabs_has_no_artificial_planar_stations() {
+        let stock = stepped_tab_stock();
+        let snapshot = crate::step_export(&[&stock], "unchanged stock").unwrap();
+        assert_eq!(coplanar_joins(&stock), 0);
+        let shell = crate::shell(&stock, &[Vec3::new(0., 0., 24.)], 1.).unwrap();
+        assert_eq!(coplanar_joins(&shell), 0, "Shell must not add internal edges across continuous planar walls");
+        assert!(shell.validity().is_empty());
+        let mesh = shell.tessellate(1e-5).unwrap();
+        let expected = 40. * 30. * 24. + 8. * 10. * 8. - (38. * 28. * 23. + 6. * 10. * 6.);
+        assert!((mesh.measure().volume - expected).abs() < 1e-6);
+        for (point, material) in [
+            (Vec3::new(0., 0., 0.5), true),
+            (Vec3::new(0., 0., 10.), false),
+            (Vec3::new(0., -14.5, 10.), true),
+            (Vec3::new(19.5, 0., 10.), true),
+            (Vec3::new(-8., -24.5, 12.), true),
+            (Vec3::new(-8., -20., 12.), false),
+            (Vec3::new(0., -18., 9.), false),
+        ] {
+            assert_eq!(mesh.contains(point), material, "wrong material at {point:?}");
+        }
+        let step = crate::step_export(&[&shell], "stepped tab shell").unwrap();
+        let reopened = crate::step_import(&step).unwrap();
+        let body = &reopened.bodies[0].body;
+        assert_eq!(body.face_count(), shell.face_count());
+        assert_eq!(coplanar_joins(body), 0);
+        assert!((body.tessellate(1e-5).unwrap().measure().volume - expected).abs() < 1e-6);
+        assert_eq!(crate::step_export(&[&stock], "unchanged stock").unwrap(), snapshot);
+    }
+
+    #[test]
+    fn contiguous_analytic_walls_remove_faces_but_retain_vertical_stations() {
+        for curved in [false, true] {
+            let outer = if curved {
+                Region2 { outer: Loop2::circle(Vec2::ZERO, 10.), holes: vec![] }
+            } else {
+                rectangle(Vec2::new(-10., -10.), Vec2::new(10., 10.))
+            };
+            let mut upper = outer.clone();
+            upper.holes.push(if curved {
+                Loop2::circle(Vec2::ZERO, 5.).reversed()
+            } else {
+                rectangle(Vec2::new(-5., -5.), Vec2::new(5., 5.)).outer.reversed()
+            });
+            let slabs = vec![vec![outer], vec![upper]];
+            let old = sew_sections(&Plane::XY, Vec3::Z, &[0., 2., 20.], &slabs, 1e-7, false).unwrap().unwrap();
+            let merged = sew_sections(&Plane::XY, Vec3::Z, &[0., 2., 20.], &slabs, 1e-7, true).unwrap().unwrap();
+            let count = if curved { 2 } else { 4 };
+            assert_eq!(old.face_count() - merged.face_count(), count);
+            let marked: Vec<_> = merged.solid.face_iter().enumerate().filter(|(i, _)| merged.face_was_coalesced(*i)).collect();
+            assert_eq!(marked.len(), count);
+            for (_, face) in marked {
+                assert_eq!(face.boundaries()[0].len(), 6, "all axial station vertices are retained");
+                let heights: Vec<_> = face.vertex_iter().map(|v| v.point().z).collect();
+                for z in [0., 2., 20.] {
+                    assert!(heights.contains(&z));
+                }
+            }
+            assert!(old.face_sources().is_none_or(|s| s.iter().all(Option::is_none)));
+            let expected = if curved { std::f64::consts::PI * (100. * 20. - 25. * 18.) } else { 400. * 20. - 100. * 18. };
+            let mesh = merged.tessellate(1e-5).unwrap();
+            assert!((mesh.measure().volume - expected).abs() < 0.03);
+            assert!(mesh.contains(Vec3::new(0., 0., 1.)));
+            assert!(!mesh.contains(Vec3::new(0., 0., 10.)));
+            assert!(merged.validity().is_empty());
+            assert_ne!(wall_key(&slabs[0][0].outer.segs[0]), wall_key(&slabs[0][0].outer.segs[0].reversed()));
+        }
+    }
+
+    #[test]
+    fn cut_run_coalescing_respects_authored_splits_and_face_paint() {
+        let region = Region2 { outer: Loop2::circle(Vec2::ZERO, 10.), holes: vec![] };
+        let tool_region = Region2 { outer: Loop2::circle(Vec2::ZERO, 5.), holes: vec![] };
+        let stock = crate::extrude(&Plane::XY, &[region], 0., 20.).unwrap().pop().unwrap();
+        let cutter = crate::extrude(&Plane::XY, &[tool_region], 2., 22.).unwrap().pop().unwrap();
+        let merged = stack_boolean(&stock, &cutter, BoolOp::Cut).unwrap().unwrap().unwrap();
+        let protected = [
+            stock.clone().with_split_lines(Some(std::sync::Arc::new(vec![vec![Vec3::new(10., 0., 0.), Vec3::new(10., 0., 20.)]]))),
+            stock.with_paint(Some(crate::Paint { opacity: 1., faces: vec![crate::FacePaint { face: 0, color: [1., 0., 0.], opacity: 1. }] })),
+        ];
+        for input in protected {
+            let output = stack_boolean(&input, &cutter, BoolOp::Cut).unwrap().unwrap().unwrap();
+            assert_eq!(output.face_count(), merged.face_count() + 2);
+            assert!((0..output.face_count()).all(|i| !output.face_was_coalesced(i)));
+            // Independent circular chord-volume bound: 2*pi*(10*20+5*18)*1e-5 < .019.
+            let expected = std::f64::consts::PI * (100. * 20. - 25. * 18.);
+            for body in [&output, &merged] {
+                let mesh = body.tessellate(1e-5).unwrap();
+                assert!((mesh.measure().volume - expected).abs() < 0.03);
+                assert!(mesh.contains(Vec3::new(0., 0., 1.)));
+                assert!(!mesh.contains(Vec3::new(0., 0., 10.)));
+                assert!(mesh.contains(Vec3::new(7., 0., 10.)));
+            }
+        }
+    }
+
+    #[test]
+    fn annular_inward_tool_recovers_exact_stacks_before_cap_policy() {
+        let plane = Plane::XY;
+        let mut region = rectangle(Vec2::ZERO, Vec2::new(40.0, 30.0));
+        region.holes.push(Loop2::circle(Vec2::new(20.0, 15.0), 5.0));
+        let mut stock = crate::extrude(&plane, std::slice::from_ref(&region), 0.0, 20.0).unwrap().pop().unwrap();
+        for (lo, hi) in [(20.0, 30.0), (30.0, 35.0)] {
+            let positive = crate::extrude(&plane, std::slice::from_ref(&region), lo, hi).unwrap().pop().unwrap();
+            stock = crate::boolean(&stock, &positive, BoolOp::Union).unwrap().unwrap();
+        }
+        let mut grown = rectangle(Vec2::new(-0.3, -0.3), Vec2::new(40.3, 30.3));
+        grown.holes = region.holes;
+        let tool = crate::extrude(&plane, &[grown], 30.0, 35.6).unwrap().pop().unwrap();
+        let tol = stock.size().max(tool.size()) * 1e-6;
+        let a = stack_of(&stock, Vec3::Z, &plane, tol).expect("annular stock qualifies");
+        let b = stack_of(&tool, Vec3::Z, &plane, tol).expect("overrun tool qualifies");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert!((a[0].lo - 0.0).abs() < tol && (a[0].hi - 35.0).abs() < tol);
+        assert!((b[0].lo - 30.0).abs() < tol && (b[0].hi - 35.6).abs() < tol);
+        assert_eq!(a[0].regions[0].holes.len(), 1);
+        assert_eq!(b[0].regions[0].holes.len(), 1);
+        assert!((a[0].regions[0].area() - (1200.0 - 25.0 * std::f64::consts::PI)).abs() < 1e-8);
+        assert!(simple_prism_boolean(&stock, &tool, BoolOp::Cut).is_none());
+        let result = stack_boolean(&stock, &tool, BoolOp::Cut).expect("qualified overlapping stacks").unwrap().unwrap();
+        assert_eq!(result.shell_count(), 1);
+        assert!(result.validity().is_empty());
+        let mesh = result.tessellate(1e-5).unwrap();
+        let expected = (1200.0 - 25.0 * std::f64::consts::PI) * 30.0;
+        // An inscribed circular mesh at radial chord error 1e-5 has volume
+        // deficit below 2*pi*R*height*error, conservatively 0.01 mm^3 here.
+        assert!((mesh.measure().volume - expected).abs() < 0.02);
+        for (point, present) in [
+            (Vec3::new(5.0, 5.0, 29.0), true),
+            (Vec3::new(5.0, 5.0, 31.0), false),
+            (Vec3::new(20.0, 15.0, 29.0), false),
+            (Vec3::new(24.8, 15.0, 29.0), false),
+            (Vec3::new(25.2, 15.0, 29.0), true),
+        ] {
+            assert_eq!(mesh.contains(point), present, "{point:?}");
+        }
+    }
+    #[test]
+    fn annular_partial_cut_overruns_and_interior_lumps_preserve_material() {
+        let area = 1200.0 - 25.0 * std::f64::consts::PI;
+        for seam in [0.0, 0.37] {
+            for plane in [Plane::XY, Plane::new(Vec3::new(30.0, 20.0, 10.0), Vec3::X, Vec3::Z).unwrap()] {
+                let mut region = rectangle(Vec2::ZERO, Vec2::new(40.0, 30.0));
+                region.holes.push(Loop2::circle_from(Vec2::new(20.0, 15.0), 5.0, seam));
+                let stock = crate::extrude(&plane, std::slice::from_ref(&region), 0.0, 35.0).unwrap().pop().unwrap();
+                let before = crate::step_export(&[&stock], "source").unwrap();
+                for (lo, hi, retained, shells) in [(30.0, 35.6, 30.0, 1), (-0.6, 5.0, 30.0, 1), (10.0, 15.0, 30.0, 2), (30.0, 35.0, 30.0, 1)] {
+                    let tool = crate::extrude(&plane, std::slice::from_ref(&region), lo, hi).unwrap().pop().unwrap();
+                    let result = stack_boolean(&stock, &tool, BoolOp::Cut).expect("exact aligned cut path").unwrap().unwrap();
+                    assert_eq!(result.shell_count(), shells);
+                    assert!(result.validity().is_empty());
+                    let mesh = result.tessellate(1e-5).unwrap();
+                    assert!((mesh.measure().volume - retained * area).abs() < 0.02);
+                    let at = |x: f64, y: f64, z: f64| plane.to_world(Vec2::new(x, y)) + plane.normal() * z;
+                    for z in [2.5, 12.5, 32.5] {
+                        let material = !(lo < z && z < hi);
+                        assert_eq!(mesh.contains(at(5.0, 5.0, z)), material);
+                        assert!(!mesh.contains(at(20.0, 15.0, z)));
+                        assert_eq!(mesh.contains(at(25.2, 15.0, z)), material);
+                    }
+                    let public = crate::boolean(&stock, &tool, BoolOp::Cut).unwrap().unwrap();
+                    assert!((public.tessellate(1e-5).unwrap().measure().volume - retained * area).abs() < 0.02);
+                    if lo == 30.0 && hi > 35.0 {
+                        let imported = crate::step_import(&crate::step_export(&[&result], "inward annular cut").unwrap()).unwrap();
+                        assert!(imported.warnings.is_empty());
+                        let saved = &imported.bodies.first().unwrap().body;
+                        assert!((saved.tessellate(1e-5).unwrap().measure().volume - 30.0 * area).abs() < 0.02);
+                        let next = crate::extrude(&plane, std::slice::from_ref(&region), 25.0, 31.0).unwrap().pop().unwrap();
+                        let shortened = crate::boolean(saved, &next, BoolOp::Cut).unwrap().unwrap();
+                        let next_volume = shortened.tessellate(1e-5).unwrap().measure().volume;
+                        assert!(
+                            (next_volume - 25.0 * area).abs() < 0.02,
+                            "seam {seam}, plane {plane:?}, next cut volume {next_volume}, expected {}",
+                            25.0 * area
+                        );
+                        assert!(shortened.contains(at(5.0, 5.0, 24.0)));
+                        assert!(!shortened.contains(at(5.0, 5.0, 26.0)));
+                        assert!(!shortened.contains(at(20.0, 15.0, 24.0)));
+                    }
+                }
+                let clear = crate::extrude(&plane, std::slice::from_ref(&region), 36.0, 40.0).unwrap().pop().unwrap();
+                assert!(stack_boolean(&stock, &clear, BoolOp::Cut).is_none());
+                let unchanged = crate::boolean(&stock, &clear, BoolOp::Cut).unwrap().unwrap();
+                assert!(std::sync::Arc::ptr_eq(&stock.solid, &unchanged.solid), "disjoint Cut must retain exact source topology");
+                let unchanged_mesh = unchanged.tessellate(1e-5).unwrap();
+                let source_mesh = stock.tessellate(1e-5).unwrap();
+                assert_eq!(unchanged_mesh.measure().volume, source_mesh.measure().volume);
+                // tessellate() floors tolerance at body.size()*1e-6. The arc
+                // polygon's area error is at most perimeter*radial chord error.
+                let bound = std::f64::consts::TAU * 5.0 * 35.0 * (stock.size() * 1e-6).max(1e-5) + 1e-5;
+                assert!((unchanged_mesh.measure().volume - 35.0 * area).abs() < bound);
+                assert!(!unchanged_mesh.contains(plane.to_world(Vec2::new(20.0, 15.0)) + plane.normal() * 12.5));
+                let all = crate::extrude(&plane, std::slice::from_ref(&region), -1.0, 36.0).unwrap().pop().unwrap();
+                assert!(stack_boolean(&stock, &all, BoolOp::Cut).unwrap().unwrap().is_none());
+                assert_eq!(crate::step_export(&[&stock], "source").unwrap(), before);
+            }
+        }
+    }
+    #[test]
+    fn annular_partial_cut_preserves_unequal_radii_and_conservative_refusals() {
+        let mut region = rectangle(Vec2::ZERO, Vec2::new(40.0, 30.0));
+        region.holes.push(Loop2::circle(Vec2::new(20.0, 15.0), 5.0));
+        let stock = crate::extrude(&Plane::XY, std::slice::from_ref(&region), 0.0, 35.0).unwrap().pop().unwrap();
+        let before = crate::step_export(&[&stock], "unchanged source").unwrap();
+        let mut larger_hole = region.clone();
+        larger_hole.holes = vec![Loop2::circle(Vec2::new(20.0, 15.0), 5.1)];
+        let tool = crate::extrude(&Plane::XY, &[larger_hole], 30.0, 36.0).unwrap().pop().unwrap();
+        let result = stack_boolean(&stock, &tool, BoolOp::Cut).unwrap().unwrap().unwrap();
+        let expected = (1200.0 - 25.0 * std::f64::consts::PI) * 30.0 + std::f64::consts::PI * (5.1_f64.powi(2) - 25.0) * 5.0;
+        let mesh = result.tessellate(1e-5).unwrap();
+        assert!((mesh.measure().volume - expected).abs() < 0.02);
+        assert!(mesh.contains(Vec3::new(25.05, 15.0, 32.0)));
+        assert!(!mesh.contains(Vec3::new(25.2, 15.0, 32.0)));
+        assert!(!mesh.contains(Vec3::new(20.0, 15.0, 32.0)));
+        let interior = crate::extrude(&Plane::XY, std::slice::from_ref(&region), 10.0, 15.0).unwrap().pop().unwrap();
+        for d in [Vec3::X, Vec3::Y] {
+            let plane = Plane::from_normal(Vec3::ZERO, d).unwrap();
+            let tol = stock.size() * 1e-6;
+            assert!(stack_of(&stock, d, &plane, tol).is_none(), "transverse cylinder axis must not fill the hole");
+            assert!(stack_of(&interior, d, &plane, tol).is_none());
+        }
+        assert!(stack_boolean(&stock, &interior, BoolOp::Union).is_none(), "Union retains its common-cap policy");
+        let tapered = crate::extrude_tapered(&Plane::XY.offset(30.0), &rectangle(Vec2::ZERO, Vec2::new(40.0, 30.0)), 6.0, 1.0, 0.05).unwrap();
+        assert!(stack_boolean(&stock, &tapered, BoolOp::Cut).is_none(), "slanted walls are not aligned prisms");
+        let curved_cap = crate::sphere(Vec3::new(20.0, 15.0, 35.0), 5.0).unwrap();
+        assert!(stack_boolean(&stock, &curved_cap, BoolOp::Cut).is_none());
+        let pieces =
+            (0..350).map(|i| crate::box_solid(Vec3::new(i as f64 * 3.0, 0.0, 0.0), Vec3::new(i as f64 * 3.0 + 1.0, 1.0, 1.0)).unwrap()).collect();
+        let over_budget = crate::ops::join_pieces(pieces).unwrap().unwrap();
+        assert!(over_budget.face_count() > 2048);
+        assert!(stack_boolean(&over_budget, &interior, BoolOp::Cut).is_none());
+        assert_eq!(crate::step_export(&[&stock], "unchanged source").unwrap(), before);
+    }
+    #[test]
+    fn curved_prism_wall_requires_positive_separable_rational_weights() {
+        let surface = |mixed: bool| {
+            let weight = if mixed { 2.0 } else { 1.0 };
+            let points = vec![
+                vec![mt::Vector4::new(0.0, 0.0, 0.0, 1.0), mt::Vector4::new(0.0, 0.0, 10.0, 1.0)],
+                vec![mt::Vector4::new(5.0, 0.0, 0.0, 1.0), mt::Vector4::new(5.0 * weight, 0.0, 10.0 * weight, weight)],
+            ];
+            mt::Surface::NurbsSurface(mt::NurbsSurface::new(mt::BSplineSurface::new(
+                (mt::KnotVec::bezier_knot(1), mt::KnotVec::bezier_knot(1)),
+                points,
+            )))
+        };
+        assert!(wall_along(&surface(false), Vec3::Z, 1e-5, &mut 1000));
+        assert!(!wall_along(&surface(true), Vec3::Z, 1e-5, &mut 1000), "parallel Euclidean controls alone do not certify a rational sweep");
+        assert!(!wall_along(&surface(false), Vec3::Y, 1e-5, &mut 1000));
+        assert!(!wall_along(&surface(false), Vec3::Z, 1e-5, &mut 0));
     }
     #[test]
     fn partial_depth_cuts_touching_a_through_hole_use_exact_stacked_sections() {

@@ -76,9 +76,12 @@ fn put_view(app: &mut SolveApp, v: DocView) {
 fn swap_in(app: &mut SolveApp, slot: DocSlot) -> DocSlot {
     // Whatever was going on in the design leaves with it.
     crate::dialogs::cancel(app);
+    crate::dim_view::cancel();
     app.tool = None;
     app.params = None;
-    app.cam_anim = None;
+    app.cancel_view_animation();
+    app.viewport.orbit_snap = None;
+    app.viewport.orbit_free = None;
     app.preview = crate::preview::PreviewState::default();
     app.viewport.hover = None;
     app.menu.props = None;
@@ -389,20 +392,21 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
             ui.ctx().data_mut(|d| d.insert_temp(id, !d.get_temp::<bool>(id).unwrap_or(false)));
         }
         if ui.ctx().data(|d| d.get_temp::<bool>(id).unwrap_or(false)) {
-            let resp = egui::Area::new(id.with("area")).fixed_pos(pos2(mr.left(), r.bottom())).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-                crate::context_menu::menu_frame(ui, |ui| {
-                    for (i, (name, dirty)) in info.iter().enumerate() {
-                        let item = crate::context_menu::Item::action(
-                            "doc",
-                            &format!("{name}{}", if *dirty { " •" } else { "" }),
-                            if i == app.docs.active { "box" } else { "" },
-                        );
-                        if crate::context_menu::list_row(ui, &item).is_some() {
-                            pick = Some(i);
+            let resp =
+                crate::frame::area(id.with("area")).fixed_pos(pos2(mr.left(), r.bottom())).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+                    crate::context_menu::menu_frame(ui, |ui| {
+                        for (i, (name, dirty)) in info.iter().enumerate() {
+                            let item = crate::context_menu::Item::action(
+                                "doc",
+                                &format!("{name}{}", if *dirty { " •" } else { "" }),
+                                if i == app.docs.active { "box" } else { "" },
+                            );
+                            if crate::context_menu::list_row(ui, &item).is_some() {
+                                pick = Some(i);
+                            }
                         }
-                    }
-                })
-            });
+                    })
+                });
             let pressed_outside = ui.ctx().input(|i| i.pointer.any_pressed()) && !resp.response.contains_pointer() && !mresp.contains_pointer();
             if pick.is_some() || pressed_outside {
                 ui.ctx().data_mut(|d| d.insert_temp(id, false));

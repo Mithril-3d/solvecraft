@@ -9,6 +9,8 @@ pub struct OffsetChain {
     pub outputs: Vec<String>,
     pub distance: f64,
     pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<crate::offset_topology::OffsetTopology>,
 }
 
 impl Sketch {
@@ -57,7 +59,11 @@ impl Sketch {
     }
 
     fn refresh_analytic_offsets(&mut self) -> Result<(), SketchError> {
-        for offset in self.offsets.clone() {
+        for index in 0..self.offsets.len() {
+            if self.refresh_convex_offset(index)? {
+                continue;
+            }
+            let offset = self.offsets.get(index).cloned().ok_or_else(|| SketchError::Invalid("missing offset chain".into()))?;
             if offset.sources.len() != offset.outputs.len() || offset.sources.len() > 10_000 || !offset.distance.is_finite() {
                 return Err(SketchError::Invalid("damaged offset chain".into()));
             }

@@ -268,7 +268,22 @@ pub(crate) fn boolean_apart(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Opt
         }
         for (n, d) in &back {
             // a's face points along n; b's face points along −n at the same plane (−d).
-            let shift = if op == BoolOp::Union { d2 } else { -d2 };
+            let shift = if op == BoolOp::Union && crate::ops::narrowing_bores() {
+                // Pushed into `a`, b's face must have a's material behind it all over and that
+                // deep: over a hole in a's face (a narrowed bore's rim over the other body's
+                // bore) it would fill the hole, through a thin wall it would stick out the far
+                // side. Only checked inside `bore_union`, which then tries its other way; a
+                // general check turns some joins that come out slightly wrong today (a pad
+                // half past an edge) into failures, until such faces can be split first.
+                [d2, d2 * 0.25, d2 * 0.0625]
+                    .into_iter()
+                    .find(|depth| backed(a, b, -*n, -*d, *depth))
+                    .ok_or_else(|| KernelError::Failed("pushing a face: part of it lies over a hole or past the edge of the other body".into()))?
+            } else if op == BoolOp::Union {
+                d2
+            } else {
+                -d2
+            };
             b2 = push_faces(&b2, -*n, -*d, shift)?;
         }
         let Some(mut r) = crate::ops::boolean(&a2, &b2, op)? else { return Ok(None) };
@@ -284,6 +299,29 @@ pub(crate) fn boolean_apart(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Opt
         Ok(Some(r))
     };
     Some(run())
+}
+
+/// Has `a` material behind every part of b's faces in the plane (m, d) (m their outward
+/// normal, pointing into `a`), to `depth`? Checked at points inside the faces' triangles.
+fn backed(a: &Body, b: &Body, m: Vec3, d: f64, depth: f64) -> bool {
+    let size = a.size().max(b.size());
+    let tol = (size * 1e-7).max(1e-9) * 10.0;
+    let faces: Vec<usize> = planes(b).into_iter().filter(|(_, p)| p.n.dot(m) > 1.0 - 1e-9 && (p.d - d).abs() < tol).map(|(i, _)| i).collect();
+    let (Ok(ma), Ok(mb)) = (a.tessellate_with(size * 1e-3, true), b.tessellate_with(size * 1e-3, true)) else { return false };
+    let inside = ma.inside_index();
+    let mut points = Vec::new();
+    for (t, fi) in mb.triangles.iter().zip(&mb.tri_face) {
+        if !faces.contains(&(*fi as usize)) {
+            continue;
+        }
+        let Some([p, q, r]) = mb.tri(t) else { continue };
+        let c = (p + q + r) / 3.0;
+        points.extend([c, c.lerp(p, 0.8), c.lerp(q, 0.8), c.lerp(r, 0.8)]);
+        if points.len() > 4000 {
+            break;
+        }
+    }
+    !points.is_empty() && points.iter().all(|p| [0.05, 0.5, 1.0].iter().all(|k| inside.contains(*p + m * (depth * k))))
 }
 
 /// Union of bodies that touch along one identical planar face, back to back (a body joined
@@ -383,6 +421,146 @@ pub(crate) fn glue(a: &Body, b: &Body) -> Option<Result<Body>> {
                 let solid = Solid::try_new(vec![faces.into()]).map_err(|e| fail(&e.to_string()))?;
                 Body::new(crate::heal::heal(solid, size))
             }));
+        }
+    }
+    None
+}
+
+/// A cylindrical face: its index, a point on the axis, the unit axis and the radius.
+#[derive(Clone, Copy, Debug)]
+struct CylFace {
+    index: usize,
+    origin: Vec3,
+    axis: Vec3,
+    radius: f64,
+}
+
+fn cylinders(b: &Body) -> Vec<CylFace> {
+    (0..b.face_count())
+        .filter_map(|index| match crate::face_surface(b, index)? {
+            crate::FaceSurface::Cylinder { origin, axis, radius } => Some(CylFace { index, origin, axis, radius }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Do the two cylinders lie on the same surface?
+fn same_cylinder(x: &CylFace, y: &CylFace, tol: f64) -> bool {
+    let off = y.origin - x.origin;
+    x.axis.dot(y.axis).abs() > 1.0 - 1e-9 && (x.radius - y.radius).abs() < tol && (off - x.axis * off.dot(x.axis)).len() < tol
+}
+
+/// Do the bodies have cylindrical faces on a common cylinder?
+pub(crate) fn has_coincident_cylinders(a: &Body, b: &Body) -> bool {
+    let tol = (a.size().max(b.size()) * 1e-7).max(1e-9) * 10.0;
+    let cb = cylinders(b);
+    cylinders(a).iter().any(|x| cb.iter().any(|y| same_cylinder(x, y, tol)))
+}
+
+/// Union of bodies with bores on a common cylinder (a drain pad's bore around the drain hole
+/// it is joined over). The mesh intersection can't take the coincident walls, so the tool's
+/// bore is narrowed (its walls pushed toward the axis, now clear of the target's), the bodies
+/// are joined, and the cylinder of the original bore is cut out again over the tool's length.
+/// Recutting is valid only where that cylinder holds no material of either body. The
+/// samples are plausibility checks; a whole-boundary guard rejects additional boundaries
+/// crossing the recut. Original common-bore trims retain the legacy eligibility policy.
+/// This is not a general emptiness or Boolean-equivalence certificate. Each direction
+/// returns a result only when `accept` takes it; otherwise this returns `None`.
+pub(crate) fn bore_union(a: &Body, b: &Body, accept: &dyn Fn(&Body) -> bool) -> Option<Body> {
+    let size = a.size().max(b.size());
+    let tol = (size * 1e-7).max(1e-9) * 10.0;
+    let mtol = size * 2e-3;
+    let (ma, mb) = (a.tessellate_with(mtol, true).ok()?, b.tessellate_with(mtol, true).ok()?);
+    let (ia, ib) = (ma.inside_index(), mb.inside_index());
+    let empty = |p: Vec3| !ia.contains(p) && !ib.contains(p);
+    let (ca, cb) = (cylinders(a), cylinders(b));
+    // (body to narrow, its mesh and inside test, the other body, their faces on the cylinder).
+    let ways = [(b, &mb, &ib, a, &cb, &ca), (a, &ma, &ia, b, &ca, &cb)];
+    for (tool, mesh, inside, target, ct, co) in ways {
+        for c in ct {
+            if !co.iter().any(|o| same_cylinder(c, o, tol)) {
+                continue;
+            }
+            let bore: Vec<usize> = ct.iter().filter(|x| same_cylinder(c, x, tol)).map(|x| x.index).collect();
+            // The tool's extent along the axis on that cylinder, and whether it is a bore (the
+            // material outside it) at a point of the face.
+            let (mut t0, mut t1) = (f64::INFINITY, f64::NEG_INFINITY);
+            let mut probe = None;
+            for (t, fi) in mesh.triangles.iter().zip(&mesh.tri_face) {
+                if !bore.contains(&(*fi as usize)) {
+                    continue;
+                }
+                let Some(ps) = mesh.tri(t) else { continue };
+                for p in ps {
+                    let s = (p - c.origin).dot(c.axis);
+                    t0 = t0.min(s);
+                    t1 = t1.max(s);
+                }
+                if probe.is_none() {
+                    probe = Some((ps[0] + ps[1] + ps[2]) / 3.0);
+                }
+            }
+            let Some(q) = probe else { continue };
+            if !(t1 - t0 > tol && c.radius > tol) {
+                continue;
+            }
+            let along = c.origin + c.axis * (q - c.origin).dot(c.axis);
+            let Some(radial) = (q - along).normalized() else { continue };
+            let on = along + radial * c.radius;
+            let e = (c.radius * 0.05).max(size * 1e-4);
+            if !(inside.contains(on + radial * e) && !inside.contains(on - radial * e)) {
+                continue;
+            }
+            // The cylinder over the tool's length holds no material of either body.
+            let (u, w) = (c.axis.any_perp(), c.axis.cross(c.axis.any_perp()));
+            let at = |s: f64, r: f64, ang: f64| c.origin + c.axis * s + (u * ang.cos() + w * ang.sin()) * r;
+            let clear = (1..=9).all(|i| {
+                let s = t0 + (t1 - t0) * f64::from(i) / 10.0;
+                empty(at(s, 0.0, 0.0))
+                    && (0..8).all(|k| {
+                        let ang = f64::from(k) * std::f64::consts::FRAC_PI_4 + 0.3;
+                        empty(at(s, c.radius * 0.5, ang)) && empty(at(s, c.radius * 0.9, ang))
+                    })
+            });
+            if !clear {
+                continue;
+            }
+            // Past an end where the space is empty well beyond the radius too, the cut runs on a
+            // little (so its cap doesn't lie in a face's plane). Not where the other body's bore
+            // goes on: the cut's side would lie on its wall.
+            let ext = size * 0.01;
+            let past = |s: f64| {
+                empty(at(s, 0.0, 0.0))
+                    && (0..8).all(|k| {
+                        let ang = f64::from(k) * std::f64::consts::FRAC_PI_4 + 0.3;
+                        empty(at(s, c.radius * 0.9, ang)) && empty(at(s, c.radius * 1.1, ang)) && empty(at(s, c.radius * 1.5, ang))
+                    })
+            };
+            let lo = if past(t0 - ext * 0.5) && past(t0 - ext) { t0 - ext } else { t0 };
+            let hi = if past(t1 + ext * 0.5) && past(t1 + ext) { t1 + ext } else { t1 };
+            // The samples above are plausibility checks, not proof that an
+            // arbitrarily thin web is absent. Every additional current boundary
+            // must be wholly clear of the recut; unsupported trims refuse.
+            let other_bore: Vec<usize> = co.iter().filter(|x| same_cylinder(c, x, tol)).map(|x| x.index).collect();
+            if crate::bore_guard::boundaries_clear(tool, &bore, c.origin, c.axis, c.radius, lo, hi, tol).is_none()
+                || crate::bore_guard::boundaries_clear(target, &other_bore, c.origin, c.axis, c.radius, lo, hi, tol).is_none()
+            {
+                continue;
+            }
+            let d = (c.radius * 0.2).min(size * 0.01);
+            let run = || -> Result<Option<Body>> {
+                let narrowed = crate::offset::offset_body(tool, |i, _| if bore.contains(&i) { d } else { 0.0 })?;
+                if !narrowed.validity().is_empty() {
+                    return Err(KernelError::Failed("narrowing a bore: an unsound result".into()));
+                }
+                let Some(joined) = crate::ops::boolean(target, &narrowed, BoolOp::Union)? else { return Ok(None) };
+                let cut = crate::build::cylinder(at(lo, 0.0, 0.0), c.axis, c.radius, hi - lo)?;
+                crate::ops::boolean(&joined, &cut, BoolOp::Cut)
+            };
+            match run() {
+                Ok(Some(r)) if accept(&r) => return Some(r),
+                _ => continue,
+            }
         }
     }
     None

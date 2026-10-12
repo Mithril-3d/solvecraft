@@ -6,9 +6,11 @@ Describe the problem and resulting behavior. Link the issue when applicable.
 
 What did you run, and what were the results? Include expected and measured values for geometry changes.
 
-## Concrete visual context (when helpful)
+## Screenshots of the behavior (when observable)
 
-If a screenshot, short demo, diagram or before/after model view helps explain what this change means, include it alongside the prose. This includes kernel, geometry, assembly and backend changes, not only UI work. Coding agents should run the example and capture the actual reproduction/result themselves, adding brief steps and annotations where helpful. Use a public-safe example; exclude private designs and sensitive details, and attach media rather than committing generated review artifacts. Changes with no useful visual explanation can omit this section.
+For observable CAD, UI or model behavior, include actual descriptive screenshots or a short recording from a small reproduction. This includes kernel, geometry, assembly and backend effects that can be shown in the app. Coding agents should run the app and capture the evidence themselves, rather than asking a human for evidence they can produce. Show the actual failure/result, preferably before and after, with brief steps, expected/actual behavior and annotations where helpful.
+
+Flowcharts and Mermaid diagrams cannot substitute for evidence of visible behavior. Use diagrams for architectural reasoning when actual screenshots cannot illustrate the point. Changes with no useful observable behavior may omit screenshot/video evidence. Exclude private designs and sensitive details; attach media or link to an accessible recording rather than committing generated review artifacts.
 
 ## Integration status
 

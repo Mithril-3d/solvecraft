@@ -323,7 +323,7 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
             s.store(ui.ctx(), id);
         }
         let pos: Pos2 = sp + vec2(-34.0, -11.0);
-        egui::Area::new(egui::Id::new(("sc_dim_area", i))).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+        crate::frame::area(egui::Id::new(("sc_dim_area", i))).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
             let fill = if b.locked { tk.accent_soft } else { tk.panel };
             egui::Frame::popup(ui.style()).fill(fill).inner_margin(egui::Margin::symmetric(3, 1)).show(ui, |ui| {
                 let r = ui

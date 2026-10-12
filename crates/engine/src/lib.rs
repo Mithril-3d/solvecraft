@@ -33,6 +33,10 @@ pub use solvecraft_kernel as kernel;
 pub use solvecraft_render as render;
 pub use solvecraft_sketch as sketch;
 
+/// Longest accepted request line on the JSON-lines channels (MCP over stdio and the control
+/// server over loopback), so both refuse runaway input at the same size.
+pub const MAX_LINE: usize = 16 << 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("unknown command `{0}`")]
@@ -146,6 +150,28 @@ pub struct Preview {
     pub after: Arc<ModelState>,
 }
 
+/// Prepared world geometry depends on design/model identity and placement context, not
+/// selection or the view revision. Retained Arcs prevent pointer reuse after a design closes.
+#[derive(Clone)]
+struct WorldCache {
+    doc: Arc<Document>,
+    model: Arc<solvecraft_doc::ModelState>,
+    pending_moves: std::collections::BTreeMap<u64, solvecraft_doc::Mat>,
+    active_component: u64,
+    active_occurrence_path: Option<Vec<u64>>,
+    world: Arc<solvecraft_doc::ModelState>,
+}
+
+impl WorldCache {
+    fn matches(&self, session: &Session, model: &Arc<solvecraft_doc::ModelState>) -> bool {
+        Arc::ptr_eq(&self.doc, &session.doc)
+            && Arc::ptr_eq(&self.model, model)
+            && self.pending_moves == session.pending_moves
+            && self.active_component == session.active_component
+            && self.active_occurrence_path == session.active_occurrence_path
+    }
+}
+
 /// An editing session on one design.
 pub struct Session {
     pub doc: Arc<Document>,
@@ -169,7 +195,7 @@ pub struct Session {
     pub active_occurrence_path: Option<Vec<u64>>,
     /// Occurrence moves not captured yet (Capture Position keeps them, a recompute drops them).
     pub pending_moves: std::collections::BTreeMap<u64, solvecraft_doc::Mat>,
-    world_cache: std::sync::Mutex<Option<(u64, Arc<solvecraft_doc::ModelState>)>>,
+    world_cache: std::sync::Mutex<Option<WorldCache>>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
     /// Features copied with `timeline.copy` (pasted by `timeline.paste`).
     pub clipboard: Vec<solvecraft_doc::Feature>,
@@ -304,10 +330,10 @@ impl Session {
             return st;
         }
         if let Ok(c) = self.world_cache.lock()
-            && let Some((rev, w)) = c.as_ref()
-            && *rev == self.revision
+            && let Some(cached) = c.as_ref()
+            && cached.matches(self, &st)
         {
-            return w.clone();
+            return cached.world.clone();
         }
         let mut w = if self.pending_moves.is_empty() {
             solvecraft_doc::world_state(&self.doc, &st)
@@ -346,7 +372,14 @@ impl Session {
         }
         let w = Arc::new(w);
         if let Ok(mut c) = self.world_cache.lock() {
-            *c = Some((self.revision, w.clone()));
+            *c = Some(WorldCache {
+                doc: self.doc.clone(),
+                model: st,
+                pending_moves: self.pending_moves.clone(),
+                active_component: self.active_component,
+                active_occurrence_path: self.active_occurrence_path.clone(),
+                world: w.clone(),
+            });
         }
         w
     }
@@ -395,6 +428,7 @@ impl Session {
         let changed = !Arc::ptr_eq(&self.doc, &before.doc);
         match r {
             Ok(v) => {
+                let v = if changed { self.with_created(spec.id, params, &before, v) } else { v };
                 if changed {
                     if spec.undoable {
                         self.undo.push(before);
@@ -417,6 +451,27 @@ impl Session {
                 Err(e)
             }
         }
+    }
+
+    /// A sketch command's result gets `created`: the ids of the points, curves, constraints and
+    /// dimensions it added to its sketch (the `sketch` param, else the active sketch), so every
+    /// drawing and modify command reports them the same way (see `cmd::sketch_created`). A command
+    /// that runs another one (`sketch.draw.dimensioned`) gets the whole diff, replacing the nested
+    /// command's narrower `created`.
+    fn with_created(&self, id: &str, params: &Value, before: &Snapshot, mut v: Value) -> Value {
+        if !id.starts_with("sketch.") {
+            return v;
+        }
+        let Some(out) = v.as_object_mut() else { return v };
+        let named = match params.get("sketch") {
+            Some(Value::Number(n)) => self.doc.find_feature(&n.to_string()).map(|f| f.id),
+            Some(Value::String(x)) => self.doc.find_feature(x).map(|f| f.id),
+            _ => None,
+        };
+        let Some(sk) = named.or(self.active_sketch).or(before.active_sketch) else { return v };
+        let Ok(after) = self.doc.sketch(sk) else { return v };
+        out.insert("created".into(), cmd::sketch_created(before.doc.sketch(sk).ok(), after));
+        v
     }
 
     /// Remember the design, active sketch, pending positions and undo history; returns the checkpoint's id.
@@ -477,7 +532,7 @@ impl Session {
             active_component: self.active_component,
             active_occurrence_path: self.active_occurrence_path.clone(),
             pending_moves: self.pending_moves.clone(),
-            world_cache: Default::default(),
+            world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
             occurrence_visibility_cache: Default::default(),
             clipboard: self.clipboard.clone(),
             section: None,
@@ -493,12 +548,6 @@ impl Session {
     pub fn invalidate_view(&mut self, previous_revision: u64) {
         let old = self.revision;
         self.revision = old.max(previous_revision) + 1;
-        if let Ok(mut cache) = self.world_cache.lock()
-            && let Some((revision, _)) = cache.as_mut()
-            && *revision == old
-        {
-            *revision = self.revision;
-        }
     }
 
     /// Commit commands evaluated on a scratch copy without losing this session's file,
@@ -616,6 +665,8 @@ mod extent_tests;
 #[cfg(test)]
 mod pattern_suppress_tests;
 #[cfg(test)]
+mod profile_curves_tests;
+#[cfg(test)]
 mod profile_refs_tests;
 #[cfg(test)]
 mod split_face_tests;
@@ -623,3 +674,5 @@ mod split_face_tests;
 mod tests;
 #[cfg(test)]
 mod thread_tests;
+#[cfg(test)]
+mod world_placement_cache_tests;

@@ -64,6 +64,8 @@ struct Job {
 pub fn run(args: &[String]) -> Result<(), String> {
     let from = flag(args, "--from", 0u64);
     let count = flag(args, "--count", 100u64);
+    let last = from.checked_add(count.saturating_sub(1)).ok_or("seed range exceeds u64::MAX: reduce --from or --count")?;
+    let mut seeds = (count > 0).then_some(from..=last).into_iter().flatten().peekable();
     let jobs = flag(args, "--jobs", 4usize).clamp(1, 64);
     let timeout = Duration::from_secs(flag(args, "--timeout", 120u64));
     let steps = flag(args, "--steps", 8usize);
@@ -74,14 +76,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if let Some(d) = &out_dir {
         std::fs::create_dir_all(d).map_err(|e| format!("{d}: {e}"))?;
     }
-    let mut next = from;
     let mut running: Vec<Job> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
     let t0 = Instant::now();
-    while next < from + count || !running.is_empty() {
-        while running.len() < jobs && next < from + count {
+    while seeds.peek().is_some() || !running.is_empty() {
+        while running.len() < jobs {
+            let Some(seed) = seeds.next() else { break };
             let mut cmd = Command::new(&exe);
-            cmd.args(["fuzz-one", &next.to_string(), "--steps", &steps.to_string()]);
+            cmd.args(["fuzz-one", &seed.to_string(), "--steps", &steps.to_string()]);
             if minimise {
                 cmd.arg("--minimise");
             }
@@ -96,8 +98,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     }
                 });
             }
-            running.push(Job { seed: next, child, started: Instant::now(), err: rx, last: String::new() });
-            next += 1;
+            running.push(Job { seed, child, started: Instant::now(), err: rx, last: String::new() });
         }
         std::thread::sleep(Duration::from_millis(50));
         let mut i = 0;

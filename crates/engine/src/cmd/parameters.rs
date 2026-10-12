@@ -226,16 +226,15 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"format": format, "path": path, "text": text}))
 }
 
+/// Largest parameter table we read from a file.
+const MAX_PARAMETER_BYTES: usize = 16 << 20;
+
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "parameters.import";
     let text = match (str_(p, "text"), str_(p, "path")) {
         (Some(t), _) => t.to_string(),
         (None, Some(path)) => {
-            let meta = solvecraft_io::vfs::len(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-            if meta > 16 << 20 {
-                return Err(bad(cmd, "file too large"));
-            }
-            solvecraft_io::vfs::read_to_string(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
+            solvecraft_io::vfs::read_to_string(path, MAX_PARAMETER_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
         }
         _ => return Err(bad(cmd, "give `text` or `path`")),
     };

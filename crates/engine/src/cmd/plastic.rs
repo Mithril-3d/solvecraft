@@ -267,6 +267,7 @@ fn snap_fit(s: &mut Session, p: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use solvecraft_geom::Vec3;
     use std::f64::consts::PI;
 
     use serde_json::{Value, json};
@@ -350,6 +351,40 @@ mod tests {
         let m = run(&mut s, "inspect.measure", json!({}));
         assert!((m["bodies"][0]["bbox"]["max"][0].as_f64().unwrap_or(0.0) - 40.0).abs() < 1e-9);
         assert!(s.execute("plastic.snap_fit", &json!({"position": [5, 5, 4], "direction": [0, 0, 1], "hook": [0, 0, 1], "length": 15, "thickness": 1.5, "width": 6, "catch_depth": 1, "catch_length": 3})).is_err());
+    }
+
+    #[test]
+    fn enclosure_snap_fit_follows_resized_front_wall() {
+        let mut s = Session::default();
+        let script: Value = serde_json::from_str(include_str!("../../../../examples/acceptance/sensor_enclosure.json")).unwrap();
+        s.run_script(&script).unwrap();
+        let feature = s.doc.find_feature("SnapFit1").unwrap().clone();
+        run(&mut s, "parameters.change", json!({"name":"board_d","expression":"50 mm"}));
+        let before = s.model.state_before(feature.id);
+        let name = feature.face_names.first().unwrap();
+        let point = solvecraft_doc::naming::point_on_face(&before, name, Vec3::new(0., -28., 20.))
+            .expect("the original wall identity survives merged pieces")
+            .0;
+        assert!((point - Vec3::new(0., -33., 20.)).len() < 1e-8, "{point:?}");
+        assert!(s.model.results.iter().all(|result| result.error.is_none()));
+        let check = |session: &Session| {
+            let before = session.model.state_before(feature.id);
+            let after = &session.model.result(feature.id).unwrap().state;
+            let old = before.body("Case").unwrap();
+            let body = after.body("Case").unwrap();
+            let added = solvecraft_kernel::measure(&body.body).unwrap().volume - solvecraft_kernel::measure(&old.body).unwrap().volume;
+            // Rectangular arm + triangular catch; the small attachment overlap lies inside the wall.
+            assert!((added - (8. * 1.2 + 0.8 * 1.5 / 2.) * 6.).abs() < 0.05, "{added}");
+            let mesh = body.mesh();
+            assert!(mesh.contains(Vec3::new(0., -29., 19.4)), "the arm follows the inner wall");
+            assert!(mesh.contains(Vec3::new(0., -25.9, 20.2)), "the catch follows the arm");
+            assert!(!mesh.contains(Vec3::new(0., -22., 19.4)), "the old arm placement is empty");
+            assert!(!mesh.contains(Vec3::new(0., -24., 19.4)), "the arm ends at its specified length");
+        };
+        check(&s);
+        let cold = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!(cold.model.results.iter().all(|result| result.error.is_none()));
+        check(&cold);
     }
 
     fn plate() -> (Session, f64) {

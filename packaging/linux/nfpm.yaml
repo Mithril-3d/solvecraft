@@ -11,8 +11,8 @@ release: 1
 section: graphics
 priority: optional
 maintainer: ${SOLVECRAFT_MAINTAINER}
-vendor: SolveCraft contributors
-homepage: https://bherbruck.github.io/solvecraft/
+vendor: SolidCraft contributors
+homepage: https://bherbruck.github.io/solidcraft/
 license: MIT OR Apache-2.0
 description: |-
   Open-source parametric 3D CAD in the style of Fusion

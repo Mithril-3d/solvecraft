@@ -11,7 +11,7 @@ pub const THIRD_PARTY: &str = include_str!("../../../THIRD-PARTY-LICENSES.txt");
 pub fn all() -> String {
     let rule = "=".repeat(80);
     format!(
-        "SolveCraft is licensed under the MIT License or the Apache License, Version 2.0, at your option.\n\n{rule}\nNOTICE\n{rule}\n\n{NOTICE}\n{rule}\nLICENSE-MIT\n{rule}\n\n{LICENSE_MIT}\n{rule}\nLICENSE-APACHE\n{rule}\n\n{LICENSE_APACHE}\n{rule}\n{THIRD_PARTY}"
+        "SolidCraft is licensed under the MIT License or the Apache License, Version 2.0, at your option.\n\n{rule}\nNOTICE\n{rule}\n\n{NOTICE}\n{rule}\nLICENSE-MIT\n{rule}\n\n{LICENSE_MIT}\n{rule}\nLICENSE-APACHE\n{rule}\n\n{LICENSE_APACHE}\n{rule}\n{THIRD_PARTY}"
     )
 }
 

@@ -47,7 +47,7 @@ A missing author path also requires explicit repair. Reattachment and creation c
 pending positions only on the involved source and author paths. Failed commands restore
 those pending positions; undo restores the previous attachment and placement state.
 
-File format 11 saves these optional attachments. Existing designs with face references
+File format 11 introduced these optional attachments, which format 12 also preserves. Existing designs with face references
 without an attachment retain their legacy geometry and lookup behavior when opened; they
 are not silently upgraded. Redefining such a sketch onto a supported selected face creates
 the stronger attachment. Unsupported legacy geometry can instead be retained on an explicit

@@ -429,7 +429,7 @@ impl Sketch {
         if self.points.len() + lay.pts.len() > crate::model::MAX_POINTS {
             return Err(SketchError::TooLarge);
         }
-        let id = self.fresh("j");
+        let id = self.fresh("j")?;
         self.links.push(Link { id: id.clone(), kind, source, face_name: None, auto_face: false, lost: false });
         self.build_link(&id, &lay)?;
         Ok(id)
@@ -468,7 +468,7 @@ impl Sketch {
                     (CurveKind::Spline { pts, control, degree, periodic }, "s")
                 }
             };
-            let cid = self.fresh(prefix);
+            let cid = self.fresh(prefix)?;
             self.curves.push(Curve {
                 id: cid,
                 kind,

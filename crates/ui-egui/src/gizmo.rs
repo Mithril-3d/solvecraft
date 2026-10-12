@@ -241,6 +241,11 @@ fn snap(v: f64, step: f64, free: bool) -> f64 {
     if free || step <= 0.0 { v } else { (v / step).round() * step }
 }
 
+/// Discard a suspended pointer gesture without reporting a final model change.
+pub(crate) fn cancel(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.remove::<State>(id));
+}
+
 /// Draw the triad and run a drag on it. `step` is the distance snap step.
 pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::Id, t: &Triad, step: f64) -> Option<Drag> {
     let tk = Tokens::get();

@@ -177,7 +177,7 @@ pub fn export(app: &SolveApp) -> Value {
 
 pub fn import(app: &mut SolveApp, v: &Value) -> Result<(), String> {
     if v.get("format").and_then(Value::as_str) != Some("solvecraft-shortcuts/1") {
-        return Err("not a SolveCraft shortcuts file".into());
+        return Err("not a SolidCraft shortcuts file".into());
     }
     if let Some(s) = v.get("shortcuts") {
         app.keymap.load(s);

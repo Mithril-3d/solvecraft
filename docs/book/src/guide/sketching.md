@@ -4,6 +4,13 @@ A sketch lies on a plane: an origin plane, a construction plane or a planar face
 **Create Sketch** (`sketch.create`) and click a plane, or pick a face first. **Finish Sketch**
 returns to the model.
 
+Curves adapt to the current zoom and display scale. Picking and highlighting use the same
+visible boundary, including small circles at Fit and sketches in rotated components.
+Profile shading follows those curves while preserving holes. Zooming changes the display
+without changing sketch geometry, dimensions, or undo history.
+On short windows or enlarged displays, the Sketch Palette's options scroll while its
+constraint status and **Finish Sketch** button remain visible.
+
 ## Geometry
 
 Lines and polylines (L), rectangles (two-point R, three-point, centre), circles (centre C,
@@ -15,9 +22,29 @@ fillet, chamfer, offset (O), mirror, patterns, move/copy and scale.
 **Project** (P) and **Intersect** bring model edges into the sketch as linked geometry that
 follows later changes. Sketching on a face projects its edges automatically.
 
+Run from a script or the control channel, every command that adds sketch geometry returns the
+ids of what it added (`created: {points, curves, constraints, dimensions}`). Ids are stable and
+never reused within a sketch, even after a delete, so a script can dimension or constrain the new
+geometry right away.
+
 Extend finds intersections with exact ellipses, rational conics and spline spans. It keeps the
 original line or circular support and extends only beyond the selected endpoint; conflicting
 constraints or an ambiguous overlap leave the sketch unchanged.
+
+Closed convex chains of tangent lines and circular arcs support inward offsets that consume
+a rounded corner. When the offset passes the corner radius, the neighbouring straight
+supports meet at a sharp corner. The surviving lines and endpoint IDs stay stable; the
+retired arcs return under their original IDs if a later edit restores their radius.
+Whole-boundary profile selections follow this transition through save and reopen, so an
+extruded lip can remain associative. Existing eligible closed analytic offsets upgrade
+without changing their saved geometry or IDs.
+
+This transition requires a closed convex boundary with tangent junctions and a certified
+nonempty region. An extinguished arc referenced individually by a constraint or another
+offset cannot retire. Creating another offset from an already sharp retired boundary also
+requires breaking its association first. Open, nonconvex and mixed free-form chains keep
+their existing behavior. Break Offset Association freezes the current boundary, including
+private arc centres and construction flags, for independent editing.
 
 Offsets of smooth ellipses, conics and splines follow their source after dimension changes,
 dragging and reopening a design. Their stored cubic spline has a whole-span normal-distance
@@ -54,11 +81,33 @@ fresh link once the source is available; their stored point values are preserved
 
 ## Constraints and dimensions
 
-The solver is SolveCraft's own (damped Gauss–Newton with degree-of-freedom analysis). Constraints:
+**Horizontal/Vertical** accepts a click on a line or clicks on two distinct sketch points,
+including the origin, endpoints and circle centres. For two points, it chooses horizontal
+or vertical alignment from their current positions. Esc cancels a pending first point.
+
+The solver is SolidCraft's own (damped Gauss–Newton with degree-of-freedom analysis). Constraints:
 coincident, horizontal/vertical, parallel, perpendicular, tangent, equal, concentric, collinear,
 midpoint, symmetry, fix, curvature (G2) and polygon. **Sketch Dimension** (D) adds linear,
 aligned, horizontal, vertical, radius, diameter and angle dimensions. Each is a parameter
 (`d1`, `d2`, …), so it can hold an expression.
+
+For **Coincident**, pick two points, a point and a curve (in either order), or two
+distinct straight lines. Two lines join their closest pair of endpoints; the first
+picked line stays in place when the existing constraints allow it. Pick endpoints
+explicitly when you want to connect a different pair.
+
+Horizontal/Vertical also applies immediately to one selected line or two distinct selected
+points. Shift-click to add the second point before choosing the constraint.
+
+For Parallel, Perpendicular, Equal, Tangent, Concentric and Collinear, select exactly two
+sketch curves (Shift-click to add the second) and choose the constraint to apply it immediately.
+You can also start the constraint first and then pick its curves. An incomplete or mixed
+selection leaves the tool ready for ordinary picking.
+
+Coincident accepts an exact selection of two points or a point and a curve. Midpoint
+accepts one point and one line, in either selection order. Symmetry accepts two distinct
+points and one symmetry line, regardless of where the line occurs in the selection.
+Successful constraints clear the selection; rejected constraints preserve it.
 
 Under-constrained geometry is blue and fully constrained geometry turns dark, and the status
 shows the remaining degrees of freedom. A constraint or dimension that would over-constrain the
@@ -69,3 +118,12 @@ constraint while you drag.
 
 Closed loops become profiles automatically, including regions split by crossing lines and
 islands inside outlines. Extrude, revolve, sweep and loft pick profiles.
+
+A feature remembers a picked profile by the curves around it, not by where it was clicked:
+`"profiles": [{"curves": ["l1", "l2", "a1", "l3"]}]` (or `[{"curves": ["c1"]}]` for a circle)
+picks the region whose outer loop is made of exactly those curves, or the pieces of them that
+other curves cut off. It is found again on every recompute, so the feature keeps the same region
+when a parameter moves the geometry. Islands inside the region are its holes. When no region, or
+more than one (both halves of a circle cut by a line), is bounded by exactly those curves, the
+feature reports an error rather than taking another region. Profiles picked by index or by point
+(`[{"point": [x, y]}]`) are stored the same way when the feature is made.

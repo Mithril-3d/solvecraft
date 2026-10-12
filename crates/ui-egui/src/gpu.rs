@@ -121,6 +121,8 @@ const IMG_SIZE: usize = 24;
 pub struct ViewportCallback {
     pub key: u64,
     pub slot: SceneSlot,
+    pub sketch_key: u64,
+    pub sketch_slot: SceneSlot,
     /// The highlight scene and its key.
     pub hl_key: u64,
     pub hl_slot: SceneSlot,
@@ -230,6 +232,7 @@ struct Resources {
     bind: wgpu::BindGroup,
     linear_out: bool,
     model: Batches,
+    sketch: Batches,
     highlight: Batches,
     preview: Batches,
     image: wgpu::RenderPipeline,
@@ -828,6 +831,7 @@ impl Resources {
             bind,
             linear_out: t.format.is_srgb(),
             model: Batches::default(),
+            sketch: Batches::default(),
             highlight: Batches::default(),
             preview: Batches::default(),
         }
@@ -893,6 +897,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
         res.model.take(device, self.key, &self.slot);
+        res.sketch.take(device, self.sketch_key, &self.sketch_slot);
         res.highlight.take(device, self.hl_key, &self.hl_slot);
         res.preview.take(device, self.pv_key, &self.pv_slot);
         res.model.sort_glass(queue, self.back);
@@ -977,8 +982,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 pass.draw(0..6, 0..b.count);
             }
         };
-        let (m, h, pv) = (&res.model, &res.highlight, &res.preview);
+        let (m, sk, h, pv) = (&res.model, &res.sketch, &res.highlight, &res.preview);
         lines(pass, &res.overlay, &m.under);
+        lines(pass, &res.overlay, &sk.under);
         pass.set_bind_group(1, &res.access_bind, &[]);
         let cut = res.tri_cut.as_ref().filter(|_| self.clip[..3].iter().map(|c| c * c).sum::<f32>() > 0.25);
         match cut {
@@ -996,6 +1002,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         }
         tris(pass, &res.tri_hl, &h.tris);
         lines(pass, &res.line, &m.lines);
+        lines(pass, &res.line, &sk.lines);
         lines(pass, &res.line_hidden, &m.hidden);
         lines(pass, &res.line_hidden, &h.hidden);
         lines(pass, &res.line, &pv.lines);
@@ -1012,9 +1019,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         tris(pass, &res.glass_far, &m.glass);
         tris(pass, &res.glass_near, &m.glass);
         tris(pass, &res.trans, &m.trans);
+        tris(pass, &res.trans, &sk.trans);
         tris(pass, &res.trans, &h.trans);
         tris(pass, &res.xray, &pv.xray);
         lines(pass, &res.overlay, &m.overlays);
+        lines(pass, &res.overlay, &sk.overlays);
         lines(pass, &res.overlay, &h.overlays);
     }
 }

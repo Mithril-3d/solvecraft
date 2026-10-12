@@ -245,7 +245,7 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
         }
         let edge = if op == "cut" { [c.removed[0], c.removed[1], c.removed[2], 255] } else { c.edge };
         for (ei, e) in m.edges.iter().enumerate() {
-            if !m.seams.get(ei).copied().unwrap_or(false) {
+            if m.shaded_edge_visible(ei) {
                 for w in e.windows(2) {
                     sc.line(w[0].to_f32(), w[1].to_f32(), edge, 1.3, op != "join");
                 }
@@ -306,7 +306,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             }
         }
         for (ei, e) in am.edges.iter().enumerate() {
-            if am.seams.get(ei).copied().unwrap_or(false) {
+            if !am.shaded_edge_visible(ei) {
                 continue;
             }
             for w in e.windows(2) {

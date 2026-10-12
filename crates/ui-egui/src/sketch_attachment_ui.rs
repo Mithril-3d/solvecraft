@@ -267,3 +267,11 @@ pub fn guide_lines(app: &SolveApp) -> Vec<Vec<Vec3>> {
         .map(|segment| segment.polyline(0.05).into_iter().map(|point| plane.to_world(point)).collect())
         .collect()
 }
+
+pub fn display_guide_lines(app: &SolveApp, proj: &crate::viewport::Proj) -> Vec<Vec<Vec3>> {
+    let Some((plane, sketch)) = lost_guide(app) else { return Vec::new() };
+    let mut budget = solvecraft_engine::render::SamplingBudget::new(65_536, 262_144);
+    (0..sketch.curves.len())
+        .flat_map(|index| crate::sketch_display::curve_with_budget(sketch, index, &plane, proj, app.viewport.pixels_per_point(), &mut budget).parts)
+        .collect()
+}

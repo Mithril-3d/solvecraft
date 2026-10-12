@@ -167,6 +167,7 @@ pub fn set_linetype(app: &mut SolveApp, kind: u8) {
 
 /// Draw the palette (while sketching and no command dialog is open).
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
+    app.viewport.palette_rect = None;
     let _language = crate::i18n::scope(&app.preferences.language);
     if app.dialog.is_some() {
         return;
@@ -178,7 +179,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     };
     let t = Tokens::get();
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());
-    let anchor = egui::pos2(vp.right(), vp.top() + crate::viewport::VIEW_CUBE_CLEARANCE);
+    let bottom = vp.bottom().min(ctx.content_rect().bottom()) - 8.0;
+    // Prefer the space below Axis View, but reclaim it on short/HiDPI views.
+    let top = (vp.top() + crate::viewport::AXIS_VIEW_CLEARANCE).min((bottom - 360.0).max(vp.top()));
+    let anchor = egui::pos2(vp.right(), top);
     let frame = egui::Frame::window(&ctx.global_style())
         .fill(t.dialog_bg)
         .stroke(Stroke::new(1.0, t.dialog_border))
@@ -201,16 +205,18 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut look = false;
     let mut finish = false;
     let has_curves = !selected_curves(app).is_empty();
-    crate::frame::docked(
+    let response = crate::frame::docked(
         app.tr("ui.heading_sketch_palette"),
         egui::Id::new("sc_sketch_palette"),
         anchor,
-        ctx.content_rect().bottom() - anchor.y - 8.0,
+        bottom - anchor.y,
         crate::frame::Width::Normal,
     )
     .frame(frame)
     .show(ctx, |ui| {
-        ui.set_width(WIDTH);
+        let width = WIDTH.min((vp.width() * 0.46 - 16.0).max(120.0));
+        ui.set_width(width);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.horizontal(|ui| {
             let folded = FOLDED.with(Cell::get);
             if ui.add(egui::Button::new(RichText::new(if folded { "+" } else { "−" }).size(14.0)).frame(false)).clicked() {
@@ -229,51 +235,58 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             OPTIONS_FOLDED.with(|f| f.set(!ofold));
         }
         if !ofold {
-            egui::Grid::new("sc_palette_grid").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
-                ui.label(app.tr("ui.linetype"));
-                ui.horizontal(|ui| {
-                    // With a selection: convert it; without: the mode new curves are drawn in.
-                    let current = mode(app);
-                    for (i, (label, tip)) in [("—", "Normal"), ("- -", "Construction"), ("-·-", "Centerline")].iter().enumerate() {
-                        let on = !has_curves && current == i as u8;
-                        let tr_tip = app.tr_label(tip);
-                        let tip_str = if has_curves {
-                            crate::i18n::format("sketch.make_selection", &[("linetype", tr_tip)])
-                        } else {
-                            crate::i18n::format("sketch.draw_curves", &[("linetype", tr_tip)])
-                        };
-                        if ui.add(egui::Button::new(*label).selected(on).min_size(vec2(30.0, 20.0))).on_hover_text(tip_str).clicked() {
-                            linetype = Some(i as u8);
+            let options_height = (bottom - ui.cursor().top() - 68.0).max(24.0);
+            let options =
+                egui::ScrollArea::vertical().id_salt("sc_palette_options").max_height(options_height).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(app.tr("ui.linetype"));
+                        ui.horizontal(|ui| {
+                            // With a selection: convert it; without: the mode new curves are drawn in.
+                            let current = mode(app);
+                            for (i, (label, tip)) in [("—", "Normal"), ("- -", "Construction"), ("-·-", "Centerline")].iter().enumerate() {
+                                let on = !has_curves && current == i as u8;
+                                let tr_tip = app.tr_label(tip);
+                                let tip = if has_curves {
+                                    crate::i18n::format("sketch.make_selection", &[("linetype", tr_tip)])
+                                } else {
+                                    crate::i18n::format("sketch.draw_curves", &[("linetype", tr_tip)])
+                                };
+                                if ui.add(egui::Button::new(*label).selected(on).min_size(vec2(30.0, 20.0))).on_hover_text(tip).clicked() {
+                                    linetype = Some(i as u8);
+                                }
+                            }
+                        });
+                        ui.label(app.tr("ui.look_at"));
+                        if ui.button(app.tr("ui.look_at")).clicked() {
+                            look = true;
+                        }
+                    });
+                    for (k, label) in TOGGLES {
+                        // The label is part of the checkbox: clicking it toggles too.
+                        let mut on = shown(k);
+                        if ui.checkbox(&mut on, app.tr_label(label)).changed() {
+                            set = Some((k.to_string(), on));
                         }
                     }
                 });
-                ui.end_row();
-                ui.label(app.tr("ui.look_at"));
-                if ui.button(app.tr("ui.look_at")).clicked() {
-                    look = true;
-                }
-                ui.end_row();
-                for (k, label) in TOGGLES {
-                    // The label is part of the checkbox: clicking it toggles too.
-                    let mut on = shown(k);
-                    if ui.checkbox(&mut on, app.tr_label(label)).changed() {
-                        set = Some((k.to_string(), on));
-                    }
-                    ui.end_row();
-                }
-            });
+            crate::scenario::publish_rect("sketch_palette:options", options.inner_rect);
         }
         ui.add_space(4.0);
-        let tr_dof = crate::i18n::tr_dyn(&dof_line);
-        ui.label(RichText::new(tr_dof).color(if ok { t.sketch_accent } else { t.text_dim }));
+        ui.label(RichText::new(crate::i18n::tr_dyn(&dof_line)).color(if ok { t.sketch_accent } else { t.text_dim }));
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(WIDTH - 100.0);
-            if ui.add(egui::Button::new(RichText::new(app.tr("ui.finish_sketch")).color(Color32::WHITE)).fill(t.accent)).clicked() {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let button = ui.add(egui::Button::new(RichText::new(app.tr("ui.finish_sketch")).color(Color32::WHITE)).fill(t.accent));
+            crate::scenario::publish_rect("sketch_palette:finish", button.rect);
+            crate::scenario::publish_handle("sketch_palette:finish", button.rect.center());
+            if button.clicked() {
                 finish = true;
             }
         });
     });
+    app.viewport.palette_rect = response.map(|r| r.response.rect);
+    if let Some(r) = app.viewport.palette_rect {
+        crate::scenario::publish_rect("sketch_palette:outer", r);
+    }
     if let Some((k, on)) = set {
         let mut p = serde_json::Map::new();
         p.insert(k, Value::Bool(on));
@@ -299,6 +312,45 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_footer_and_scrolled_lower_option_remain_reachable_at_scale_and_resize() {
+        for (scale, height) in [(1.0, 900.0), (2.0, 900.0), (2.0, 720.0)] {
+            FOLDED.with(|v| v.set(false));
+            OPTIONS_FOLDED.with(|v| v.set(false));
+            let mut h = crate::scenario::Harness::new();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.circle.center", json!({"center":[0,0],"radius":1})).unwrap();
+            h.call("ui.resize", json!({"width":1400,"height":height}));
+            h.call("ui.prefs", json!({"ui_scale":scale}));
+            h.settle();
+            let baseline = h.app.session.doc.to_json();
+            let undo = h.app.session.undo.len();
+            let vp = h.app.viewport.rect.unwrap();
+            let footer = crate::scenario::rect_of("sketch_palette:finish").unwrap();
+            assert!(vp.contains_rect(footer), "scale{scale} height{height}: {footer:?} outside {vp:?}");
+            let options = crate::scenario::rect_of("sketch_palette:options").unwrap();
+            assert!(vp.contains_rect(options));
+            h.call("ui.scroll", json!({"x":options.center().x,"y":options.center().y,"delta":-1000}));
+            h.settle();
+            assert_eq!(h.app.session.doc.to_json(), baseline);
+            assert_eq!(h.app.session.undo.len(), undo);
+            let [x, y] = h.widget("3D Sketch").unwrap();
+            assert!(options.contains(egui::pos2(x as f32, y as f32)), "lower option must be visible after scrolling");
+            h.call("ui.click", json!({"x":x,"y":y}));
+            h.settle();
+            assert!(h.app.session.world_state().sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch.view.three_d);
+            assert_eq!(h.app.session.undo.len(), undo + 1);
+            h.app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(h.app.session.doc.to_json(), baseline);
+            h.settle();
+            let footer = crate::scenario::rect_of("sketch_palette:finish").unwrap();
+            h.call("ui.click", json!({"x":footer.center().x,"y":footer.center().y}));
+            h.settle();
+            assert!(h.app.session.active_sketch.is_none(), "Finish Sketch must work at scale{scale} height{height}");
+            assert_eq!(h.app.session.doc.to_json(), baseline);
+        }
+    }
 
     #[test]
     fn dof_readout() {

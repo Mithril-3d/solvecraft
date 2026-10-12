@@ -23,28 +23,97 @@ fn rel(a: f64, b: f64) -> f64 {
 #[test]
 fn join_extrude_from_a_chamfered_top_face() {
     let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"height","expression":"20 mm"}));
+    run(&mut s, "parameters.add", json!({"name":"bevel","expression":"2 mm"}));
     run(&mut s, "sketch.create", json!({"plane": "XY"}));
     run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}));
-    run(&mut s, "solid.extrude", json!({"distance": 20}));
-    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2}));
+    let source = run(&mut s, "solid.extrude", json!({"distance": "height","name":"Stem"}))["feature"].as_u64().unwrap();
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": "bevel"}));
     let base = volume(&mut s);
-    let before = s.doc.to_json();
-    let active = s.active_sketch;
-    assert!(s.execute("sketch.create", &json!({"plane":{"face":[0,0,20]}})).is_err(), "modified faces require an explicit fixed plane");
-    assert_eq!(s.doc.to_json(), before);
-    assert_eq!(s.active_sketch, active);
-    assert!(rel(volume(&mut s), base) < 1e-12);
-    let id = run(&mut s, "sketch.create", json!({"plane": {"face": [0, 0, 20],"fixed":true}}))["sketch"].as_u64().unwrap();
-    let solvecraft_doc::FeatureKind::Sketch { plane: solvecraft_doc::PlaneRef::Custom { plane }, sketch } = &s.doc.feature(id).unwrap().kind else {
-        panic!("explicit fixed face must become a custom plane");
+    let id = run(&mut s, "sketch.create", json!({"plane": {"face": [0, 0, 20]}}))["sketch"].as_u64().unwrap();
+    let solvecraft_doc::FeatureKind::Sketch { plane: solvecraft_doc::PlaneRef::Face { anchor: Some(anchor), .. }, sketch } =
+        &s.doc.feature(id).unwrap().kind
+    else {
+        panic!("the chamfered cap retains its exact original construction support");
     };
-    assert!((plane.origin.z - 20.).abs() < 1e-9);
-    assert!(sketch.links.is_empty(), "fresh fixed plane does not create live auto-projections");
-    run(&mut s, "sketch.circle.center", json!({"center":[0,0],"radius":8}));
+    assert_eq!(anchor.target.origin_feature, source);
+    assert!(matches!(anchor.target.certificate, Some(solvecraft_doc::config::FaceCertificate::ExtrudeCap { high: true, .. })));
+    assert!(!sketch.links.is_empty());
+    assert!(sketch.links.iter().all(|link| link.auto_face && !link.lost));
+    // The default linked cap outline is radius8; no explicit fixed plane or
+    // duplicate manually drawn circle is required to join a pad to that face.
     run(&mut s, "sketch.finish", json!({}));
     run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "join"}));
     assert_eq!(s.model.state().bodies.len(), 1);
     assert!(rel(volume(&mut s), base + PI * 64.0 * 5.0) < 5e-4);
+    for (height, bevel) in [(20., 2.), (25., 3.)] {
+        run(&mut s, "parameters.change", json!({"name":"height","expression":format!("{height} mm")}));
+        run(&mut s, "parameters.change", json!({"name":"bevel","expression":format!("{bevel} mm")}));
+        let expected = PI * (100. * height - (10. * bevel * bevel - bevel * bevel * bevel / 3.) + (10. - bevel) * (10. - bevel) * 5.);
+        let loaded = solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+        let mut cold = Session::new(loaded);
+        let warm_volume = volume(&mut s);
+        let cold_volume = volume(&mut cold);
+        assert!(rel(warm_volume, expected) < 5e-4, "{warm_volume} vs {expected}");
+        assert!((warm_volume - cold_volume).abs() < 1e-8);
+        for current in [&s, &cold] {
+            assert!(current.model.results.iter().all(|result| result.error.is_none() && result.warning.is_none()), "{:?}", current.model.results);
+            let state = current.model.state();
+            assert_eq!(state.bodies.len(), 1);
+            let solved = state.sketch(id).unwrap();
+            assert!((solved.plane.origin.z - height).abs() < 1e-8);
+            assert!(solved.sketch.links.iter().all(|link| link.auto_face && !link.lost));
+            let body = &state.bodies[0];
+            assert!(body.body.contains(solvecraft_geom::Vec3::new(0., 0., height + 4.)));
+            assert!(!body.body.contains(solvecraft_geom::Vec3::new(0., 0., height + 6.)));
+            assert!(body.body.contains(solvecraft_geom::Vec3::new(10. - bevel - 0.5, 0., height + 4.)));
+            assert!(!body.body.contains(solvecraft_geom::Vec3::new(10. - bevel + 0.5, 0., height + 4.)));
+        }
+    }
+}
+
+/// A join that bridges two bodies makes them one body, not an overlap of the first and the second.
+#[test]
+fn join_bridging_two_bodies_merges_them() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new_body"}));
+    run(&mut s, "solid.box", json!({"length": 20, "width": 4, "height": 4, "corner": [5, 3, 3], "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1, "both boxes and the bar are one body");
+    assert_eq!(st.bodies[0].name, "Body1");
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 1);
+    // 2 boxes + the bar's 10 mm outside them.
+    assert!(rel(volume(&mut s), 2000.0 + 10.0 * 16.0) < 1e-6);
+}
+
+/// A join touching only the second body merges into that body and leaves the first alone.
+#[test]
+fn join_merges_into_the_body_it_meets() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "operation": "new_body"}));
+    // Sits on Body2's top face: a face contact, no shared volume.
+    run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [23, 3, 10], "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2);
+    let b1 = st.bodies.iter().find(|b| b.name == "Body1").unwrap();
+    let b2 = st.bodies.iter().find(|b| b.name == "Body2").unwrap();
+    assert_eq!(b1.body.face_count(), 6, "Body1 is untouched");
+    assert_eq!(b2.body.lumps().unwrap().len(), 1);
+    assert!(rel(volume(&mut s), 2064.0) < 1e-6);
+}
+
+/// A join that meets no body still joins the first body, as a separate lump.
+#[test]
+fn join_meeting_nothing_keeps_the_first_body() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": [40, 0, 0], "operation": "join"}));
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 1);
+    assert_eq!(st.bodies[0].body.lumps().unwrap().len(), 2);
+    assert!(rel(volume(&mut s), 1064.0) < 1e-6);
 }
 
 mod component_frames;
@@ -2254,4 +2323,30 @@ fn adopting_a_computed_component_keeps_its_warm_world_geometry() {
     assert!(std::sync::Arc::ptr_eq(&prepared, &s.world_state()));
     s.invalidate_view(100);
     assert!(std::sync::Arc::ptr_eq(&prepared, &s.world_state()));
+}
+
+/// Every file command checked the size with the metadata and then read to the end. A character
+/// device reports a length of 0, so the cap passed and the read never finished; a FIFO blocked
+/// the calling thread, which over the control channel is the thread drawing the window.
+#[cfg(unix)]
+#[test]
+fn special_files_are_refused_by_every_file_command() {
+    let mut s = Session::default();
+    for cmd in ["doc.open", "parameters.import"] {
+        let r = s.execute(cmd, &json!({"path": "/dev/zero"}));
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("not a regular file")), "{cmd}: {r:?}");
+    }
+    // The commands that check the extension first need a special file with the right name.
+    let dir = std::env::temp_dir().join(format!("solvecraft-special-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    for (cmd, name) in [("file.insert_step", "x.step"), ("file.insert_mesh", "x.3mf"), ("sketch.insert_dxf", "x.dxf")] {
+        let p = dir.join(name);
+        let _ = std::fs::remove_file(&p);
+        if !std::process::Command::new("mkfifo").arg(&p).status().map(|st| st.success()).unwrap_or(false) {
+            continue;
+        }
+        let r = s.execute(cmd, &json!({"path": p.to_string_lossy()}));
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("not a regular file")), "{cmd}: {r:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

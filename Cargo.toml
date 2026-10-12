@@ -5,12 +5,12 @@ members = ["crates/*", "apps/*", "xtask"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.3.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.90"
-authors = ["SolveCraft contributors"]
-repository = "https://github.com/bherbruck/solvecraft"
+rust-version = "1.95"
+authors = ["SolidCraft contributors"]
+repository = "https://github.com/bherbruck/solidcraft"
 
 [workspace.dependencies]
 # internal
@@ -100,3 +100,6 @@ truck-shapeops = { path = "vendor/truck-shapeops" }
 truck-stepio = { path = "vendor/truck-stepio" }
 truck-meshalgo = { path = "vendor/truck-meshalgo" }
 matext4cgmath = { path = "vendor/matext4cgmath" }
+
+# Keep OpenGL pipelines, resolve textures and CAD callbacks at the same safe sample count.
+egui-wgpu = { path = "vendor/egui-wgpu" }

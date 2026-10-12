@@ -97,13 +97,16 @@ impl Cache {
 
 /// Sew the faces into a closed solid.
 pub fn sew(faces: &[FaceSpec]) -> Result<Body> {
-    sew_impl(faces, false)
+    sew_impl(faces, false, None)
 }
 
 /// Separate boundary sheets at a shared geometric edge without moving it.
-/// The face adjacency must still describe one connected solid boundary.
-pub(crate) fn sew_touching(faces: &[FaceSpec]) -> Result<Body> {
-    sew_impl(faces, true)
+/// Optional transient sources follow only unchanged produced face identities.
+pub(crate) fn sew_touching_with_sources(faces: &[FaceSpec], sources: &[Option<crate::FaceSource>]) -> Result<Body> {
+    if sources.len() != faces.len() {
+        return Err(KernelError::Invalid("sew source alignment".into()));
+    }
+    sew_impl(faces, true, Some(sources))
 }
 
 type EdgeUse = (usize, usize, usize);
@@ -347,7 +350,7 @@ fn split_vertex_fans(faces: Vec<mt::Face>) -> Result<Vec<mt::Face>> {
         .collect()
 }
 
-fn sew_impl(faces: &[FaceSpec], touching: bool) -> Result<Body> {
+fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::FaceSource>]>) -> Result<Body> {
     if faces.len() < 4 || faces.len() > 200_000 {
         return Err(KernelError::Invalid("a solid needs 4…200000 faces".into()));
     }
@@ -396,6 +399,11 @@ fn sew_impl(faces: &[FaceSpec], touching: bool) -> Result<Body> {
             };
             out.push(face);
         }
+        let source_ids: HashMap<_, _> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| sources.and_then(|s| s.get(i)).and_then(Option::as_ref).map(|s| (f.id(), (f.orientation(), s))))
+            .collect();
         if !sheets.is_empty() && !faces_connected(&out) {
             return Err(KernelError::Invalid("sew: bodies touch only along an edge".into()));
         }
@@ -404,7 +412,10 @@ fn sew_impl(faces: &[FaceSpec], touching: bool) -> Result<Body> {
         }
         let shells = closed_components(out)?;
         let solid = Solid::try_new(shells).map_err(|e| KernelError::Failed(format!("sew: the faces do not close: {e}")))?;
-        Body::new(solid)
+        let body = Body::new(solid)?;
+        let mapped =
+            body.solid.face_iter().map(|f| source_ids.get(&f.id()).filter(|(o, _)| *o == f.orientation()).map(|(_, s)| (*s).clone())).collect();
+        Ok(body.with_face_sources(sources.map(|_| std::sync::Arc::new(mapped))))
     })
 }
 

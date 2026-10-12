@@ -539,34 +539,139 @@ fn poly_area(p: &[Vec2]) -> f64 {
     (0..m).filter_map(|i| Some(p.get(i)?.cross(*p.get((i + 1) % m)?))).sum::<f64>() / 2.0
 }
 
+/// Current unmodified extrusion caps, including placement, certify the tool's depth.
+/// Tessellation can drift in thickness at distant coordinates and cannot certify a slab.
+fn sheet_tool_span(body: &Body, source: &Plane) -> Option<(f64, f64, f64, Option<(Plane, Region2)>)> {
+    use kernel::FaceSource;
+    #[derive(PartialEq)]
+    enum Signature<'a> {
+        Raw(&'a Region2),
+        Certified(&'a [String], &'a [Vec<String>]),
+    }
+    let sources = body.face_sources()?;
+    if sources.len() != body.face_count() || sources.len() > 16_384 {
+        return None;
+    }
+    let n = source.normal();
+    let mut family = None;
+    let mut caps = [None, None];
+    let mut projection_roundoff: f64 = 0.0;
+    let mut footprint = None;
+    for (index, entry) in sources.iter().enumerate() {
+        let (group, cap) = match entry.as_ref()? {
+            FaceSource::ExtrudeSide { .. } => (None, None),
+            FaceSource::ExtrudeCap { high, region, plane } => (None, Some((*high, *plane, Signature::Raw(region)))),
+            FaceSource::CertifiedExtrudeSide { producer, sketch, .. } => (Some((*producer, *sketch)), None),
+            FaceSource::CertifiedExtrudeCap { producer, sketch, high, outer, holes, plane } => {
+                (Some((*producer, *sketch)), Some((*high, *plane, Signature::Certified(outer, holes))))
+            }
+            _ => return None,
+        };
+        match family {
+            None => family = Some(group),
+            Some(previous) if previous != group => return None,
+            _ => {}
+        }
+        if let Some((high, plane, signature)) = cap {
+            if high && let Signature::Raw(region) = &signature {
+                footprint = Some((plane, (*region).clone()));
+            }
+            let valid = |p: &Plane| {
+                p.origin.is_finite()
+                    && p.x.is_finite()
+                    && p.y.is_finite()
+                    && (p.x.len2() - 1.0).abs() <= 1e-10
+                    && (p.y.len2() - 1.0).abs() <= 1e-10
+                    && p.x.dot(p.y).abs() <= 1e-10
+                    && p.normal().cross(n).len() <= 1e-10
+            };
+            let current = body.planar_face(index)?;
+            if !valid(&plane) || !valid(&current) {
+                return None;
+            }
+            // Bound floating point projection separately from model geometry tolerance.
+            let roundoff = 128.0 * f64::EPSILON * (plane.origin.len() + current.origin.len() + source.origin.len()).max(1.0);
+            if roundoff > 1e-7 || (current.origin - plane.origin).dot(n).abs() > roundoff {
+                return None;
+            }
+            projection_roundoff = projection_roundoff.max(roundoff);
+            let distance = (plane.origin - source.origin).dot(n);
+            if !distance.is_finite() || caps[usize::from(high)].is_some() {
+                return None;
+            }
+            caps[usize::from(high)] = Some((distance, signature));
+        }
+    }
+    let [Some((low, low_signature)), Some((high, high_signature))] = caps else { return None };
+    (low_signature == high_signature && low != high).then_some((low.min(high), low.max(high), projection_roundoff, footprint))
+}
+
 /// Exact prismatic machining, retained in sheet material/depth metadata.
-pub(super) fn sheet_cut(f: &Feature, st: &mut ModelState, tools: &[Body], targets: &[String]) -> Result<Vec<String>> {
+pub(super) fn sheet_cut(
+    f: &Feature,
+    st: &mut ModelState,
+    tools: &[Body],
+    targets: &[String],
+    constructor: Option<&ExtrudeConstructor>,
+) -> Result<Vec<String>> {
     let FeatureKind::Extrude { sketch, profiles, operation, extent, .. } = &f.kind else { return Ok(Vec::new()) };
     if extent.taper.is_some() {
+        return Ok(Vec::new());
+    }
+    let targets = if targets.is_empty() { &f.participants } else { targets };
+    let all = targets.len() == 1 && targets.first().is_some_and(|t| t == "*");
+    let eligible = |original: &crate::sheet::SheetBody| {
+        all || if targets.is_empty() {
+            st.bodies.iter().any(|b| b.name == original.body && (b.component == f.component || b.feature == f.id))
+        } else {
+            targets.contains(&original.body)
+        }
+    };
+    if !st.sheets.iter().any(&eligible) {
         return Ok(Vec::new());
     }
     let Some(ss) = st.sketch(*sketch).cloned() else { return Ok(Vec::new()) };
     let regions = solvecraft_sketch::merge_regions(&select_profiles(&ss, profiles)?);
     let n = ss.plane.normal();
+    let mut work = sheet::FlatWork::new();
+    let faces = tools.iter().fold(0usize, |count, body| count.saturating_add(body.face_count()));
+    if tools.len() > 1000 || faces > 16_384 {
+        return Err(DocError::Invalid("sheet machining tools exceed the bounded geometry budget".into()));
+    }
+    work.charge(faces.saturating_mul(5))?;
     let mut span = (f64::MAX, f64::MIN);
-    for t in tools {
-        for p in t.tessellate((t.size() * 1e-3).max(1e-3))?.positions {
-            let d = (p - ss.plane.origin).dot(n);
-            span = (span.0.min(d), span.1.max(d));
+    let mut cap_roundoff: f64 = 0.0;
+    let mut current_footprints = Vec::new();
+    for tool in tools {
+        let Some((lo, hi, roundoff, footprint)) = sheet_tool_span(tool, &ss.plane) else {
+            // Modified tools need a current geometric prism certificate. The generic
+            // sheet preflight permits actual no-change, otherwise refuses stale metadata.
+            return Ok(Vec::new());
+        };
+        if span.0 != f64::MAX && ((span.0 - lo).abs() > cap_roundoff + roundoff || (span.1 - hi).abs() > cap_roundoff + roundoff) {
+            // Different profile tools cannot be represented as one filled depth interval.
+            return Ok(Vec::new());
+        }
+        span = (span.0.min(lo), span.1.max(hi));
+        cap_roundoff = cap_roundoff.max(roundoff);
+        if let Some(footprint) = footprint {
+            current_footprints.push(footprint);
         }
     }
-    let targets = if targets.is_empty() { &f.participants } else { targets };
-    let all = targets.len() == 1 && targets.first().is_some_and(|t| t == "*");
+    // Only untrimmed Distance tools may use their exact authored scalar interval.
+    // The cap certificate still qualifies their current physical slab above.
+    let selected_edges =
+        regions.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).map(|l| l.segs.len()).fold(0usize, usize::saturating_add);
+    work.charge(faces.saturating_mul(selected_edges).saturating_mul(16))?;
+    let nominal = constructor.filter(|c| c.plane == ss.plane).and_then(|c| {
+        let placed_basis = Plane::new(c.plane.origin, c.plane.x, c.plane.y)?;
+        (current_footprints.len() == tools.len()
+            && current_footprints.iter().all(|(plane, r)| plane.x == placed_basis.x && plane.y == placed_basis.y && regions.contains(r)))
+        .then_some(c.interval)
+    });
     let mut plans = Vec::new();
-    let mut work = sheet::FlatWork::new();
-    for original in &st.sheets {
-        let eligible = all
-            || if targets.is_empty() {
-                st.bodies.iter().any(|b| b.name == original.body && (b.component == f.component || b.feature == f.id))
-            } else {
-                targets.contains(&original.body)
-            };
-        if !eligible {
+    'sheets: for original in &st.sheets {
+        if !eligible(original) {
             continue;
         }
         let Some(mb) = st.body(&original.body) else {
@@ -605,28 +710,81 @@ pub(super) fn sheet_cut(f: &Feature, st: &mut ModelState, tools: &[Body], target
                 continue;
             }
             let (a, b) = ((span.0 - zorigin) / sign, (span.1 - zorigin) / sign);
+            let roundoff = (cap_roundoff
+                + 128.0 * f64::EPSILON * (apply_point(&w, Vec3::ZERO).len() + ss.plane.origin.len() + span.0.abs() + span.1.abs() + sh.t).max(1.0))
+                / sign.abs();
+            let nominal_depth = if apply_point(&w, Vec3::ZERO) == ss.plane.origin
+                && let Some((lo, hi)) = nominal
+                && (span.0 - lo).abs() <= roundoff
+                && (span.1 - hi).abs() <= roundoff
+            {
+                // Equality of the two frame origins proves zero origin displacement;
+                // use authored distances, never an inferred endpoint coincidence.
+                let normal = crate::apply_vector(&w, Vec3::X).cross(crate::apply_vector(&w, Vec3::Y));
+                let exact_sign = if normal == n {
+                    1.0
+                } else if normal == -n {
+                    -1.0
+                } else {
+                    sign
+                };
+                Some((lo / exact_sign, hi / exact_sign))
+            } else {
+                None
+            };
+            if nominal_depth.is_none() && roundoff > 1e-7 {
+                super::sheet_boolean_unchanged(&mb.body, tools, *operation)?;
+                plans.push((original.body.clone(), Some((original.clone(), mb.body.clone()))));
+                continue 'sheets;
+            }
+            let (a, b) = nominal_depth.unwrap_or((a, b));
             let (z0, z1) = (a.min(b).max(0.0), a.max(b).min(sh.t));
+            // Sub-resolution layers must not be silently erased by endpoint snapping.
+            let depth_resolved = ![z0, sh.t - z1, z1 - z0].into_iter().any(|d| d > 0.0 && d < 1e-6);
+            let mapped = if extent.to.is_some() && current_footprints.len() == tools.len() {
+                current_footprints.iter().map(|(plane, r)| sh.region_to_flat(pi, plane, r)).collect::<Result<Vec<_>>>()?
+            } else {
+                regions.iter().map(|r| sh.region_to_flat(pi, &ss.plane, r)).collect::<Result<Vec<_>>>()?
+            };
             if *operation == Operation::Intersect {
                 if z1 <= z0 {
                     sh.holes.push(panel);
                     modeled = true;
                     continue;
                 }
-                if z0 > 1e-7 || z1 < sh.t - 1e-7 {
-                    super::sheet_boolean_unchanged(&mb.body, tools, *operation)?;
-                    continue;
-                }
-                let mapped = regions.iter().map(|r| sh.region_to_flat(pi, &ss.plane, r)).collect::<Result<Vec<_>>>()?;
                 let tool = sheet::material_union(mapped, &mut work)?;
                 let retained = sheet::material_boolean(std::slice::from_ref(&panel), &tool, kernel::BoolOp::Intersect, &mut work)?;
-                let removed = sheet::material_boolean(&[panel], &retained, kernel::BoolOp::Cut, &mut work)?;
+                let removed = sheet::material_boolean(std::slice::from_ref(&panel), &retained, kernel::BoolOp::Cut, &mut work)?;
+                if removed.is_empty() && !sh.material_outside_depth(&panel, z0, z1, &mut work)? {
+                    modeled = true;
+                    continue;
+                }
+                if !retained.is_empty() && !depth_resolved {
+                    return Err(DocError::Invalid(
+                        "sheet machining depth is below the supported 0.000001 mm extrusion resolution; increase the layer depth".into(),
+                    ));
+                }
                 sh.holes.extend(removed);
+                // Preserve original stock thickness and prior machining. Intersection
+                // removes the complementary layers above/below every surviving region.
+                for region in retained {
+                    if z0 > 0.0 {
+                        sh.record_pocket(region.clone(), 0.0, z0, &mut work)?;
+                    }
+                    if z1 < sh.t {
+                        sh.record_pocket(region, z1, sh.t, &mut work)?;
+                    }
+                }
                 modeled = true;
             } else if z1 > z0 {
-                for r in &regions {
-                    let flat = sh.region_to_flat(pi, &ss.plane, r)?;
+                for flat in mapped {
                     let clipped =
                         sheet::material_boolean(std::slice::from_ref(&panel), std::slice::from_ref(&flat), kernel::BoolOp::Intersect, &mut work)?;
+                    if !clipped.is_empty() && !depth_resolved {
+                        return Err(DocError::Invalid(
+                            "sheet machining depth is below the supported 0.000001 mm extrusion resolution; increase the layer depth".into(),
+                        ));
+                    }
                     if !clipped.is_empty() && z0 <= 1e-7 && z1 >= sh.t - 1e-7 {
                         // Keep a single original tool boundary across structural seams.
                         // Re-clipping notch polygons creates coincident seam endpoints.
@@ -636,7 +794,7 @@ pub(super) fn sheet_cut(f: &Feature, st: &mut ModelState, tools: &[Body], target
                         modeled = true;
                     } else {
                         for region in clipped {
-                            sh.pockets.push(sheet::SheetPocket { region, z0, z1 });
+                            sh.record_pocket(region, z0, z1, &mut work)?;
                             modeled = true;
                         }
                     }

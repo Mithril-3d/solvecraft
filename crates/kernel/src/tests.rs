@@ -290,6 +290,60 @@ fn moving_a_body_with_an_intersection_curve_edge_ends() {
     assert!(rel(v0, v1) < 1e-6, "{v0} vs {v1}");
 }
 
+/// Drain pads joined flush under a floor with a drain hole. The floor (100 × 80, top sloping
+/// 1°, so not a prism) has a Ø20 hole through it at (50, 40).
+/// - A ring whose bore is the hole's wall (coincident cylinders): used to fail.
+/// - The same ring 2 mm into the floor: used to fail too.
+/// - A disc across the hole: worked before, and must stay exact.
+#[test]
+fn drain_pads_flush_under_a_floor_with_a_hole() {
+    let t = 1f64.to_radians().tan();
+    let hs = |n: Vec3, p: Vec3| {
+        let n = n.normalized().unwrap();
+        HalfSpace { n, d: n.dot(p) }
+    };
+    let slab = convex_polyhedron(&[
+        hs(Vec3::X, Vec3::new(100.0, 0.0, 0.0)),
+        hs(-Vec3::X, Vec3::ZERO),
+        hs(Vec3::Y, Vec3::new(0.0, 80.0, 0.0)),
+        hs(-Vec3::Y, Vec3::ZERO),
+        hs(-Vec3::Z, Vec3::ZERO),
+        hs(Vec3::new(-t, 0.0, 1.0), Vec3::new(0.0, 0.0, 10.0)),
+    ])
+    .unwrap();
+    let hole = cylinder(Vec3::new(50.0, 40.0, -5.0), Vec3::Z, 10.0, 30.0).unwrap();
+    let floor = boolean(&slab, &hole, BoolOp::Cut).unwrap().unwrap();
+    // Top z = 10 + t x: the slab's volume is its mean height (at x = 50) times its area, the
+    // hole's likewise (its top is planar, centred at x = 50).
+    let v_floor = (10.0 + t * 50.0) * (8000.0 - PI * 100.0);
+    assert!(rel(measure(&floor).unwrap().volume, v_floor) < 2e-5, "{} vs {v_floor}", measure(&floor).unwrap().volume);
+    let ring = |z0: f64, z1: f64| {
+        let r = Region2 { outer: Loop2::circle(Vec2::new(50.0, 40.0), 20.0), holes: vec![Loop2::circle(Vec2::new(50.0, 40.0), 10.0).reversed()] };
+        extrude(&Plane::XY, &[r], z0, z1).unwrap().pop().unwrap()
+    };
+    // The ring's part inside the floor adds nothing: 5 mm of ring below it either way.
+    let v_ring = PI * (400.0 - 100.0) * 5.0;
+    for (z0, z1) in [(-5.0, 0.0), (-5.0, 2.0)] {
+        let u = boolean(&floor, &ring(z0, z1), BoolOp::Union).unwrap().unwrap();
+        let v = measure(&u).unwrap().volume;
+        assert!(rel(v, v_floor + v_ring) < 2e-5, "ring {z0}..{z1}: {v} vs {}", v_floor + v_ring);
+        assert!(u.validity().is_empty(), "{:?}", u.validity());
+    }
+    let disc = cylinder(Vec3::new(50.0, 40.0, -5.0), Vec3::Z, 20.0, 5.0).unwrap();
+    let u = boolean(&floor, &disc, BoolOp::Union).unwrap().unwrap();
+    let v = measure(&u).unwrap().volume;
+    let expect = v_floor + PI * 400.0 * 5.0;
+    assert!(rel(v, expect) < 2e-5, "disc across the hole: {v} vs {expect}");
+    // A boss ring standing on the sloping top around the hole, its foot just under the top
+    // everywhere: it adds its annulus times its height above the top at the centre.
+    let foot = 10.0 + t * 30.0 - 0.2;
+    let u = boolean(&floor, &ring(foot, 14.0), BoolOp::Union).unwrap().unwrap();
+    let v = measure(&u).unwrap().volume;
+    let expect = v_floor + PI * 300.0 * (14.0 - (10.0 + t * 50.0));
+    assert!(rel(v, expect) < 2e-5, "boss ring on the slope: {v} vs {expect}");
+    assert!(u.validity().is_empty(), "{:?}", u.validity());
+}
+
 /// A trough whose floor falls 1° (or 2° toward a drain, in four faces), and short round pads
 /// and bosses crossing the fall. The B-rep results were right, but the plausibility check meshed
 /// them without refinement: on a round side trimmed to a thin band by the shallow cut, the plain
@@ -374,6 +428,38 @@ fn planar_booleans_with_coincident_faces() {
     assert!(rel(measure(&c).unwrap().volume, 1000.0 - 250.0) < 1e-9);
     let i = boolean(&a, &notch, BoolOp::Intersect).unwrap().unwrap();
     assert!(rel(measure(&i).unwrap().volume, 250.0) < 1e-9);
+}
+
+/// The planar fallback runs after any failed B-rep boolean, not only on coincident faces; when
+/// it can't run it says which body has which curved faces (it used to blame "coincident faces
+/// on curved bodies" whatever the cause).
+#[test]
+fn planar_fallback_names_the_curved_faces() {
+    let slab = box_solid(Vec3::ZERO, Vec3::new(40.0, 30.0, 10.0)).unwrap();
+    let pad = cylinder(Vec3::new(20.0, 15.0, 5.0), Vec3::Z, 8.0, 10.0).unwrap();
+    let e = planar_boolean(&slab, &pad, BoolOp::Union).unwrap_err().to_string();
+    assert!(e.contains("not supported yet"), "{e}");
+    assert!(e.contains("the tool has 2 curved faces (cylinder)"), "{e}");
+    assert!(!e.contains("target"), "{e}");
+    assert!(!e.contains("coincident faces on curved bodies"), "{e}");
+    let ball = sphere(Vec3::new(20.0, 15.0, 10.0), 5.0).unwrap();
+    let e = planar_boolean(&ball, &pad, BoolOp::Cut).unwrap_err().to_string();
+    assert!(e.contains("the target has 6 curved faces (sphere) and the tool has 2 curved faces (cylinder)"), "{e}");
+    // All-planar bodies, a face of one at a shallow angle (1°): the fallback takes them.
+    let slope = Vec3::new(-1f64.to_radians().tan(), 0.0, 1.0).normalized().unwrap();
+    let wedge = convex_polyhedron(&[
+        HalfSpace { n: Vec3::X, d: 30.0 },
+        HalfSpace { n: -Vec3::X, d: -10.0 },
+        HalfSpace { n: Vec3::Y, d: 20.0 },
+        HalfSpace { n: -Vec3::Y, d: -10.0 },
+        HalfSpace { n: -Vec3::Z, d: -5.0 },
+        HalfSpace { n: slope, d: slope.dot(Vec3::new(10.0, 0.0, 11.0)) },
+    ])
+    .unwrap();
+    let u = planar_boolean(&slab, &wedge, BoolOp::Union).unwrap().unwrap();
+    let above = box_solid(Vec3::new(0.0, 0.0, 10.0), Vec3::new(40.0, 30.0, 20.0)).unwrap();
+    let expect = 40.0 * 30.0 * 10.0 + measure(&boolean(&wedge, &above, BoolOp::Intersect).unwrap().unwrap()).unwrap().volume;
+    assert!(rel(measure(&u).unwrap().volume, expect) < 1e-6, "{} vs {expect}", measure(&u).unwrap().volume);
 }
 
 #[test]
@@ -1521,6 +1607,49 @@ fn smooth_loft_through_three_sections() {
     .unwrap();
     let v = measure(&c).unwrap().volume;
     assert!(v > PI * 64.0 * 30.0 && v < 576.0 * 30.0, "{v}");
+}
+
+/// A loft from the basin's whole outline (10 up) down to a drain pad in a corner (1 up), cut
+/// from a 3 mm shell: its top edges lie on the outer walls. One order of the sections failed
+/// the cut ("shell not oriented and closed", or a panic inside the intersection), the other
+/// worked; both orders now build the same body, valid and outward.
+#[test]
+fn loft_section_order_gives_the_same_body() {
+    let r = |x0: f64, y0: f64, x1: f64, y1: f64| Loop2::polygon(&[Vec2::new(x0, y0), Vec2::new(x1, y0), Vec2::new(x1, y1), Vec2::new(x0, y1)]);
+    let at = |z: f64| Plane::new(Vec3::new(0.0, 0.0, z), Vec3::X, Vec3::Y).unwrap();
+    let big = (at(10.0), r(0.0, 0.0, 100.0, 60.0));
+    let small = (at(1.0), r(80.0, 40.0, 90.0, 50.0));
+    let basin = shell(&box_solid(Vec3::ZERO, Vec3::new(100.0, 60.0, 30.0)).unwrap(), &[Vec3::new(50.0, 30.0, 30.0)], 3.0).unwrap();
+    // The material inside the loft: the floor from 1 to 3 up, the walls from 3 to 10.
+    let v0 = measure(&basin).unwrap().volume;
+    let removed = v0 - 41582.028;
+    let mut volumes = Vec::new();
+    for secs in [vec![big.clone(), small.clone()], vec![small.clone(), big.clone()]] {
+        let l = loft(&secs).unwrap();
+        let m = measure(&l).unwrap();
+        assert!(m.volume > 0.0, "{}", m.volume);
+        volumes.push(m.volume);
+        let cut = boolean(&basin, &l, BoolOp::Cut).unwrap().unwrap();
+        let v = measure(&cut).unwrap().volume;
+        assert!((v0 - v - removed).abs() < 0.01 * removed, "{v} vs {}", v0 - removed);
+        let joined = boolean(&basin, &l, BoolOp::Union).unwrap().unwrap();
+        assert!(measure(&joined).unwrap().volume > v0);
+    }
+    assert!(rel(volumes[0], volumes[1]) < 1e-12, "{volumes:?}");
+    // Reversed in z too (large below, small above, and sketched on planes facing down).
+    let down = |z: f64| Plane::new(Vec3::new(0.0, 0.0, z), Vec3::Y, Vec3::X).unwrap();
+    for secs in [
+        vec![(at(0.0), r(0.0, 0.0, 100.0, 60.0)), (at(20.0), r(40.0, 20.0, 60.0, 40.0))],
+        vec![(down(20.0), r(20.0, 40.0, 40.0, 60.0)), (at(0.0), r(0.0, 0.0, 100.0, 60.0))],
+    ] {
+        // Prismoid: h/6 · (A0 + 4 Amid + A1).
+        let want = 20.0 / 6.0 * (6000.0 + 4.0 * 60.0 * 40.0 + 400.0);
+        let back: Vec<(Plane, Loop2)> = secs.iter().rev().cloned().collect();
+        for b in [loft(&secs).unwrap(), loft(&back).unwrap()] {
+            let v = measure(&b).unwrap().volume;
+            assert!(rel(v, want) < 1e-6, "{v} vs {want}");
+        }
+    }
 }
 
 #[test]

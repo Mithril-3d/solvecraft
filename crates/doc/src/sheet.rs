@@ -32,7 +32,7 @@ impl FlatWork {
     pub(crate) fn new() -> Self {
         Self(MAX_FLAT_WORK)
     }
-    fn charge(&mut self, work: usize) -> Result<()> {
+    pub(crate) fn charge(&mut self, work: usize) -> Result<()> {
         self.0 = self.0.checked_sub(work).ok_or_else(flat_budget_error)?;
         Ok(())
     }
@@ -754,16 +754,88 @@ impl SheetBody {
         }
         let mut work = FlatWork::new();
         let cells = self.cells_with_work(&mut work)?;
-        let body = kernel::sew(&self.faces(&cells, 0.0, self.t, &mut work)?)?;
-        self.machine_pockets(body, &mut work)
+        // Validate the bounded material first, then build close to the sheet's own
+        // origin. Fitting planes after a distant component transfer loses precision.
+        let mut local = self.clone();
+        local.frame = Plane::XY;
+        let body = kernel::sew(&local.faces(&cells, 0.0, self.t, &mut work)?)?;
+        let body = local.machine_pockets(body, &mut work)?;
+        self.place_local_solid(body)
     }
 
     /// The flat pattern as one extrusion (outline with its cut-outs).
     pub fn flat_solid(&self) -> Result<Body> {
         let regions = self.flat_regions()?;
-        let pl = plane_of(&self.frame_mat(), Vec3::ZERO, Vec3::X, Vec3::Y)?;
-        let body = kernel::extrude_planar_regions(&pl, &regions, 0.0, self.t)?;
-        self.machine_pockets(body, &mut FlatWork::new())
+        let mut local = self.clone();
+        local.frame = Plane::XY;
+        local.flat = true;
+        let body = kernel::extrude_planar_regions(&Plane::XY, &regions, 0.0, self.t)?;
+        let body = local.machine_pockets(body, &mut FlatWork::new())?;
+        self.place_local_solid(body)
+    }
+
+    fn place_local_solid(&self, body: Body) -> Result<Body> {
+        if self.frame == Plane::XY { Ok(body) } else { Ok(kernel::transform_matrix(&body, self.frame_mat())?) }
+    }
+
+    /// Retain bounded derived machining records, without duplicating identical replay work.
+    pub(crate) fn record_pocket(&mut self, region: Region2, z0: f64, z1: f64, work: &mut FlatWork) -> Result<()> {
+        if !z0.is_finite() || !z1.is_finite() || z0 < 0.0 || z1 > self.t || z0 >= z1 {
+            return Err(DocError::Invalid("invalid sheet pocket depth".into()));
+        }
+        if self.pockets.len() > 1000 {
+            return Err(flat_budget_error());
+        }
+        let pocket = SheetPocket { region, z0, z1 };
+        let (old_edges, old_points) = regions_complexity(self.pockets.iter().map(|p| &p.region))?;
+        let (new_edges, new_points) = region_complexity(std::slice::from_ref(&pocket.region))?;
+        work.charge(
+            old_edges.saturating_add(old_points).saturating_add(new_edges.saturating_add(new_points).saturating_mul(self.pockets.len().max(1))),
+        )?;
+        if self.pockets.contains(&pocket) {
+            return Ok(());
+        }
+        if self.pockets.len() >= 1000 {
+            return Err(flat_budget_error());
+        }
+        if old_edges.saturating_add(new_edges) > MAX_FLAT_POINTS || old_points.saturating_add(new_points) > MAX_FLAT_POINTS {
+            return Err(flat_budget_error());
+        }
+        self.pockets.push(pocket);
+        Ok(())
+    }
+
+    /// Certify whether a planar panel has material outside a retained thickness interval.
+    /// Classification uses exact planar arrangements at every pocket depth boundary.
+    pub(crate) fn material_outside_depth(&self, panel: &Region2, z0: f64, z1: f64, work: &mut FlatWork) -> Result<bool> {
+        if !z0.is_finite() || !z1.is_finite() || z0 < 0.0 || z1 > self.t || z0 >= z1 {
+            return Err(DocError::Invalid("invalid sheet retained depth".into()));
+        }
+        if self.pockets.len() > 1000 {
+            return Err(flat_budget_error());
+        }
+        regions_complexity(self.pockets.iter().map(|p| &p.region))?;
+        let mut levels = vec![0.0, self.t, z0, z1];
+        for p in &self.pockets {
+            if !p.z0.is_finite() || !p.z1.is_finite() || p.z0 < 0.0 || p.z1 > self.t || p.z0 >= p.z1 {
+                return Err(DocError::Invalid("invalid sheet pocket depth".into()));
+            }
+            levels.extend([p.z0, p.z1]);
+        }
+        levels.sort_by(f64::total_cmp);
+        levels.dedup();
+        work.charge(levels.len().saturating_mul(self.pockets.len().max(1)))?;
+        for zs in levels.windows(2) {
+            if zs[0] >= z0 && zs[1] <= z1 {
+                continue;
+            }
+            let active: Vec<_> = self.pockets.iter().filter(|p| p.z0 <= zs[0] && p.z1 >= zs[1]).map(|p| p.region.clone()).collect();
+            let removed = material_union(active, work)?;
+            if !material_boolean(std::slice::from_ref(panel), &removed, kernel::BoolOp::Cut, work)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Replay exact planar machining after forming the full-thickness material.
@@ -1962,5 +2034,19 @@ mod tests {
             s.pockets = vec![SheetPocket { z0, z1, ..pocket.clone() }];
             assert!(s.flat_solid().unwrap_err().to_string().contains("depth"));
         }
+    }
+    #[test]
+    fn pocket_recording_deduplicates_at_limit_and_rejects_growth_before_mutation() {
+        let mut s = plate(100.0, 60.0);
+        let pocket =
+            SheetPocket { region: rect(Vec2::new(1.0, 1.0), Vec2::new(2.0, 1.0), Vec2::new(2.0, 2.0), Vec2::new(1.0, 2.0)), z0: 0.0, z1: 0.5 };
+        s.pockets = vec![pocket.clone(); 1000];
+        let mut work = FlatWork::new();
+        s.record_pocket(pocket.region.clone(), pocket.z0, pocket.z1, &mut work).unwrap();
+        assert_eq!(s.pockets.len(), 1000);
+        assert!(s.record_pocket(pocket.region.clone(), 0.0, 0.6, &mut work).is_err());
+        assert_eq!(s.pockets.len(), 1000);
+        s.pockets.push(pocket.clone());
+        assert!(s.record_pocket(pocket.region, 0.0, 0.5, &mut work).is_err());
     }
 }

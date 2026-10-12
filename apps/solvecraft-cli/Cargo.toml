@@ -1,6 +1,6 @@
 [package]
 name = "solvecraft-cli"
-description = "SolveCraft headless CLI: run command scripts, measure, export, render snapshots, replay oracle recipes"
+description = "SolidCraft headless CLI: run command scripts, measure, export, render snapshots, replay oracle recipes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

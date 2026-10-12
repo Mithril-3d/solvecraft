@@ -1,0 +1,53 @@
+[
+  {
+    "note": "Axis labels are world X/Y/Z; with Y up, Y chooses top and Z chooses front."
+  },
+  {
+    "call": "ui.prefs",
+    "params": {
+      "up_axis": "y"
+    }
+  },
+  {
+    "call": "ui.view",
+    "params": {
+      "view": "home"
+    }
+  },
+  {
+    "click": {
+      "handle": "axis_view:y"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 0,
+        "pitch_deg": 90,
+        "back": [
+          0,
+          1,
+          0
+        ]
+      }
+    }
+  },
+  {
+    "click": {
+      "handle": "axis_view:z"
+    }
+  },
+  {
+    "expect": {
+      "camera": {
+        "yaw_deg": 0,
+        "pitch_deg": 0,
+        "back": [
+          0,
+          0,
+          1
+        ]
+      }
+    }
+  }
+]

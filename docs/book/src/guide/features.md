@@ -26,6 +26,14 @@ one undo step, including downstream parameter changes. Editing a placed componen
 edited feature before its downstream history. Cylindrical Emboss profile guides follow the
 sketch's chosen occurrence frame.
 
+Newly selected adaptive profiles store complete outer and hole source identities when the
+entire boundary can be qualified. Changing an ellipse or periodic offset after extrusion can
+then change its spline span count while keeping the same selected material region. A partial,
+intersected or ambiguous boundary cannot satisfy that whole-source reference; changing the
+hole identities also makes it lost. Older curve-span selections retain their exact stored
+multisets. If an older feature has already lost its profile after subdivision changed, edit
+the feature and reselect the intended current region to capture the new identity.
+
 New symmetric revolves split the entered angle evenly around the sketch profile, regardless
 of which way the selected axis points. Two Sides measures the second angle backward and the
 first angle forward along the sketch-normal sweep direction. Profiles on opposite sides of
@@ -96,4 +104,8 @@ canvases). It runs as one undoable step and lists the features that would go wit
 
 Face Extrude, face Revolve, and Press Pull retain linked generated profiles. When a modified planar face has no construction certificate, these internal profiles use the legacy named-face attachment and projection behavior so upstream edits still update the plane and outline. This compatibility path is private to those modeling tools: newly attached user sketches require a certified face or an explicitly fixed plane. Legacy internal attachments can follow the nearest matching face after topology changes; inspect their result after major upstream edits. Activate the intended occurrence before generating a face profile from a repeated component; capture a separately moved source position before creating a legacy profile across components.
 
-A negative Press Pull across a planar face containing a round through-hole can still fail when the Boolean cutter has coincident curved faces. This operation reports an error and preserves the design atomically; positive face extrusion and Press Pull retain the hole and remain linked.
+Negative Press Pull across supported aligned prismatic faces retains round through-holes,
+including after a joined extrusion and in a rotated component occurrence. The cut partitions
+the current material into axial sections, preserving the hole through undo, redo, and reopen.
+Walls that cannot be qualified as a parallel extrusion still use the general Boolean path
+and may report an unsupported coincident-surface operation atomically.

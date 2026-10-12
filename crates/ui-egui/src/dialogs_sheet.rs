@@ -744,6 +744,7 @@ pub fn overlay(painter: &egui::Painter, rect: Rect, d: &Dialog) -> bool {
     // A pocket retains material below (or above) the cut. Dashed contours and a depth
     // annotation distinguish it from the solid through-cut boundaries.
     let pockets: Vec<&Value> = v["pockets"].as_array().into_iter().flatten().collect();
+    let mut pocket_annotations: Vec<(Pos2, Vec<String>)> = Vec::new();
     for pocket in &pockets {
         let outer: Vec<(f64, f64)> = pocket["outline"].as_array().into_iter().flatten().filter_map(read).collect();
         for contour in std::iter::once(&pocket["outline"]).chain(pocket["cutouts"].as_array().into_iter().flatten()) {
@@ -757,9 +758,18 @@ pub fn overlay(painter: &egui::Painter, rect: Rect, d: &Dialog) -> bool {
             let bounds = outer.iter().map(|p| to(*p)).fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(p, p)));
             let anchor = bounds.center_top() - vec2(0.0, 6.0);
             if let Some(label) = pocket_label(pocket) {
-                painter.text(anchor, Align2::CENTER_BOTTOM, label, FontId::proportional(12.0), t.accent);
+                if let Some((_, labels)) = pocket_annotations.iter_mut().find(|(at, _)| at.distance(anchor) < 1.0) {
+                    if !labels.contains(&label) {
+                        labels.push(label);
+                    }
+                } else {
+                    pocket_annotations.push((anchor, vec![label]));
+                }
             }
         }
+    }
+    for (anchor, labels) in pocket_annotations {
+        painter.text(anchor, Align2::CENTER_BOTTOM, labels.join("\n"), FontId::proportional(12.0), t.accent);
     }
     for b in v["bends"].as_array().into_iter().flatten() {
         let (Some(a), Some(e)) = (read(&b["start"]), read(&b["end"])) else { continue };

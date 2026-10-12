@@ -7,6 +7,10 @@ use truck_modeling as mt;
 use crate::body::{Body, Solid, from_p3};
 use crate::{KernelError, Result, guard};
 
+#[cfg(test)]
+#[path = "bore_union_tests.rs"]
+mod bore_union_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoolOp {
@@ -175,6 +179,13 @@ thread_local! {
     /// Set while a boolean runs on bodies whose coincident faces were pushed apart (no
     /// second round of pushing).
     static APART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a union runs with a bore narrowed off a common cylinder (no second round).
+    static BORES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is a union with a narrowed bore running (see [`crate::coplanar::bore_union`])?
+pub(crate) fn narrowing_bores() -> bool {
+    BORES.with(|c| c.get())
 }
 
 /// Boolean of two bodies. The result may be empty (`Ok(None)`) for a cut that removes
@@ -209,6 +220,10 @@ pub fn boolean(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
                 "join cannot preserve the original faces; check for zero-thickness edge contact or add intentional overlap".into(),
             )),
         };
+    }
+    r = r.map(|result| result.map(|body| body.inherit_regularization_protection(a).inherit_regularization_protection(b)));
+    if matches!(op, BoolOp::Cut | BoolOp::Union) {
+        r = r.and_then(|result| result.map(|body| body.with_preserved_boolean_planar_sources(a, b, op == BoolOp::Cut)).transpose());
     }
     r
 }
@@ -345,6 +360,15 @@ fn boolean_whole(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
             if ok {
                 return Ok(Some(body));
             }
+        }
+    }
+    // Bores on a common cylinder (a pad's bore around the hole it is joined over).
+    if op == BoolOp::Union && !BORES.with(|c| c.get()) && crate::coplanar::has_coincident_cylinders(a, b) {
+        BORES.with(|c| c.set(true));
+        let r = crate::coplanar::bore_union(a, b, &|body| check(body).0);
+        BORES.with(|c| c.set(false));
+        if let Some(body) = r {
+            return Ok(Some(body));
         }
     }
     let mut empty_votes = 0;
@@ -515,7 +539,11 @@ pub(crate) fn join_pieces(pieces: Vec<Body>) -> Result<Option<Body>> {
         _ => {
             let shells: Vec<mt::Shell> = pieces.iter().flat_map(|p| p.solid.boundaries().clone()).collect();
             let solid = guard("pieces", || Solid::try_new(shells).map_err(|e| KernelError::Failed(e.to_string())))?;
-            Body::new(solid).map(Some)
+            let protected = pieces.iter().any(|piece| piece.regularization_protected);
+            Body::new(solid).map(|mut body| {
+                body.regularization_protected = protected;
+                Some(body)
+            })
         }
     }
 }
@@ -535,8 +563,9 @@ pub fn transform_matrix(body: &Body, m: [[f64; 4]; 4]) -> Result<Body> {
         );
         // An affine placement retains face order and appearance metadata.
         let sources = body.transformed_sources(m)?;
-        Body::new(placed_topology(&body.solid, mat)?)
-            .map(|placed| placed.with_color(body.color()).with_paint(body.paint().cloned()).with_face_sources(sources))
+        Body::new(placed_topology(&body.solid, mat)?).map(|placed| {
+            placed.with_color(body.color()).with_paint(body.paint().cloned()).with_face_sources(sources).inherit_regularization_protection(body)
+        })
     })
 }
 

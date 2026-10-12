@@ -90,7 +90,7 @@ pub fn read_dxf(text: &str) -> Result<Vec<Geom2>> {
         }
     }
     let mut out = Vec::new();
-    convert(&ents, k, &blocks, 0, &mut out)?;
+    convert(&ents, k, &blocks, 0, &mut out, &mut 0)?;
     Ok(out)
 }
 
@@ -120,16 +120,22 @@ fn section(p: &[(i32, String)], start: usize) -> Result<Vec<Ent>> {
 
 /// Deepest block nesting expanded.
 const MAX_BLOCK_DEPTH: usize = 16;
+/// Entities visited and array cells placed while expanding blocks. Every bound below this one
+/// is on the geometry that comes out, and a block that emits none trips none of them: N blocks
+/// that each insert the same empty block N times fan out to N^MAX_BLOCK_DEPTH visits for no
+/// output at all. This counts the work instead.
+const MAX_WORK: usize = 4 * MAX_ENTITIES;
 
 /// Entities to geometry (millimetres), expanding block references.
-fn convert(ents: &[Ent], k: f64, blocks: &HashMap<String, (Vec2, Vec<Ent>)>, depth: usize, out: &mut Vec<Geom2>) -> Result<()> {
+fn convert(ents: &[Ent], k: f64, blocks: &HashMap<String, (Vec2, Vec<Ent>)>, depth: usize, out: &mut Vec<Geom2>, work: &mut usize) -> Result<()> {
     let pt = |x: f64, y: f64| Vec2::new(x * k, y * k);
     let mut i = 0;
     while i < ents.len() {
         let Some(e) = ents.get(i) else { break };
         i += 1;
-        if out.len() > MAX_ENTITIES {
-            return Err(IoError::Invalid("too many entities".into()));
+        *work = work.saturating_add(1);
+        if out.len() > MAX_ENTITIES || *work > MAX_WORK {
+            return Err(IoError::Invalid("the drawing is too complex".into()));
         }
         // Paper space (layouts) is not the drawing.
         if e.get(67).is_some_and(|v| v != 0.0) {
@@ -142,13 +148,18 @@ fn convert(ents: &[Ent], k: f64, blocks: &HashMap<String, (Vec2, Vec<Ent>)>, dep
                     continue;
                 }
                 let mut inner = Vec::new();
-                convert(list, k, blocks, depth + 1, &mut inner)?;
+                convert(list, k, blocks, depth + 1, &mut inner, work)?;
+                if inner.is_empty() {
+                    continue;
+                }
                 let (sx, sy) = (e.get(41).unwrap_or(1.0), e.get(42).unwrap_or(1.0));
                 let rot = e.get(50).unwrap_or(0.0).to_radians();
                 let ins = pt(e.get(10).unwrap_or(0.0), e.get(20).unwrap_or(0.0));
                 let (cols, rows) = (e.get(70).unwrap_or(1.0).clamp(1.0, 10_000.0) as usize, e.get(71).unwrap_or(1.0).clamp(1.0, 10_000.0) as usize);
-                if cols.saturating_mul(rows).saturating_mul(inner.len()) > MAX_ENTITIES {
-                    return Err(IoError::Invalid("too many entities".into()));
+                let cells = cols.saturating_mul(rows);
+                *work = work.saturating_add(cells);
+                if cells > MAX_ENTITIES || cells.saturating_mul(inner.len()) > MAX_ENTITIES || *work > MAX_WORK {
+                    return Err(IoError::Invalid("the drawing is too complex".into()));
                 }
                 let (dc, dr) = (e.get(44).unwrap_or(0.0) * k, e.get(45).unwrap_or(0.0) * k);
                 for r in 0..rows {
@@ -491,5 +502,28 @@ mod tests {
         let selfref = "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nA\n0\nINSERT\n2\nA\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nA\n0\nENDSEC\n0\nEOF\n";
         assert_eq!(read_dxf(selfref).unwrap().len(), 16);
         assert!(read_dxf("AutoCAD Binary DXF\r\n").is_err());
+    }
+
+    /// Bounds on the geometry that comes out do not see a block that emits none: six
+    /// self-inserts fan out to 6^16 visits for no output. Both shapes must be refused quickly.
+    #[test]
+    fn empty_blocks_do_not_fan_out() {
+        let t = std::time::Instant::now();
+
+        let fanout = format!(
+            "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nA\n{}0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nA\n0\nENDSEC\n0\nEOF\n",
+            "0\nINSERT\n2\nA\n".repeat(6)
+        );
+        assert!(read_dxf(&fanout).is_err(), "a block of six self-inserts must be refused");
+
+        // An empty block placed as a 10,000 by 10,000 array, a thousand times over.
+        let array = format!(
+            "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nE\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n{}0\nENDSEC\n0\nEOF\n",
+            "0\nINSERT\n2\nE\n70\n10000\n71\n10000\n".repeat(1000)
+        );
+        let g = read_dxf(&array).unwrap_or_default();
+        assert!(g.is_empty(), "an empty block has no geometry to place");
+
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
     }
 }

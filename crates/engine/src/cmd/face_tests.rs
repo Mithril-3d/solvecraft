@@ -10,7 +10,7 @@ fn run(s: &mut Session, command: &str, params: Value) -> Value {
 }
 fn check(s: &mut Session, want: f64, hole: bool, height: f64) {
     s.refresh();
-    assert!(s.model.results.iter().all(|result| result.error.is_none()));
+    assert!(s.model.results.iter().all(|result| result.error.is_none() && result.warning.is_none()), "{:?}", s.model.results);
     let state = s.model.state();
     let got: f64 = state.bodies.iter().map(|b| solvecraft_kernel::measure(&b.body).unwrap().volume).sum();
     // Legacy linked outlines fit tessellated curves; enforce the existing 1e-4 material envelope.
@@ -22,10 +22,10 @@ fn check(s: &mut Session, want: f64, hole: bool, height: f64) {
     }
 }
 #[test]
-fn generated_face_profiles_keep_certified_and_internal_legacy_links_live_after_edit_and_reopen() {
+fn generated_face_profiles_keep_exact_links_live_after_edit_and_reopen() {
     for hole in [false, true] {
         let mut s = Session::default();
-        run(&mut s, "solid.box", json!({"length":40,"width":30,"height":20,"name":"Base"}));
+        let base = run(&mut s, "solid.box", json!({"length":40,"width":30,"height":20,"name":"Base"}))["feature"].as_u64().unwrap();
         if hole {
             run(&mut s, "sketch.create", json!({"plane":"XY"}));
             run(&mut s, "sketch.circle.center", json!({"center":[20,15],"radius":5}));
@@ -37,9 +37,11 @@ fn generated_face_profiles_keep_certified_and_internal_legacy_links_live_after_e
         let FeatureKind::Extrude { sketch, .. } = pad.kind else { panic!("extrude") };
         let generated = s.doc.feature(sketch).unwrap();
         let FeatureKind::Sketch { plane, sketch: profile } = &generated.kind else { panic!("sketch") };
-        assert!(matches!(plane,PlaneRef::Face{anchor,..} if anchor.is_some()!=hole));
+        let PlaneRef::Face { anchor: Some(anchor), .. } = plane else { panic!("the original Box cap remains exact after a hole cut") };
+        assert_eq!(anchor.target.origin_feature, base);
+        assert!(matches!(anchor.target.certificate, Some(solvecraft_doc::config::FaceCertificate::Box { axis: 2, high: true })));
         assert!(!profile.links.is_empty());
-        assert!(profile.links.iter().all(|link| link.auto_face != hole && !link.lost));
+        assert!(profile.links.iter().all(|link| link.auto_face && !link.lost));
         let area = 1200.0 - if hole { 25.0 * PI } else { 0.0 };
         check(&mut s, area * 30.0, hole, 30.0);
         run(&mut s, "timeline.edit", json!({"feature":"Base","set":{"height":"25","length":"50"}}));
@@ -48,7 +50,7 @@ fn generated_face_profiles_keep_certified_and_internal_legacy_links_live_after_e
         let edited = s.model.state();
         assert!(edited.bodies.iter().any(|body| body.body.contains(Vec3::new(49.0, 5.0, 34.0))));
         assert!(!edited.bodies.iter().any(|body| body.body.contains(Vec3::new(51.0, 5.0, 34.0))));
-        assert!(edited.sketch(sketch).unwrap().sketch.links.iter().all(|link| !link.lost));
+        assert!(edited.sketch(sketch).unwrap().sketch.links.iter().all(|link| link.auto_face && !link.lost));
         let solved = edited.sketch(sketch).unwrap().plane;
         assert!((solved.origin.z - 25.0).abs() < 1e-6);
         let before = s.model.state();
@@ -100,19 +102,17 @@ fn generated_profiles_and_press_pull_convert_rotated_occurrence_picks_once() {
         check(&mut s, area * 30.0, hole, 30.0);
         run(&mut s, "solid.press_pull", json!({"face":[35,-10,15],"distance":5}));
         check(&mut s, area * 35.0, hole, 35.0);
-        let height = if hole {
-            // Curved coincident Cut is an existing kernel limit; it must be atomic.
-            let before = s.doc.to_json();
-            let error = s.execute("solid.press_pull", &json!({"face":[35,-15,15],"distance":-5})).unwrap_err();
-            assert!(error.to_string().contains("coincident faces on curved bodies"), "{error}");
-            assert_eq!(s.doc.to_json(), before);
-            check(&mut s, area * 35.0, hole, 35.0);
-            35.0
-        } else {
-            run(&mut s, "solid.press_pull", json!({"face":[35,-15,15],"distance":-5}));
-            check(&mut s, area * 30.0, hole, 30.0);
-            30.0
-        };
+        let before_cut = s.doc.to_json();
+        run(&mut s, "solid.press_pull", json!({"face":[35,-15,15],"distance":-5}));
+        let height = 30.0;
+        check(&mut s, area * height, hole, height);
+        let after_cut = s.doc.to_json();
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.to_json(), before_cut);
+        check(&mut s, area * 35.0, hole, 35.0);
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(s.doc.to_json(), after_cut);
+        check(&mut s, area * height, hole, height);
         let world = s.world_state();
         let occupied = Vec3::new(35.0, 21.0 - height, 15.0);
         let absent = Vec3::new(35.0, 19.0 - height, 15.0);

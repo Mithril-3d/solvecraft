@@ -1190,7 +1190,7 @@ fn merge_split_faces(ex: &mut p21::Exchange, paint: &mut HashMap<u64, FaceLook>,
 /// The B-rep entities of one body as truck writes them, parsed, and the surfaces of faces
 /// merged from pieces.
 fn brep_exchange(b: &Body, merge: bool) -> Result<(p21::Exchange, HashMap<u64, V3>, HashMap<u64, FaceLook>)> {
-    let text = crate::step::truck_step(&[b], "SolveCraft")?;
+    let text = crate::step::truck_step(&[b], "SolidCraft")?;
     let mut ex = p21::parse(&text).map_err(|e| KernelError::Failed(format!("STEP export: {e}")))?;
     collapse_short_edges(&mut ex);
     // Face colours by exchange face: truck writes each shell's faces in the body's face order.
@@ -1429,10 +1429,10 @@ fn products_text(products: &[ExportProduct], root: usize, header: &StepHeader, m
 
     let mut s = String::new();
     s.push_str("ISO-10303-21;\nHEADER;\n");
-    s.push_str("FILE_DESCRIPTION(('SolveCraft model'),'2;1');\n");
+    s.push_str("FILE_DESCRIPTION(('SolidCraft model'),'2;1');\n");
     let _ = writeln!(
         s,
-        "FILE_NAME({},{},({}),({}),'SolveCraft','SolveCraft','');",
+        "FILE_NAME({},{},({}),({}),'SolidCraft','SolidCraft','');",
         string(&header.file_name),
         string(&header.time_stamp),
         string(&header.author),

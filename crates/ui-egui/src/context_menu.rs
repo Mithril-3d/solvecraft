@@ -1,9 +1,10 @@
 //! Context menus, one look everywhere.
 //!
-//! The viewport's right-click opens a radial marking menu (eight commands around the cursor,
-//! Repeat at the top) with a list underneath of what fits the selection or the thing under the
-//! cursor: faces, edges, bodies, sketch entities or empty space. Holding the right button opens
-//! it too; releasing over a direction picks that command (a flick). The browser's right-click
+//! The viewport's right-click opens a list of commands for the selection or the thing under the
+//! cursor: faces, edges, bodies, sketch entities or empty space. The optional radial marking
+//! menu adds eight commands around the cursor, with Repeat at the top. With that preference on,
+//! holding the right button opens it too; releasing over a direction picks a command (a flick).
+//! The browser's right-click
 //! opens the same list styling for a body, sketch or component.
 //!
 //! Items are commands (by id, with parameters filled from the target) or `ui.*` actions on view
@@ -1172,7 +1173,7 @@ pub fn open(app: &mut SolveApp, at: Pos2) {
 /// Open a menu for a target (the radial ring only for the viewport).
 pub fn open_for(app: &mut SolveApp, at: Pos2, target: Target) {
     app.menu.key_row = None;
-    app.menu.radial = target == Target::Viewport;
+    app.menu.radial = target == Target::Viewport && app.preferences.radial_context_menu;
     app.menu.target = target;
     app.menu.flick = false;
     app.viewport.context_menu = Some(at);
@@ -1301,6 +1302,12 @@ fn slot_rect(c: Pos2, k: usize, size: Vec2) -> Rect {
 /// Press-and-hold of the right button in the viewport opens the menu; releasing over a
 /// direction picks it.
 fn track_hold(app: &mut SolveApp, ctx: &egui::Context) {
+    if !app.preferences.radial_context_menu {
+        app.menu.press = None;
+        app.menu.flick = false;
+        app.menu.radial = false;
+        return;
+    }
     let (pressed, down, released, pos, time) = ctx.input(|i| {
         (
             i.pointer.button_pressed(egui::PointerButton::Secondary),
@@ -1369,7 +1376,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         let area = Rect::from_center_size(c, vec2(2.0 * (RX + 165.0), 2.0 * (RY + 34.0)));
         inside |= pointer.is_some_and(|p| area.contains(p));
         let hot = pointer.and_then(|p| sector(p - c));
-        let resp = egui::Area::new(egui::Id::new("sc_marking_menu")).fixed_pos(area.min).order(egui::Order::Foreground).show(ctx, |ui| {
+        let resp = crate::frame::area(egui::Id::new("sc_marking_menu")).fixed_pos(area.min).order(egui::Order::Foreground).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(area.size(), Sense::hover());
             let painter = ui.painter_at(r.expand(4.0));
             let font = FontId::proportional(13.0);
@@ -1435,15 +1442,16 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         picked = Some(item.clone());
     }
     let key_row = app.menu.key_row;
-    let resp = egui::Area::new(egui::Id::new("sc_context_menu")).fixed_pos(list_at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
-        menu_frame(ui, |ui| {
-            for (k, item) in list.iter().enumerate() {
-                if let Some(p) = list_row_lit(ui, item, key_row == Some(k)) {
-                    picked = Some(p);
+    let resp =
+        crate::frame::area(egui::Id::new("sc_context_menu")).fixed_pos(list_at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
+            menu_frame(ui, |ui| {
+                for (k, item) in list.iter().enumerate() {
+                    if let Some(p) = list_row_lit(ui, item, key_row == Some(k)) {
+                        picked = Some(p);
+                    }
                 }
-            }
+            });
         });
-    });
     inside |= resp.response.contains_pointer() || resp.response.rect.contains(pointer.unwrap_or(Pos2::ZERO));
 
     let (primary, secondary, esc) = ctx.input(|i| {
@@ -1508,6 +1516,7 @@ pub fn list_row_lit(ui: &mut egui::Ui, item: &Item, lit: bool) -> Option<Item> {
         return None;
     }
     let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0), if item.enabled { Sense::click() } else { Sense::hover() });
+    crate::scenario::publish_handle(&format!("menu:{}", item.id), r.center());
     if item.enabled && (resp.hovered() || lit) {
         ui.painter().rect_filled(r.shrink2(vec2(2.0, 1.0)), 4.0, t.hover);
     }
@@ -1536,7 +1545,7 @@ fn show_rename(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(mut r) = app.menu.rename.take() else { return };
     let t = Tokens::get();
     let mut done: Option<bool> = None;
-    let resp = egui::Area::new(egui::Id::new("sc_rename")).fixed_pos(r.at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
+    let resp = crate::frame::area(egui::Id::new("sc_rename")).fixed_pos(r.at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
         menu_frame(ui, |ui| {
             ui.add_space(2.0);
             ui.label(egui::RichText::new("Rename").size(11.0).color(t.text_dim));
@@ -1645,6 +1654,53 @@ fn show_props(app: &mut SolveApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_right_click_keeps_list_menu_and_radial_is_opt_in() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.settle();
+        let point = h.at(&json!({"world":[0,0,0]})).unwrap();
+        h.step(&json!({"click":point,"button":"right"})).unwrap();
+        assert!(h.app.viewport.context_menu.is_some(), "ordinary right click must still open a menu");
+        let list = describe(&h.app);
+        assert!(list["radial"].as_array().unwrap().is_empty());
+        assert!(list["items"].as_array().unwrap().iter().any(|item| item["id"] == "ui.origin" && item["enabled"] == true));
+        h.step(&json!({"click":{"handle":"menu:ui.origin"}})).unwrap();
+        assert!(!h.app.ui.show_origin && h.app.viewport.context_menu.is_none(), "the ordinary menu must execute Hide Origin and close");
+        h.call("ui.prefs", json!({"radial_context_menu":true}));
+        h.step(&json!({"click":point,"button":"right"})).unwrap();
+        assert_eq!(describe(&h.app)["radial"].as_array().unwrap().len(), DIRS);
+        open_for(&mut h.app, pos2(point[0] as f32, point[1] as f32), Target::Origin);
+        assert!(!h.app.menu.radial, "browser menus remain lists when radial menus are enabled");
+    }
+
+    #[test]
+    fn disabled_radial_menu_does_not_capture_right_button_hold() {
+        let mut app = SolveApp::new(solvecraft_engine::Session::default(), Default::default());
+        let ctx = egui::Context::default();
+        let point = pos2(600.0, 400.0);
+        app.viewport.mouse = Some(point);
+        for (time, events) in [
+            (
+                0.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            (1.0, vec![]),
+        ] {
+            let mut output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |_| track_hold(&mut app, &ctx));
+            output.textures_delta.clear();
+        }
+        assert!(app.viewport.context_menu.is_none() && app.menu.press.is_none() && !app.menu.flick);
+    }
 
     #[test]
     fn sectors_go_clockwise_from_the_top() {

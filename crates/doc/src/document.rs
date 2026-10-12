@@ -71,6 +71,15 @@ pub enum PlaneRef {
     },
 }
 
+/// Complete source curves of an outer boundary and each of its holes. Unlike a
+/// span multiset, this identity is independent of adaptive spline subdivision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WholeProfileBoundary {
+    pub outer: Vec<String>,
+    pub holes: Vec<Vec<String>>,
+}
+
 /// Which closed profiles of a sketch a feature uses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -79,9 +88,16 @@ pub enum ProfileSel {
     All,
     /// Profiles by index in the solved sketch's profile list.
     Indices { indices: Vec<usize> },
-    /// Profiles whose outer loop is made of exactly these curves (order-insensitive); stable
-    /// across parameter changes.
+    /// Profiles whose outer loop is made of exactly these curves, or pieces of them where other
+    /// curves cut them (order and repeats don't matter; see `sketch::profile_by_curves`). Found
+    /// again on every evaluation, so stable across parameter changes; no match or several is
+    /// an error, never another profile.
     Curves { loops: Vec<Vec<String>> },
+    /// Complete current boundaries of topology-aware analytic offset associations.
+    /// The local association identity survives retirement and resurrection of arc roles.
+    OffsetBoundaries { associations: Vec<String> },
+    /// Exact whole source coverage, including holes; partial source curves do not match.
+    WholeBoundaries { profiles: Vec<WholeProfileBoundary> },
     /// The profile containing each sketch point.
     Points { points: Vec<Vec2> },
 }
@@ -1315,6 +1331,22 @@ impl FeatureKind {
         }
     }
 
+    /// Profile selections and their source sketches without cloning feature data.
+    pub fn profile_sels(&self) -> Vec<(u64, &ProfileSel)> {
+        match self {
+            FeatureKind::Extrude { sketch, profiles, .. }
+            | FeatureKind::Revolve { sketch, profiles, .. }
+            | FeatureKind::Sweep { sketch, profiles, .. }
+            | FeatureKind::Emboss { sketch, profiles, .. }
+            | FeatureKind::SheetBase { sketch, profiles, .. } => vec![(*sketch, profiles)],
+            FeatureKind::Patch { sketch: Some(sketch), profiles, .. } => vec![(*sketch, profiles)],
+            FeatureKind::Loft { sections, .. } => {
+                sections.iter().filter(|section| section.point.is_none()).map(|section| (section.sketch, &section.profiles)).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn face_points_mut(&mut self) -> Vec<&mut Vec3> {
         match self {
             FeatureKind::Shell { faces, .. }
@@ -2100,7 +2132,7 @@ impl Document {
             | PlaneRef::AlongPath { .. }
             | PlaneRef::Perpendicular { .. } => {
                 let st = st.ok_or_else(|| DocError::Invalid("this plane is built from the model: evaluate first".into()))?;
-                crate::construct::resolve_geo_plane(&crate::construct::Ctx { doc: self, vals, st }, p)
+                crate::construct::resolve_geo_plane(&crate::construct::Ctx { doc: self, vals, st, depth }, p)
             }
         }
     }

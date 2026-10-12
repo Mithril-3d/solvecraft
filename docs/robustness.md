@@ -11,6 +11,10 @@ solvecraft-cli fuzz --from 0 --count 1000 --jobs 8 --timeout 90 --out runs/ --re
 solvecraft-cli fuzz-one <seed> --minimise      # one design, cut down to the steps that matter
 ```
 
+`--count` seeds are run starting at `--from`. A range that exceeds `u64::MAX` is
+rejected before any jobs or output directories are created. The maximum seed
+(`18446744073709551615`) is valid with `--count 1`; `--count 0` runs no seeds.
+
 - **Designs** (`crates/engine/src/fuzz.rs`): a seeded generator starts from a box, an extruded
   sketch profile closed by an arc (sometimes notched), or a revolved section (partial or full
   turns, sometimes touching the axis). It then adds up to eight steps: joins and cuts of

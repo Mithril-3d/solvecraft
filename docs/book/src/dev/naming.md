@@ -2,7 +2,7 @@
 
 A fillet stores the edges it rounds, and a sketch stores the face it sits on. If those were face
 and edge *indices*, an upstream edit that adds a face would move the fillet to the wrong edge.
-SolveCraft stores **names** instead (`crates/doc/src/naming.rs`):
+SolidCraft stores **names** instead (`crates/doc/src/naming.rs`):
 
 - A face of an evaluated body is named after how it was made. A face lying on a face of the
   feature's input keeps that face's name; a face new to the feature is named by its role:

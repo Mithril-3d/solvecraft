@@ -91,21 +91,113 @@ fn enclosure_datums_follow_wall_height_and_board_depth_with_material_proofs() {
 }
 
 #[test]
-fn enclosure_inward_offset_collapse_reports_an_error_instead_of_a_stale_lip() {
+fn enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen() {
+    use solvecraft_doc::FeatureKind;
+    use solvecraft_geom::{Vec2, Vec3};
+    use solvecraft_sketch::CurveKind;
+
     let mut s = Session::default();
     let script: Value = serde_json::from_str(include_str!("../../../examples/acceptance/sensor_enclosure.json")).unwrap();
     s.run_script(&script).unwrap();
-    run(&mut s, "parameters.change", json!({"name":"wall","expression":"3 mm"}));
-    // R4 outer corners leave R1 inner corners. The requested 1.4 mm inward
-    // offset needs a topology transition, which this offset operation refuses.
-    let lip = s.doc.features.iter().find(|f| f.name == "Lid lip" && matches!(f.kind, solvecraft_doc::FeatureKind::Sketch { .. })).unwrap();
-    let result = s.model.result(lip.id).unwrap();
-    assert!(result.error.as_deref().is_some_and(|error| error.contains("offset collapses an arc")), "{result:?}");
-    assert!(result.warning.as_deref().is_none_or(|warning| !warning.contains("identity is ambiguous")), "{result:?}");
-    let state = s.model.state();
-    assert!(state.sketch(lip.id).is_none());
-    assert!(!state.body("Lid").unwrap().mesh().contains(solvecraft_geom::Vec3::new(0., 27.2, 24.)));
-    let reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
-    assert!(reopened.model.result(lip.id).unwrap().error.as_deref().is_some_and(|error| error.contains("offset collapses an arc")));
-    assert!(reopened.model.state().sketch(lip.id).is_none());
+    for (name, expression) in [("height", "30 mm"), ("board_d", "50 mm"), ("wall", "3 mm")] {
+        run(&mut s, "parameters.change", json!({"name":name,"expression":expression}));
+    }
+    let check = |session: &Session| {
+        let errors = session.model.results.iter().filter_map(|r| r.error.as_ref().map(|e| (&r.name, e))).collect::<Vec<_>>();
+        let warnings = session.model.results.iter().filter_map(|r| r.warning.as_ref().map(|e| (&r.name, e))).collect::<Vec<_>>();
+        assert!(errors.is_empty(), "errors {errors:?}");
+        // The earlier snap-fit operation retains its documented legacy split-face
+        // notice. Offset/projection failures or frozen borders are not accepted.
+        assert!(
+            warnings.iter().all(|(name, message)| name.as_str() == "SnapFit1"
+                && message.as_str() == "face `F11:side:bs#7` was split; using the piece nearest the picked point"),
+            "warnings {warnings:?}"
+        );
+        assert!(session.model.results.iter().filter(|r| r.name == "Lid lip").all(|r| r.warning.is_none()));
+        let state = session.model.state();
+        let feature = session.doc.features.iter().find(|f| f.name == "Lid lip" && matches!(f.kind, FeatureKind::Extrude { .. })).unwrap();
+        let FeatureKind::Extrude { sketch, profiles, .. } = &feature.kind else {
+            panic!("lip extrusion");
+        };
+        let solved = state.sketch(*sketch).unwrap();
+        assert!((solved.plane.origin.z - 30.).abs() < 1e-8);
+        let inner = &solved.sketch.offsets[1];
+        assert_eq!(inner.outputs.len(), 4);
+        let mut corners = Vec::new();
+        for id in &inner.outputs {
+            let curve = &solved.sketch.curves[solved.sketch.curve_index(id).unwrap()];
+            let CurveKind::Line { a, b } = curve.kind else {
+                panic!("extinct arcs must leave line supports: {curve:?}");
+            };
+            for point in [solved.sketch.points[a].pos, solved.sketch.points[b].pos] {
+                assert!((point.x.abs() - 36.6).abs() < 1e-8 && (point.y.abs() - 31.6).abs() < 1e-8, "{point:?}");
+                if !corners.iter().any(|p: &Vec2| p.dist(point) < 1e-8) {
+                    corners.push(point);
+                }
+            }
+        }
+        assert_eq!(corners.len(), 4);
+        let regions = solvecraft_doc::select_profiles(solved, profiles).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert!((regions[0].area() - 332.570619298295).abs() < 1e-7, "area {}", regions[0].area());
+        let ring = solvecraft_kernel::extrude(&solved.plane, &regions, 0., 2.).unwrap();
+        assert_eq!(ring.len(), 1);
+        let precise_ring = ring[0].tessellate(1e-6).unwrap();
+        let bounds = precise_ring.bounds();
+        for (actual, expected) in
+            [(bounds.min.x, -37.8), (bounds.max.x, 37.8), (bounds.min.y, -32.8), (bounds.max.y, 32.8), (bounds.min.z, 28.), (bounds.max.z, 30.)]
+        {
+            assert!((actual - expected).abs() < 1e-8, "ring bounds {bounds:?}");
+        }
+        let height = bounds.max.z - bounds.min.z;
+        assert!((height - 2.).abs() < 1e-8);
+        let analytic_volume = regions[0].area() * height;
+        assert!((analytic_volume - 665.141238596591).abs() < 2e-7, "analytic ring volume {analytic_volume}");
+        let arc_perimeter = regions[0]
+            .outer
+            .segs
+            .iter()
+            .map(|segment| match segment {
+                solvecraft_geom::Seg2::Arc { radius, sweep, .. } => radius.abs() * sweep.abs(),
+                solvecraft_geom::Seg2::Line { .. } => 0.,
+                other => panic!("unexpected ring boundary {other:?}"),
+            })
+            .sum::<f64>();
+        assert!((arc_perimeter - std::f64::consts::TAU * 0.8).abs() < 1e-8);
+        assert_eq!(regions[0].holes.len(), 1);
+        assert!(regions[0].holes[0].segs.iter().all(|segment| matches!(segment, solvecraft_geom::Seg2::Line { .. })));
+        // Body::tessellate floors the requested sag tolerance at size * 1e-6.
+        // Only the outer arcs incur chord error: their tolerance-wide boundary
+        // strip bounds the volume error without changing CAD or export tolerances.
+        let actual_tol = 1e-6_f64.max(ring[0].size() * 1e-6);
+        let discretization_bound = height * (arc_perimeter * actual_tol + std::f64::consts::PI * actual_tol.powi(2));
+        let measured = precise_ring.measure().volume.abs();
+        assert!(
+            (measured - analytic_volume).abs() <= discretization_bound,
+            "ring mesh volume {measured}, analytic {analytic_volume}, bound {discretization_bound}"
+        );
+        let lid = state.body("Lid").unwrap().body.tessellate(1e-4).unwrap();
+        for (point, material) in [
+            (Vec3::new(0., 32.2, 29.), true),
+            (Vec3::new(0., 32.9, 29.), false),
+            (Vec3::new(0., 31.5, 29.), false),
+            (Vec3::new(36.7, 31.7, 29.), true),
+            (Vec3::new(36.5, 31.5, 29.), false),
+            (Vec3::new(37.55, 32.55, 29.), true),
+            (Vec3::new(37.7, 32.7, 29.), false),
+            // These points expose the stale old rim and the old height.
+            (Vec3::new(0., 27.2, 29.), false),
+            (Vec3::new(0., 27.2, 24.), false),
+        ] {
+            assert_eq!(precise_ring.contains(point), material, "standalone ring {point:?}");
+            assert_eq!(lid.contains(point), material, "joined lid {point:?}");
+        }
+        assert!(!lid.contains(Vec3::new(-33.5, -28.5, 32.)));
+        assert!(lid.contains(Vec3::new(-31.5, -28.5, 32.)));
+    };
+    check(&s);
+    let saved = s.doc.to_json();
+    let reopened = Session::new(solvecraft_doc::Document::from_json(&saved).unwrap());
+    check(&reopened);
+    assert_eq!(reopened.doc.to_json(), saved);
 }

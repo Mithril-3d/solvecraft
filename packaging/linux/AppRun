@@ -1,5 +1,5 @@
 #!/bin/sh
-# SolveCraft AppImage entry point (packaging/linux/AppRun; installed by package.sh).
+# SolidCraft AppImage entry point (packaging/linux/AppRun; installed by package.sh).
 # Adapted from PhotoCraft's AppRun (storytold/photocraft, Apache-2.0; see ATTRIBUTION.md).
 #
 # On Wayland the compositor resolves a window's dock icon by taking the window's

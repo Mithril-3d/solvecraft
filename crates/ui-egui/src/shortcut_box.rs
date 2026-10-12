@@ -158,7 +158,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         at.x.clamp(screen.left() + 4.0, (screen.right() - W - 4.0).max(screen.left())),
         at.y.clamp(screen.top() + 4.0, (screen.bottom() - h).max(screen.top())),
     );
-    let resp = egui::Area::new(egui::Id::new("sc_sbox")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
+    let resp = crate::frame::area(egui::Id::new("sc_sbox")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
         crate::context_menu::menu_frame(ui, |ui| {
             ui.set_width(W - 10.0);
             // Pinned commands: a mini toolbar.

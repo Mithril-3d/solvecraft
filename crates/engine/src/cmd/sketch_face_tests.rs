@@ -399,3 +399,184 @@ fn angled_attachment_tracks_source_plane_and_reopens() {
     let reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
     assert_eq!(reopened.model.state().sketch(id).unwrap().plane, placed);
 }
+
+#[test]
+fn rounded_enclosure_shell_side_and_floor_attach_through_width_wall_and_reopen() {
+    use solvecraft_doc::{FeatureKind, config::FaceCertificate, face_anchor::plane_face_anchor};
+    let mut s = Session::default();
+    for (name, expression) in [("width", "80 mm"), ("depth", "60 mm"), ("height", "30 mm"), ("wall", "2 mm")] {
+        run(&mut s, "parameters.add", json!({"name":name,"expression":expression}));
+    }
+    let base = run(&mut s, "sketch.create", json!({"plane":"XY","name":"Outline"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.rectangle.center", json!({"center":[0,0],"corner":[40,30]}));
+    run(&mut s, "sketch.dimension", json!({"entities":["l1"],"value":"width"}));
+    run(&mut s, "sketch.dimension", json!({"entities":["l2"],"value":"depth"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":base,"distance":"height","operation":"new","body_name":"Case"}));
+    run(&mut s, "solid.fillet", json!({"body":"Case","edges":[[40,30,15],[-40,30,15],[-40,-30,15],[40,-30,15]],"radius":6}));
+    run(&mut s, "solid.shell", json!({"body":"Case","faces":[[0,0,30]],"thickness":"wall","name":"Hollow"}));
+    assert_eq!(s.model.state().body("Case").unwrap().body.face_count(), 19, "rounded Shell has no separate base strips");
+    let pick = |s: &Session, normal: Vec3, point: Vec3| {
+        let state = s.model.state();
+        let body = state.body("Case").unwrap();
+        let face = body
+            .body
+            .faces(0.01)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.plane_normal.is_some_and(|n| n.dot(normal) > 0.999) && (f.centroid - point).dot(normal).abs() < 1e-6)
+            .unwrap();
+        json!({"body":"Case","index":face.index,"face":[point.x,point.y,point.z]})
+    };
+    let side_pick = pick(&s, Vec3::X, Vec3::new(40., 10., 20.));
+    let side = run(&mut s, "sketch.create", json!({"name":"USB","plane":side_pick,"project_edges":true}))["sketch"].as_u64().unwrap();
+    let port_plane = s.model.state().sketch(side).unwrap().plane;
+    let p0 = port_plane.to_local(Vec3::new(40., -6., 8.5));
+    let p1 = port_plane.to_local(Vec3::new(40., 6., 15.5));
+    let port_curves = run(&mut s, "sketch.rectangle.two_point", json!({"p0":[p0.x,p0.y],"p1":[p1.x,p1.y]}))["curves"].clone();
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.extrude",
+        json!({"sketch":side,"profiles":[{"curves":port_curves}],"distance":"wall","direction":"negative","operation":"cut","targets":["Case"],"name":"USBcut"}),
+    );
+    let floor_pick = pick(&s, Vec3::Z, Vec3::new(6., -9., 2.));
+    let floor = run(&mut s, "sketch.create", json!({"name":"Bosses","plane":floor_pick,"project_edges":true}))["sketch"].as_u64().unwrap();
+    let boss_curves = run(&mut s, "sketch.circle.center", json!({"center":[30,20],"radius":3.5}))["curves"].clone();
+    let centre = format!("{}.center", boss_curves[0].as_str().unwrap());
+    run(&mut s, "sketch.dimension", json!({"entities":["origin",centre],"type":"horizontal","value":"width / 2 - 10 mm"}));
+    run(&mut s, "sketch.dimension", json!({"entities":["origin",centre],"type":"vertical","value":"depth / 2 - 10 mm"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.extrude",
+        json!({"sketch":floor,"profiles":[{"curves":boss_curves}],"distance":12,"operation":"join","targets":["Case"],"name":"Boss"}),
+    );
+    run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"features":["Boss"],"dir1":[-1,0,0],"count1":2,"spacing1":"width - 20 mm","dir2":[0,-1,0],"count2":2,"spacing2":"depth - 20 mm","name":"BossPattern"}),
+    );
+    for id in [side, floor] {
+        let FeatureKind::Sketch { plane, .. } = &s.doc.feature(id).unwrap().kind else { panic!() };
+        assert!(matches!(plane_face_anchor(plane).unwrap().target.certificate, Some(FaceCertificate::ShellPlanar { .. })));
+    }
+    run(&mut s, "parameters.change", json!({"name":"width","expression":"100 mm"}));
+    run(&mut s, "parameters.change", json!({"name":"wall","expression":"3 mm"}));
+    let reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    for session in [&s, &reopened] {
+        for id in [side, floor] {
+            let result = session.model.result(id).unwrap();
+            assert!(result.error.is_none(), "{}: {:?}", result.name, result.error);
+            assert!(result.warning.is_none(), "{}: {:?}", result.name, result.warning);
+            assert!(
+                session.model.state().sketch(id).unwrap().sketch.links.iter().all(|link| !link.lost),
+                "projected boundary must resolve current geometry"
+            );
+        }
+        let state = session.model.state();
+        assert!(state.body("Case").is_some());
+        assert!((state.sketch(side).unwrap().plane.origin.x - 50.).abs() < 1e-6);
+        assert!((state.sketch(floor).unwrap().plane.origin.z - 3.).abs() < 1e-6);
+        assert!(state.sketch(floor).unwrap().plane.normal().dot(Vec3::Z) > 0.999);
+        let mesh = state.body("Case").unwrap().body.tessellate_with(1e-4, true).unwrap();
+        let case = &state.body("Case").unwrap().body;
+        let corners: Vec<_> = (0..case.face_count()).filter(|i| matches!(solvecraft_kernel::face_surface(case, *i), Some(solvecraft_kernel::FaceSurface::Cylinder { radius, .. }) if (radius - 6.).abs() < 1e-6)).collect();
+        assert_eq!(corners.len(), 4, "later port/boss features must not subdivide untouched outer corners");
+        for index in corners {
+            let points: Vec<_> = mesh
+                .edge_faces
+                .iter()
+                .enumerate()
+                .filter(|(_, faces)| faces.contains(&(index as u32)))
+                .flat_map(|(edge, _)| &mesh.edges[edge])
+                .collect();
+            assert!(points.iter().any(|p| p.z.abs() < 1e-8));
+            assert!(points.iter().any(|p| (p.z - 30.).abs() < 1e-8));
+        }
+
+        assert!(!mesh.contains(Vec3::new(49., 0., 12.)), "USB must remain open after resize/reopen");
+        assert!(mesh.contains(Vec3::new(49., 15., 12.)), "adjacent right wall remains solid");
+        assert!(mesh.contains(Vec3::new(-49., 0., 12.)), "opposite wall must stay solid");
+        let seed = state.sketch(floor).unwrap().plane.to_world(solvecraft_geom::Vec2::new(40., 20.)) + Vec3::Z * 6.;
+        assert!(mesh.contains(seed), "seed boss starts on current floor");
+        for shift in [Vec3::ZERO, Vec3::new(-80., 0., 0.), Vec3::new(0., -40., 0.), Vec3::new(-80., -40., 0.)] {
+            assert!(mesh.contains(seed + shift), "each patterned boss must survive resize/reopen at {:?}", seed + shift);
+        }
+        assert!(!mesh.contains(Vec3::new(0., 0., 6.)), "the cavity remains hollow");
+        let area = |w: f64, d: f64, r: f64| w * d - (4. - std::f64::consts::PI) * r * r;
+        let expected = area(100., 60., 6.) * 30. - area(94., 54., 3.) * 27. - 12. * 7. * 3. + 4. * std::f64::consts::PI * 3.5 * 3.5 * 12.;
+        assert!((mesh.measure().volume - expected).abs() < 0.1, "actual {}, analytic {expected}", mesh.measure().volume);
+    }
+    run(&mut s, "timeline.suppress", json!({"feature":"Hollow","suppressed":true}));
+    assert!(s.model.result(side).unwrap().error.is_some());
+    assert!(s.model.result(floor).unwrap().error.is_some());
+}
+
+#[test]
+fn offset_rectangle_pocket_has_one_logical_outer_wall_and_closed_face_projection() {
+    let mut s = Session::default();
+    let base = run(&mut s, "sketch.create", json!({"plane":"XY"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.rectangle.center", json!({"center":[0,0],"corner":[30,27]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":base,"distance":10,"operation":"new","body_name":"Stock"}));
+    let control_sketch = run(&mut s, "sketch.create", json!({"plane":"XY"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0":[100,100],"p1":[104,104]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":control_sketch,"distance":10,"operation":"new","body_name":"Control"}));
+    let untouched = s.model.state().body("Control").unwrap().body.clone();
+    let before_control = solvecraft_kernel::step_export(&[&untouched], "control snapshot").unwrap();
+    let pick = top_pick(&s, "Stock");
+    let pocket = run(&mut s, "sketch.create", json!({"plane":pick}))["sketch"].as_u64().unwrap();
+    let side = {
+        let state = s.model.state();
+        let sk = &state.sketch(pocket).unwrap().sketch;
+        let curve = sk.curves.iter().find(|c| c.id == "l1").unwrap();
+        let solvecraft_sketch::CurveKind::Line { a, b } = curve.kind else { panic!() };
+        sk.point(a).unwrap() + sk.point(b).unwrap()
+    };
+    let outer = run(&mut s, "sketch.offset", json!({"curves":["l1"],"distance":0.3425231845240546,"side":[side.x,side.y]}))["curves"].clone();
+    let inner = run(&mut s, "sketch.offset", json!({"curves":[outer[0]],"distance":5.609348914858092,"side":[0,0]}))["curves"].clone();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":pocket,"profiles":[{"curves":inner}],"distance":-9,"operation":"cut"}));
+    let control = s.model.state().body("Control").unwrap().body.clone();
+    assert!(control.same(&untouched), "a separate body crossing the cutter end plane remains the exact same solid");
+    assert_eq!(solvecraft_kernel::step_export(&[&control], "control snapshot").unwrap(), before_control);
+    let state = s.model.state();
+    let body = state.body("Stock").unwrap();
+    let display = body.body.display_mesh(0.01).unwrap();
+    let face = body
+        .body
+        .faces(0.01)
+        .unwrap()
+        .into_iter()
+        .find(|face| face.plane_normal.is_some_and(|n| n.dot(Vec3::X) > 0.999) && (face.centroid.x - 30.).abs() < 1e-6)
+        .unwrap();
+    assert_eq!(body.body.faces(0.01).unwrap().len(), 11, "actual pocket topology has no outer floor-height strips");
+    assert_eq!(display.surface_patch(face.index).len(), 1);
+    let attached = run(&mut s, "sketch.create", json!({"plane":{"body":"Stock","index":face.index,"face":[30,0,0.5]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    let reopened = Session::new(solvecraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    for session in [&s, &reopened] {
+        let result = session.model.result(attached).unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+        let state = session.model.state();
+        let sketch = &state.sketch(attached).unwrap().sketch;
+        assert!(sketch.links.iter().all(|link| !link.lost));
+        assert_eq!(sketch.curves.len(), 4, "whole outer-wall rectangle has no floor-height stations");
+        let mesh = state.body("Stock").unwrap().body.display_mesh(0.01).unwrap();
+        assert!(mesh.contains(Vec3::new(0., 0., 0.5)));
+        assert!(!mesh.contains(Vec3::new(0., 0., 5.)));
+        assert!(mesh.contains(Vec3::new(28., 0., 5.)));
+        let control = &state.body("Control").unwrap().body;
+        assert_eq!(control.faces(0.01).unwrap().len(), 6);
+        assert_eq!(control.edges(0.01).unwrap().len(), 12);
+        let control_mesh = control.tessellate(0.01).unwrap();
+        assert!((control_mesh.measure().volume - 160.).abs() < 1e-6);
+        assert!(control_mesh.contains(Vec3::new(102., 102., 0.5)));
+        assert!(control_mesh.contains(Vec3::new(102., 102., 5.)));
+        let expected = 60. * 54. * 10. - 4. * 24.73317426966596 * 21.733174269665962 * 9.;
+        assert!((mesh.measure().volume - expected).abs() < 1e-6, "actual {}, expected {expected}", mesh.measure().volume);
+    }
+}

@@ -195,7 +195,7 @@ impl Sketch {
             return self.add_link(kind, source, geom);
         }
         let id = if geom.is_empty() {
-            let id = self.fresh("j");
+            let id = self.fresh("j")?;
             self.links.push(Link { id: id.clone(), kind, source, face_name: None, auto_face: false, lost: false });
             id
         } else {
@@ -217,7 +217,7 @@ impl Sketch {
         for (k, pts) in ws.into_iter().enumerate() {
             let wid = match old.get(k) {
                 Some(o) => o.clone(),
-                None => self.fresh("w"),
+                None => self.fresh("w")?,
             };
             self.wires.push(Wire { id: wid, pts, space: WireSpace::Component, link: Some(id.to_string()), fit: Vec::new() });
         }
@@ -233,7 +233,7 @@ impl Sketch {
     pub fn add_drawn_wire_in(&mut self, fit: &[Vec3], space: WireSpace) -> Result<String> {
         let pts = drawn_polyline(fit)?;
         self.wire_budget(None, 1, pts.len() + fit.len())?;
-        let id = self.fresh(if fit.len() == 1 { "q" } else { "w" });
+        let id = self.fresh(if fit.len() == 1 { "q" } else { "w" })?;
         self.wires.push(Wire { id: id.clone(), pts, space, link: None, fit: fit.to_vec() });
         Ok(id)
     }

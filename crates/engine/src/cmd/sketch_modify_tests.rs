@@ -826,3 +826,88 @@ fn analytic_offset_partial_delete_releases_survivors_preserves_source_and_undo()
     run(&mut s, "edit.undo", json!({}));
     assert_eq!(s.doc.to_json(), before);
 }
+
+#[test]
+fn periodic_offset_extrusion_survives_post_extrude_span_changes_and_cold_reopen() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.ellipse", json!({"center":[0,0],"major":[10,0],"minor_radius":5}));
+    run(&mut s, "sketch.dimension", json!({"entities":["e1"],"type":"major","value":10}));
+    let a = run(&mut s, "sketch.offset", json!({"curves":["e1"],"distance":-1,"chain":false}))["curves"][0].as_str().unwrap().to_string();
+    run(&mut s, "sketch.offset", json!({"curves":[a],"distance":-0.5,"chain":false}));
+    let sk_id = s.active_sketch.unwrap();
+    let initial = solvecraft_sketch::find_profiles(&sketch(&s));
+    let (index, ring) = initial.iter().enumerate().min_by(|(_, a), (_, b)| a.area.total_cmp(&b.area)).unwrap();
+    let initial_count = ring.outer_curves.len();
+    let boundary = ring.whole_curve_boundaries().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":sk_id,"profiles":[index],"distance":3,"operation":"new"}));
+    let initial_doc = s.doc.to_json();
+    for major in [12.0, 16.0, 20.0] {
+        run(&mut s, "parameters.change", json!({"name":"d1","expression":major}));
+        let state = s.world_state();
+        let sk = state.sketch(sk_id).unwrap();
+        let ring = sk.profiles.iter().find(|p| p.whole_curve_boundaries().as_ref() == Some(&boundary)).unwrap();
+        assert_ne!(ring.outer_curves.len(), initial_count, "the repro must actually change graph span multiplicity");
+        // Length-only intent leaves the centre and axis pose free. Measure that rigid frame,
+        // then derive independent ellipse normal probes (not fitted-output points).
+        let CurveKind::Ellipse { c, m, r } = sk.sketch.curves[sk.sketch.curve_index("e1").unwrap()].kind else { panic!("ellipse") };
+        let centre = sk.sketch.point(c).unwrap();
+        let axis = sk.sketch.point(m).unwrap() - centre;
+        assert!((axis.len() - major).abs() < 1e-6);
+        assert!((r - 5.0).abs() < 1e-6);
+        let u = axis / axis.len();
+        let v = Vec2::new(-u.y, u.x);
+        let t: f64 = 0.2;
+        let ellipse = centre + u * (major * t.cos()) + v * (5.0 * t.sin());
+        let gradient = u * (t.cos() / major) + v * (t.sin() / 5.0);
+        let normal = gradient / gradient.len();
+        eprintln!("major={major} centre={centre:?} axis={axis:?}");
+        assert!(ring.region.contains(ellipse + normal * 1.25), "major={major}, ring area={}", ring.area);
+        assert!(!ring.region.contains(ellipse + normal * 0.5));
+        assert!(!ring.region.contains(ellipse + normal * 1.75));
+        let n = 4096;
+        let h = std::f64::consts::TAU / n as f64;
+        let perimeter = (0..=n)
+            .map(|i| {
+                let t = i as f64 * h;
+                (major * major * t.sin().powi(2) + 25.0 * t.cos().powi(2)).sqrt()
+                    * if i == 0 || i == n {
+                        1.0
+                    } else if i % 2 == 0 {
+                        2.0
+                    } else {
+                        4.0
+                    }
+            })
+            .sum::<f64>()
+            * h
+            / 3.0;
+        let expected = (0.5 * perimeter + 1.25 * std::f64::consts::PI) * 3.0;
+        assert_eq!(state.bodies.len(), 1);
+        let body = &state.bodies[0].body;
+        for (distance, material) in [(1.25, true), (0.5, false), (1.75, false)] {
+            let point = ellipse + normal * distance;
+            assert_eq!(body.contains(solvecraft_geom::Vec3::new(point.x, point.y, 1.5)), material);
+        }
+        // Repeat at the exact major-axis seam as a physical material control.
+        for (distance, material) in [(1.25, true), (0.5, false), (1.75, false)] {
+            let point = centre + u * (major + distance);
+            assert_eq!(ring.region.contains(point), material);
+            assert_eq!(body.contains(solvecraft_geom::Vec3::new(point.x, point.y, 1.5)), material);
+        }
+        let volume = solvecraft_kernel::measure(body).unwrap().volume;
+        assert!((volume - expected).abs() < 0.05, "{major}: {volume} vs independent {expected}");
+        let mut cold = Session { doc: solvecraft_doc::format::read(&s.doc.to_json()).unwrap().into(), ..Default::default() };
+        cold.refresh();
+        let cold_state = cold.world_state();
+        assert_eq!(cold_state.bodies.len(), 1);
+        let cold_volume = solvecraft_kernel::measure(&cold_state.bodies[0].body).unwrap().volume;
+        assert!((cold_volume - volume).abs() < 1e-8);
+        let edited = s.doc.to_json();
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.to_json(), initial_doc);
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(s.doc.to_json(), edited);
+        run(&mut s, "edit.undo", json!({}));
+    }
+}

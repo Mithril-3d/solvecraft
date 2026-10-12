@@ -1,5 +1,5 @@
 {
-  description = "SolveCraft — native app development shell and package for Linux";
+  description = "SolidCraft — native app development shell and package for Linux";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -33,6 +33,7 @@
           wayland
           libxkbcommon
           libglvnd
+          vulkan-loader
           dbus
         ])
         ++ (with pkgs; [
@@ -46,14 +47,16 @@
           libxcb
         ]);
       driverLibDir = "/run/opengl-driver/lib";
+      driverShareDir = "/run/opengl-driver/share";
       libraryPath = pkgs: "${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)}:${driverLibDir}";
 
       shellHook = ''
         if [ ! -d ${driverLibDir} ]; then
-          echo "solvecraft: ${driverLibDir} is missing — set hardware.graphics.enable = true so the Mesa drivers and their EGL vendor descriptions exist." >&2
+          echo "SolidCraft: ${driverLibDir} is missing — on NixOS enable hardware.graphics; on other distributions use a matching nixGL driver wrapper." >&2
         fi
         command -v cc >/dev/null || echo "solvecraft: no C linker on PATH, cargo cannot link — use nix develop .#rust" >&2
         echo "solvecraft: cargo run --release -p solvecraft -- --sample"
+        export XDG_DATA_DIRS="${driverShareDir}:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
       '';
     in
     {
@@ -63,7 +66,7 @@
         # second rustc — or mkShell's second gcc, with another glibc behind it — would make every
         # `cargo build` produce binaries from somewhere else.
         default = pkgs.mkShellNoCC {
-          name = "solvecraft";
+          name = "solidcraft";
           LD_LIBRARY_PATH = libraryPath pkgs;
           inherit shellHook;
         };
@@ -71,7 +74,7 @@
         # For a machine with no Rust at all: `nix develop .#rust`. Its own target directory, so
         # switching between this toolchain and the system one does not thrash the cache.
         rust = pkgs.mkShell {
-          name = "solvecraft-rust";
+          name = "solidcraft-rust";
           packages = [
             pkgs.cargo
             pkgs.rustc
@@ -88,22 +91,29 @@
         };
       });
 
-      packages = forAllSystems (pkgs: {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "solvecraft";
+      packages = forAllSystems (pkgs: rec {
+        default = solidcraft;
+        solidcraft = assert pkgs.lib.assertMsg
+          (pkgs.lib.versionAtLeast pkgs.rustc.version (pkgs.lib.importTOML ./Cargo.toml).workspace.package.rust-version)
+          "SolidCraft requires the Rust version advertised in Cargo.toml; update the pinned nixpkgs input.";
+          pkgs.rustPlatform.buildRustPackage {
+          pname = "solidcraft";
           version = (pkgs.lib.importTOML ./Cargo.toml).workspace.package.version;
           src = self;
 
           cargoLock.lockFile = ./Cargo.lock;
-          # Build and install the app alone: the workspace also holds the CLI, the web app, xtask
-          # and the crates only the test suites need.
+          # The CLI draws the same packaging icons as the other Linux distributions.
           cargoBuildFlags = [
             "-p"
             "solvecraft"
+            "-p"
+            "solvecraft-cli"
           ];
           cargoInstallFlags = [
             "-p"
             "solvecraft"
+            "-p"
+            "solvecraft-cli"
           ];
           # `cargo xtask ci` is the test gate (it wants a wasm target and a GPU); the sandbox has
           # neither.
@@ -112,22 +122,48 @@
           nativeBuildInputs = [ pkgs.makeWrapper ];
           buildInputs = runtimeLibs pkgs;
 
+          postInstall = ''
+            install -Dm644 packaging/linux/ai.storyteller.solvecraft.desktop \
+              $out/share/applications/ai.storyteller.solvecraft.desktop
+            install -Dm644 packaging/linux/ai.storyteller.solvecraft.mime.xml \
+              $out/share/mime/packages/ai.storyteller.solvecraft.xml
+            for size in 16 24 32 48 64 128 256 512; do
+              icon=$out/share/icons/hicolor/''${size}x''${size}/apps/ai.storyteller.solvecraft.png
+              mkdir -p "$(dirname "$icon")"
+              $out/bin/solvecraft-cli icon --size "$size" --out "$icon" >/dev/null
+            done
+            ln -s solvecraft $out/bin/solidcraft
+          '';
+
           # The app reaches the window through dlopen'd libraries, so the packaged binary needs the
           # same LD_LIBRARY_PATH the shell exports.
           postFixup = ''
-            wrapProgram $out/bin/solvecraft --prefix LD_LIBRARY_PATH : "${libraryPath pkgs}"
+            wrapProgram $out/bin/solvecraft \
+              --prefix LD_LIBRARY_PATH : "${libraryPath pkgs}" \
+              --set-default XDG_DATA_DIRS /usr/local/share:/usr/share \
+              --prefix XDG_DATA_DIRS : "$out/share:${driverShareDir}"
           '';
 
           meta = {
             description = "Rust-native parametric 3D CAD app";
-            homepage = "https://github.com/bherbruck/solvecraft";
+            homepage = "https://github.com/bherbruck/solidcraft";
             license = with pkgs.lib.licenses; [
               mit
               asl20
             ];
-            mainProgram = "solvecraft";
+            mainProgram = "solidcraft";
           };
         };
+      });
+
+      apps = forAllSystems (pkgs: let
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.solidcraft;
+        desktop = { type = "app"; program = "${package}/bin/solidcraft"; };
+      in {
+        default = desktop;
+        solidcraft = desktop;
+        solvecraft = { type = "app"; program = "${package}/bin/solvecraft"; };
+        cli = { type = "app"; program = "${package}/bin/solvecraft-cli"; };
       });
     };
 }

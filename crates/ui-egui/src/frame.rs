@@ -33,6 +33,7 @@ pub fn docked<'a>(title: impl Into<WidgetText>, id: egui::Id, anchor: Pos2, max_
         Width::Wide => DIALOG_WIDE_MAX_W,
     };
     egui::Window::new(title)
+        .enabled(!crate::issue_report::cad_input_blocked())
         .id(id)
         .title_bar(false)
         .pivot(Align2::RIGHT_TOP)
@@ -52,7 +53,17 @@ pub fn window<'a>(ctx: &egui::Context, title: impl Into<WidgetText>, width: Widt
         Width::Wide => WINDOW_WIDE_MAX_W,
     };
     let c = ctx.content_rect().center();
-    egui::Window::new(title).collapsible(false).pivot(Align2::CENTER_CENTER).default_pos(c - vec2(0.0, 60.0)).max_width(max)
+    egui::Window::new(title)
+        .enabled(!crate::issue_report::cad_input_blocked())
+        .collapsible(false)
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(c - vec2(0.0, 60.0))
+        .max_width(max)
+}
+
+/// Floating model controls share the report's read-only drawing boundary with windows.
+pub fn area(id: egui::Id) -> egui::Area {
+    egui::Area::new(id).enabled(!crate::issue_report::cad_input_blocked())
 }
 
 /// The width a window's content had last frame (at least `min`), for laying out rows that end at
@@ -78,6 +89,51 @@ pub fn right_aligned<R>(ui: &mut Ui, total: f32, width: f32, add: impl FnOnce(&m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn feature_forms_use_available_height_and_keep_actions_visible() {
+        use crate::scenario::Harness;
+        use serde_json::json;
+        for (width, height, scale) in [(1400.0, 900.0, 1.0), (1400.0, 900.0, 2.0)] {
+            let mut h = Harness::new();
+            h.app.preferences.ui_scale = scale;
+            h.call("ui.resize", json!({"width":width / scale,"height":height / scale}));
+            h.app.run("sketch.create", json!({"plane":"XY","name":"Base"})).unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,10]})).unwrap();
+            h.app.run("sketch.finish", json!({})).unwrap();
+            h.step(&json!({"start":"solid.extrude"})).unwrap();
+            h.frames(10);
+            let dialog = h.app.viewport.dialog_rect.unwrap();
+            let viewport = h.app.viewport.rect.unwrap();
+            assert!(dialog.height() > 230.0, "scale={scale}: {dialog:?}");
+            assert!(viewport.expand(1.0).contains_rect(dialog), "scale={scale}: {dialog:?} outside {viewport:?}");
+            assert!(h.widget("Distance").is_some(), "distance must be visible without scrolling");
+            if scale == 1.0 {
+                assert!(h.widget("Operation").is_some(), "operation must be visible without scrolling");
+            }
+            assert!(dialog.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
+            assert!(h.widget("Cancel").is_some(), "cancel must be visible without scrolling");
+            h.step(&json!({"widget":"Cancel"})).unwrap();
+            assert!(h.app.dialog.is_none());
+            h.step(&json!({"start":"solid.shell"})).unwrap();
+            h.frames(8);
+            let short = h.app.viewport.dialog_rect.unwrap();
+            assert!(short.height() < dialog.height(), "short forms should shrink: {short:?}, {dialog:?}");
+            assert!(h.widget("Cancel").is_some());
+            h.step(&json!({"widget":"Cancel"})).unwrap();
+            h.step(&json!({"start":"solid.hole"})).unwrap();
+            if let Some(crate::dialogs::Dialog { kind: crate::dialogs::Kind::Hole { kind, opts, .. }, .. }) = h.app.dialog.as_mut() {
+                *kind = 1;
+                opts.tapped = true;
+            }
+            h.frames(8);
+            let long = h.app.viewport.dialog_rect.unwrap();
+            assert!(viewport.expand(1.0).contains_rect(long), "long form clipped: {long:?}");
+            assert!(h.widget("Cancel").is_some(), "long-form actions must stay visible");
+            assert!(long.contains(crate::scenario::handle_at("dialog:OK").unwrap()));
+            h.step(&json!({"widget":"Cancel"})).unwrap();
+            assert!(h.app.dialog.is_none());
+        }
+    }
     /// Windows are made in this file only, so none can skip the width limits.
     #[test]
     fn windows_come_from_the_frame_helper() {

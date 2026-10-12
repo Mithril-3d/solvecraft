@@ -5,7 +5,9 @@
 #![forbid(unsafe_code)]
 
 mod camera;
+mod curve_display;
 mod raster;
 
 pub use camera::{Camera, CameraAnim, Mat4, Quat, StandardView, UpAxis, ease_in_out};
-pub use raster::{Canvas, Rgb, Scene, SceneLine, SceneMesh, png, render, render_png, render_transparent};
+pub use curve_display::{PixelCurveView, SampledPath, SamplingBudget, SamplingQuality, sample_segment, sample_segment_unclipped};
+pub use raster::{Canvas, Rgb, SECTION_CAP, Scene, SceneLine, SceneMesh, png, render, render_png, render_transparent};

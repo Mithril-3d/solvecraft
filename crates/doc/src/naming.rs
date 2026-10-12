@@ -331,16 +331,20 @@ fn vote(ps: &[Vec3], inputs: &[(&ModelBody, FaceIndex, Arc<Vec<String>>)], tol: 
             if let Some(f) = idx.face_at(p, tol)
                 && let Some(n) = nm.get(f)
             {
+                // A later operation may merge several pieces of the same input face.
+                // Count their shared ancestry before testing the majority; a piece
+                // number identifies topology subdivision, not a different source.
+                let n = strip_piece(n);
                 match votes.iter_mut().find(|(v, _)| v == n) {
                     Some(v) => v.1 += 1,
-                    None => votes.push((n.clone(), 1)),
+                    None => votes.push((n.to_string(), 1)),
                 }
                 break;
             }
         }
     }
     votes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    votes.first().filter(|(_, n)| *n * 2 >= ps.len().max(1)).map(|(n, _)| strip_piece(n).to_string())
+    votes.first().filter(|(_, n)| *n * 2 >= ps.len().max(1) && votes.get(1).is_none_or(|(_, other)| n > other)).map(|(n, _)| n.clone())
 }
 
 /// A face name without its piece number (`#k`).
@@ -721,4 +725,29 @@ pub fn face_on_body(body: &ModelBody, name: &str, p: Vec3) -> Option<(usize, Vec
         }
     }
     best.map(|(_, index, q, split)| (index, q, split))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_face_votes_collectively_for_pieces_of_one_source() {
+        let body = ModelBody::new("Input".into(), solvecraft_kernel::box_solid(Vec3::ZERO, Vec3::new(4., 1., 1.)).unwrap(), 1);
+        let mut mesh = Mesh::default();
+        let mut points = Vec::new();
+        for i in 0..3u32 {
+            let x = f64::from(i);
+            mesh.positions.extend([Vec3::new(x, 0., 0.), Vec3::new(x + 0.8, 0., 0.), Vec3::new(x, 0.8, 0.)]);
+            mesh.triangles.push([i * 3, i * 3 + 1, i * 3 + 2]);
+            mesh.tri_face.push(i);
+            points.push(Vec3::new(x + 0.2, 0.2, 0.));
+        }
+        let pieces = Arc::new(vec!["F1:side:wall#1".into(), "F1:side:wall#2".into(), "F1:side:wall#3".into()]);
+        assert_eq!(vote(&points, &[(&body, FaceIndex::new(&mesh, 3), pieces)], 1e-8, None).as_deref(), Some("F1:side:wall"));
+        let distinct = Arc::new(vec!["F1:side:wall#1".into(), "F2:side:wall#2".into(), "F3:side:wall#3".into()]);
+        let inputs = [(&body, FaceIndex::new(&mesh, 3), distinct)];
+        assert_eq!(vote(&points, &inputs, 1e-8, None), None);
+        assert_eq!(vote(&points[..2], &inputs, 1e-8, None), None, "equal different-source votes must not pick a lexicographic winner");
+    }
 }

@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solvecraft_geom::Vec3;
 
+pub(crate) fn shell_plane_family(planes: impl IntoIterator<Item = Option<solvecraft_geom::Plane>>) -> bool {
+    let mut planes = planes.into_iter();
+    let Some(Some(first)) = planes.next() else { return false };
+    first.origin.is_finite() && first.x.is_finite() && first.y.is_finite() && planes.all(|plane| plane == Some(first))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFaceTarget {
@@ -98,6 +104,20 @@ pub fn validate_styles_json(value: &Value) -> Result<()> {
 }
 
 impl Document {
+    pub(crate) fn flat_certificate_producer_matches(&self, producer: u64, certificate: &super::FaceCertificate) -> bool {
+        use super::FaceCertificate;
+        let Some(feature) = self.feature(producer) else { return false };
+        match (certificate, &feature.kind) {
+            (FaceCertificate::Box { .. }, FeatureKind::Box { operation: crate::Operation::NewBody, .. }) => true,
+            (FaceCertificate::ExtrudeCap { sketch, .. }, FeatureKind::Extrude { sketch: current, extent, operation: crate::Operation::NewBody, .. }) => sketch == current && extent.taper.is_none(),
+            (FaceCertificate::ExtrudeSide { sketch, curve }, FeatureKind::Extrude { sketch: current, extent, operation: crate::Operation::NewBody, .. }) => {
+                sketch == current && extent.taper.is_none()
+                    && self.feature(*sketch).is_some_and(|feature| matches!(&feature.kind, FeatureKind::Sketch { sketch, .. } if sketch.curves.iter().any(|candidate| candidate.id == *curve && !candidate.construction && matches!(candidate.kind, solvecraft_sketch::CurveKind::Line { .. } | solvecraft_sketch::CurveKind::Circle { .. } | solvecraft_sketch::CurveKind::Arc { .. }))))
+            }
+            (FaceCertificate::Imported { .. }, FeatureKind::Import { .. }) => true,
+            _ => false,
+        }
+    }
     /// Certify named generator lineage; generic index-derived naming is unsupported.
     pub fn certify_config_face(&self, target: &ConfigFaceTarget) -> Result<()> {
         target.validate()?;
@@ -121,6 +141,11 @@ impl Document {
                         && self.feature(*sketch).is_some_and(|feature| matches!(&feature.kind, FeatureKind::Sketch { sketch, .. } if sketch.curves.iter().any(|candidate| candidate.id == *curve && !candidate.construction && matches!(candidate.kind, solvecraft_sketch::CurveKind::Line { .. } | solvecraft_sketch::CurveKind::Circle { .. } | solvecraft_sketch::CurveKind::Arc { .. }))))
                 }
                 (super::FaceCertificate::Imported { .. }, FeatureKind::Import { .. }) => role.strip_prefix("face:").is_some_and(|index| index.parse::<usize>().is_ok()),
+                (super::FaceCertificate::ShellPlanar { source_producer, source, inner }, FeatureKind::Shell { .. }) => {
+                    *source_producer != target.origin_feature
+                        && self.flat_certificate_producer_matches(*source_producer, source)
+                        && super::shell_certificate_role(source, *inner).is_ok_and(|expected| role == expected)
+                }
                 _ => false,
             };
             return if valid { Ok(()) } else { Err(DocError::Invalid("face certificate no longer matches its producer".into())) };
@@ -155,6 +180,17 @@ impl Document {
         self.certify_config_face(target)?;
         if body.body.is_mesh() || body.definition_name() != target.body {
             return Err(DocError::Invalid("configured face definition does not match".into()));
+        }
+        if let Some(super::FaceCertificate::ShellPlanar { source_producer, source, inner }) = &target.certificate {
+            let indices: Vec<_> = body.body.face_sources().into_iter().flatten().enumerate().filter_map(|(index, current)| {
+                matches!(current, Some(solvecraft_kernel::FaceSource::ShellPlanar { producer: Some(producer), source: current_source, inner: current_inner, .. }) if *producer == target.origin_feature && inner == current_inner && super::flat_source_matches(source, current_source, *source_producer)).then_some(index)
+            }).collect();
+            // A shell can split one original support into several pieces. All pieces
+            // must retain the same canonical frame, not merely lie on a common plane.
+            if !shell_plane_family(indices.iter().map(|index| body.body.face_plane(*index))) {
+                return Err(DocError::Unknown("shell planar face certificate is missing or ambiguous".into()));
+            }
+            return Ok(indices);
         }
         if matches!(target.certificate, Some(super::FaceCertificate::Box { .. } | super::FaceCertificate::ExtrudeCap { .. })) {
             let indices: Vec<_> = body

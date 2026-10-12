@@ -202,7 +202,7 @@ pub fn export_mesh(b: &solvecraft_kernel::Body) -> Result<Mesh> {
 pub fn stl_binary(meshes: &[Mesh], name: &str) -> Vec<u8> {
     let n: usize = meshes.iter().map(|m| m.triangles.len()).sum();
     let mut out = Vec::with_capacity(84 + n * 50);
-    let mut header = format!("SolveCraft STL {name}").into_bytes();
+    let mut header = format!("SolidCraft STL {name}").into_bytes();
     header.resize(80, b' ');
     out.extend_from_slice(&header);
     out.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_le_bytes());
@@ -242,7 +242,7 @@ pub fn stl_ascii(meshes: &[Mesh], name: &str) -> String {
 
 /// Wavefront OBJ, one object per body.
 pub fn obj(meshes: &[(String, Mesh)]) -> String {
-    let mut s = String::from("# SolveCraft OBJ export (mm)\n");
+    let mut s = String::from("# SolidCraft OBJ export (mm)\n");
     let mut base = 1usize;
     for (name, m) in meshes {
         s += &format!("o {}\n", name.replace(char::is_whitespace, "_"));

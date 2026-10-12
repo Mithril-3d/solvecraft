@@ -12,7 +12,7 @@ pub const REL_TOL: f64 = 1e-3;
 const APPROXIMATE: [(&str, f64, &str); 1] = [(
     "49-helical-sweep",
     5e-3,
-    "Fusion sweeps along a spline fitted through helix points; SolveCraft builds the true helix (a coil), so the size is compared within 0.5% and the topology not at all",
+    "Fusion sweeps along a spline fitted through helix points; SolidCraft builds the true helix (a coil), so the size is compared within 0.5% and the topology not at all",
 )];
 
 fn check_case(dir: &str) -> Value {
@@ -77,7 +77,7 @@ fn check_case(dir: &str) -> Value {
                     })
                     .collect();
                 seam_note = Some(format!(
-                    "topology compared seam-normalised: Fusion's {}/{}/{} faces/edges/vertices become {f}/{e}/{v} with closed-surface patches counted once and seam edges and vertices dropped (raw SolveCraft/Fusion: {})",
+                    "topology compared seam-normalised: Fusion's {}/{}/{} faces/edges/vertices become {f}/{e}/{v} with closed-surface patches counted once and seam edges and vertices dropped (raw SolidCraft/Fusion: {})",
                     want["total"]["faces"],
                     want["total"]["edges"],
                     want["total"]["vertices"],
@@ -120,7 +120,7 @@ fn check_case(dir: &str) -> Value {
         .collect();
     if !effective.is_empty() {
         out["note"] = json!(format!(
-            "known Fusion difference: {} replayed with the extent Fusion actually used (its through-all is sized as 1.1 × the farthest vertex, so curved tops stop it short; SolveCraft's through-all goes truly through)",
+            "known Fusion difference: {} replayed with the extent Fusion actually used (its through-all is sized as 1.1 × the farthest vertex, so curved tops stop it short; SolidCraft's through-all goes truly through)",
             effective.join(", ")
         ));
     }

@@ -222,3 +222,82 @@ fn shortcut_clearance_refuses_curved_contact_hidden_between_mesh_vertices() {
     let invalid = joined_shells(outer.deep_copy().boundaries().iter().chain(protruding.boundaries()).cloned().collect());
     assert!(invalid.separated_lumps().is_err());
 }
+
+fn certified_lump_witness() -> Body {
+    use solvecraft_geom::{Loop2, Plane, Region2, Vec2};
+    // The current trimmed lower prism: a rectangular tool with a circular stop
+    // removed. Its cap footprint differs materially from the original sketch.
+    let region = Region2 {
+        outer: Loop2::polygon(&[Vec2::new(20., 20.), Vec2::new(30., 20.), Vec2::new(30., 30.), Vec2::new(20., 30.)]),
+        holes: vec![Loop2::circle(Vec2::new(25., 25.), 2.)],
+    };
+    let lower = crate::extrude(&Plane::XY, &[region], 0., 1.).unwrap().pop().unwrap();
+    let named = box_solid(Vec3::new(40., 20., 5.), Vec3::new(42., 23., 7.)).unwrap().with_box_certificate(202).unwrap();
+    let unknown = box_solid(Vec3::new(50., 20., 5.), Vec3::new(51., 21., 6.)).unwrap().with_face_sources(None);
+    let sources: std::collections::HashMap<_, _> = [&lower, &named]
+        .into_iter()
+        .flat_map(|body| body.solid.face_iter().zip(body.face_sources().unwrap()).map(|(face, source)| (face.id(), source.clone())))
+        .collect();
+    // Deliberately put the larger named box first, then the trimmed tool. An
+    // index-based copy of the source table would attach certificates wrongly.
+    let shells = [&named, &unknown, &lower].into_iter().flat_map(|b| b.solid.boundaries().iter().cloned()).collect();
+    let body = Body::new(Solid::try_new(shells).unwrap()).unwrap();
+    let table = body.solid.face_iter().map(|f| sources.get(&f.id()).cloned().flatten()).collect();
+    body.with_face_sources(Some(std::sync::Arc::new(table)))
+}
+
+#[test]
+fn grouping_lumps_preserves_only_unchanged_face_certificates_and_trimmed_caps() {
+    let body = certified_lump_witness();
+    let expected: std::collections::HashMap<_, _> =
+        body.solid.face_iter().zip(body.face_sources().unwrap()).map(|(f, source)| (f.id(), (f.orientation(), source.clone()))).collect();
+    let before = step_export(&[&body], "source").unwrap();
+    let lumps = body.lumps().unwrap();
+    assert_eq!(lumps.len(), 3);
+    let mut total_faces = 0;
+    let mut raw_caps = 0;
+    let mut named_faces = 0;
+    let mut unknown_faces = 0;
+    for lump in &lumps {
+        assert_eq!(lump.face_sources().unwrap().len(), lump.face_count());
+        for (f, source) in lump.solid.face_iter().zip(lump.face_sources().unwrap()) {
+            let (orientation, original) = expected.get(&f.id()).expect("grouping must retain original face IDs");
+            assert_eq!(*orientation, f.orientation());
+            assert_eq!(source, original);
+            match source {
+                Some(FaceSource::ExtrudeCap { region, high, plane }) => {
+                    assert_eq!(region.holes.len(), 1);
+                    assert!((region.area() - (100. - 4. * std::f64::consts::PI)).abs() < 1e-10);
+                    assert!((plane.origin.z - if *high { 1. } else { 0. }).abs() < 1e-10);
+                    raw_caps += 1;
+                }
+                Some(FaceSource::Box { producer, .. }) => {
+                    assert_eq!(*producer, Some(202));
+                    named_faces += 1;
+                }
+                None => unknown_faces += 1,
+                _ => {}
+            }
+            total_faces += 1;
+        }
+        let mesh = lump.tessellate(1e-5).unwrap();
+        if mesh.contains(Vec3::new(21., 21., 0.5)) {
+            assert!(!mesh.contains(Vec3::new(25., 25., 0.5)), "trimmed stop hole must not refill");
+            assert!((mesh.measure().volume - (100. - 4. * std::f64::consts::PI)).abs() < 0.002);
+        }
+    }
+    assert_eq!(total_faces, body.face_count());
+    assert_eq!(raw_caps, 2);
+    assert_eq!(named_faces, 6);
+    assert_eq!(unknown_faces, 6);
+    assert_eq!(step_export(&[&body], "source").unwrap(), before);
+}
+
+#[test]
+fn grouping_lumps_does_not_infer_absent_or_misaligned_sources() {
+    let body = certified_lump_witness();
+    let absent = body.clone().with_face_sources(None);
+    assert!(absent.lumps().unwrap().iter().all(|b| b.face_sources().is_none()));
+    let malformed = body.with_face_sources(Some(std::sync::Arc::new(vec![None])));
+    assert!(malformed.lumps().unwrap_err().to_string().contains("face source table"));
+}

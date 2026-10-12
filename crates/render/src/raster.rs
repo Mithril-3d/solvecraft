@@ -43,7 +43,12 @@ pub struct Scene {
     /// A section cut: (normal, d); what lies where normal·p > d is cut away, and the inside
     /// shows as a hatched cap.
     pub clip: Option<(Vec3, f64)>,
+    /// The colour the section cap is tinted toward (default: [`SECTION_CAP`]).
+    pub cap: Option<Rgb>,
 }
+
+/// The section cap's default tint, as in the viewport.
+pub const SECTION_CAP: Rgb = Rgb(214, 128, 72);
 
 /// RGBA pixels plus depth.
 pub struct Canvas {
@@ -105,16 +110,28 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
         Some([(q[0] / q[3] + 1.0) * 0.5 * sw as f64, (1.0 - q[1] / q[3]) * 0.5 * sh as f64, q[2] / q[3]])
     };
     let view_dir = cam.back();
+    // Where the section cap is the visible surface: the depth of the section plane on that
+    // pixel's view ray. Written into the depth buffer once the solids are drawn, so the cut face
+    // hides edges inside the body (holes, far corners) instead of showing them like a pane of
+    // glass, while holes through the cut stay open (as the viewport does with its stencil).
+    let cap_z = scene.clip.and_then(|(n, d)| cap_plane(cam, n, d, scene.radius.max(1.0), &project));
+    let mut cap_depth = if cap_z.is_some() { vec![f32::INFINITY; sw * sh] } else { Vec::new() };
+    let cap_tint = scene.cap.unwrap_or(SECTION_CAP).f();
     for sm in &scene.meshes {
         let m = &sm.mesh;
         let body = sm.color.f();
         let pts: Vec<Option<[f64; 3]>> = m.positions.iter().map(|p| project(*p)).collect();
+        // 1 / clip w per vertex, for perspective-correct interpolation of world positions (so
+        // the section cuts along the plane, not a curve, in perspective views).
+        let inv_w: Vec<f64> = m.positions.iter().map(|p| 1.0 / vp.apply(*p)[3].max(1e-9)).collect();
         for (ti, t) in m.triangles.iter().enumerate() {
             let face = m.tri_face.get(ti).copied();
             let base = sm.face_colors.iter().find(|(f, _)| Some(*f) == face).map_or(body, |(_, c)| c.f());
             let wp = t.map(|k| m.positions.get(k as usize).copied().unwrap_or_default());
             // Seen from inside (only where a section cuts the body open).
-            let inside = (wp[1] - wp[0]).cross(wp[2] - wp[0]).dot(view_dir) < 0.0;
+            let to_eye = if cam.fov > 0.0 { cam.eye() - wp[0] } else { view_dir };
+            let inside = (wp[1] - wp[0]).cross(wp[2] - wp[0]).dot(to_eye) < 0.0;
+            let iw = t.map(|k| inv_w.get(k as usize).copied().unwrap_or(1.0));
             let (Some(Some(a)), Some(Some(b)), Some(Some(cc))) = (pts.get(t[0] as usize), pts.get(t[1] as usize), pts.get(t[2] as usize)) else {
                 continue;
             };
@@ -140,8 +157,11 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
                     if w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9 {
                         continue;
                     }
+                    let (q0, q1, q2) = (w0 * iw[0], w1 * iw[1], w2 * iw[2]);
+                    let qs = q0 + q1 + q2;
+                    let (p0, p1, p2) = if qs > 1e-12 { (q0 / qs, q1 / qs, q2 / qs) } else { (w0, w1, w2) };
                     if let Some((cn, cd)) = scene.clip
-                        && cn.dot(wp[0] * w0 + wp[1] * w1 + wp[2] * w2) > cd
+                        && cn.dot(wp[0] * p0 + wp[1] * p1 + wp[2] * p2) > cd
                     {
                         continue;
                     }
@@ -151,11 +171,20 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
                         if let Some(d) = c.depth.get_mut(i) {
                             *d = z;
                         }
-                        let n = (ns[0] * w0 + ns[1] * w1 + ns[2] * w2).normalized().unwrap_or(Vec3::Z);
-                        if scene.clip.is_some() && inside {
-                            // The cut: the body's colour, hatched at 45 degrees.
-                            let k = if ((x + y) / SS) % 9 < 2 { 0.5 } else { 0.8 };
-                            c.put(x, y, base.map(|v| v * k), 1.0);
+                        let n = (ns[0] * p0 + ns[1] * p1 + ns[2] * p2).normalized().unwrap_or(Vec3::Z);
+                        let cut = scene.clip.is_some() && inside;
+                        if let Some(d) = cap_depth.get_mut(i) {
+                            *d = match cap_z {
+                                Some([a, b, k]) if cut => ((a * px + b * py + k) as f32).min(z),
+                                _ => f32::INFINITY,
+                            };
+                        }
+                        if cut {
+                            // The cut: the body's colour tinted toward the cap colour, hatched
+                            // at 45 degrees (as the viewport draws it).
+                            let tinted: [f64; 3] = std::array::from_fn(|k| base[k] + (cap_tint[k] - base[k]) * 0.35);
+                            let k = if ((x + y) / SS) % 9 < 2 { 0.6 } else { 1.0 };
+                            c.put(x, y, tinted.map(|v| v * k), 1.0);
                             continue;
                         }
                         let mut col = shade(n, view_dir, base);
@@ -172,21 +201,24 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
             }
         }
     }
+    for (d, cz) in c.depth.iter_mut().zip(&cap_depth) {
+        if cz.is_finite() {
+            *d = *cz;
+        }
+    }
     for l in &scene.lines {
         let col = l.color.f();
         let half = (l.width * SS as f64 * 0.5).max(0.5);
         for seg in l.points.windows(2) {
-            let (Some(p), Some(q)) = (seg.first(), seg.get(1)) else { continue };
-            let (Some(a), Some(b)) = (project(*p), project(*q)) else { continue };
+            let (Some(&p), Some(&q)) = (seg.first(), seg.get(1)) else { continue };
+            // The section cuts the segment in 3D (screen space is not linear in depth in
+            // perspective views).
+            let Some((p, q)) = clip_segment(p, q, scene.clip) else { continue };
+            let (Some(a), Some(b)) = (project(p), project(q)) else { continue };
             let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
             let steps = (len.ceil() as usize).clamp(1, 20_000);
             for k in 0..=steps {
                 let t = k as f64 / steps as f64;
-                if let Some((cn, cd)) = scene.clip
-                    && cn.dot(*p + (*q - *p) * t) > cd + 1e-6
-                {
-                    continue;
-                }
                 let (x, y, z) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t);
                 let r = half.ceil() as i64;
                 for dy in -r..=r {
@@ -234,6 +266,39 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
     out
 }
 
+/// The part of segment `p`–`q` the section keeps (where normal·x <= d).
+fn clip_segment(p: Vec3, q: Vec3, clip: Option<(Vec3, f64)>) -> Option<(Vec3, Vec3)> {
+    let Some((n, d)) = clip else { return Some((p, q)) };
+    let (dp, dq) = (n.dot(p) - d - 1e-6, n.dot(q) - d - 1e-6);
+    match (dp > 0.0, dq > 0.0) {
+        (true, true) => None,
+        (false, false) => Some((p, q)),
+        (true, false) => Some((p + (q - p) * (dp / (dp - dq)), q)),
+        (false, true) => Some((p, p + (q - p) * (dp / (dp - dq)))),
+    }
+}
+
+/// Screen depth of the section plane `n·p = d` as `z = a·x + b·y + k` in canvas pixels (a plane
+/// stays a plane under projection), set a hair behind the plane so the cut's own outline stays
+/// drawn. None when the plane is seen edge-on or lies behind the eye.
+fn cap_plane(cam: &Camera, n: Vec3, d: f64, radius: f64, project: &dyn Fn(Vec3) -> Option<[f64; 3]>) -> Option<[f64; 3]> {
+    let margin = 1e-3 * (1.0 + radius);
+    let o = cam.target - n * (n.dot(cam.target) - d - margin);
+    let (u, v) = (n.any_perp(), n.cross(n.any_perp()));
+    let s = radius * 0.1;
+    let (p0, p1, p2) = (project(o)?, project(o + u * s)?, project(o + v * s)?);
+    let (ax, ay, az) = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+    let (bx, by, bz) = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]);
+    let det = ax * by - ay * bx;
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let a = (az * by - ay * bz) / det;
+    let b = (ax * bz - az * bx) / det;
+    let k = p0[2] - a * p0[0] - b * p0[1];
+    [a, b, k].iter().all(|x| x.is_finite()).then_some([a, b, k])
+}
+
 /// Render to PNG bytes.
 pub fn render_png(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Option<Vec<u8>> {
     let c = render(scene, cam, w, h);
@@ -274,6 +339,17 @@ mod tests {
     use super::*;
     use crate::StandardView;
 
+    /// Lines are cut by the section in 3D: the kept piece ends on the plane.
+    #[test]
+    fn section_clips_lines_at_the_plane() {
+        let clip = Some((Vec3::X, 2.0));
+        let (p, q) = clip_segment(Vec3::ZERO, Vec3::new(10.0, 4.0, 0.0), clip).unwrap();
+        assert_eq!(p, Vec3::ZERO);
+        assert!((q.x - 2.0).abs() < 1e-5 && (q.y - 0.8).abs() < 1e-5, "{q:?}");
+        assert!(clip_segment(Vec3::new(3.0, 0.0, 0.0), Vec3::new(5.0, 0.0, 0.0), clip).is_none());
+        assert!(clip_segment(Vec3::new(3.0, 0.0, 0.0), Vec3::new(5.0, 0.0, 0.0), None).is_some());
+    }
+
     #[test]
     fn renders_a_triangle() {
         let mesh = Mesh {
@@ -283,6 +359,8 @@ mod tests {
             tri_face: vec![0],
             edges: vec![],
             seams: vec![],
+            smooth_edges: vec![],
+            sharp_edges: vec![],
             edge_faces: vec![],
         };
         let scene = Scene {
@@ -291,6 +369,7 @@ mod tests {
             background: None,
             radius: 20.0,
             clip: None,
+            cap: None,
         };
         let mut cam = Camera { distance: 50.0, ..Default::default() };
         cam.set_view(StandardView::Front);

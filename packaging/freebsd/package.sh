@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and package SolveCraft for FreeBSD:
+# Build and package SolidCraft for FreeBSD:
 #
 #   $DIST/solvecraft-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
 #       solvecraft-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
@@ -32,7 +32,7 @@ case "$(uname -m)" in
   *) echo "unsupported architecture $(uname -m)" >&2; exit 2 ;;
 esac
 BASENAME="solvecraft-$VERSION-freebsd-$ARCH"
-echo "==> SolveCraft $VERSION for FreeBSD $ARCH"
+echo "==> SolidCraft $VERSION for FreeBSD $ARCH"
 
 # The release VM has 12 GB; full parallelism on the biggest crates runs it out of memory.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"

@@ -10,83 +10,81 @@ use super::{CommandSpec, in_sketch};
 use crate::params::{bad, num, req_vec2, str_, string_list};
 use crate::{Result, Session};
 
-pub static COMMANDS: &[CommandSpec] =
-    &[
-        CommandSpec::new("sketch.line.midpoint", "Midpoint Line", midpoint_line)
-            .at("SKETCH", "CREATE")
-            .icon("line_mid")
-            .enabled(in_sketch)
-            .params("mid: [x,y] or point ref, end: [x,y]; construction?"),
-        CommandSpec::new("sketch.arc.tangent", "Tangent Arc", arc_tangent).at("SKETCH", "CREATE").icon("arc_tangent").enabled(in_sketch).params(
-            "start: end point of a line or arc (\"l1.end\"), end: [x,y]; curve?: the curve to be tangent to (default: the one ending at start)",
-        ),
-        CommandSpec::new("sketch.circle.two_tangent", "2-Tangent Circle", circle_tan_tan)
-            .at("SKETCH", "CREATE")
-            .icon("circle_tt")
-            .enabled(in_sketch)
-            .params("curves: [two lines/circles/arcs], radius | diameter: expr, near: [x,y] (which of the solutions)"),
-        CommandSpec::new("sketch.circle.three_tangent", "3-Tangent Circle", circle_three_tan)
-            .at("SKETCH", "CREATE")
-            .icon("circle_ttt")
-            .enabled(in_sketch)
-            .params("curves: [three lines/circles/arcs], near: [x,y] (which of the solutions)"),
-        CommandSpec::new("sketch.slot.center_point", "Center Point Slot", slot_center_point)
-            .at("SKETCH", "CREATE")
-            .icon("slot")
-            .enabled(in_sketch)
-            .params("center: slot centre, end: one arc centre, width"),
-        CommandSpec::new("sketch.slot.arc_three_point", "Three Point Arc Slot", arc_slot_three)
-            .at("SKETCH", "CREATE")
-            .icon("arc_slot")
-            .enabled(in_sketch)
-            .params("start, through, end: points on the centre arc, width"),
-        CommandSpec::new("sketch.slot.arc_center", "Center Point Arc Slot", arc_slot_center)
-            .at("SKETCH", "CREATE")
-            .icon("arc_slot")
-            .enabled(in_sketch)
-            .params("center, start: centre arc start, end: direction of the centre arc end (counter-clockwise), width"),
-        CommandSpec::new("sketch.ellipse", "Ellipse", ellipse)
-            .at("SKETCH", "CREATE")
-            .icon("ellipse")
-            .enabled(in_sketch)
-            .params("center, major: end of the major axis [x,y], minor: a point the ellipse passes through on the minor side [x,y] | minor_radius"),
-        CommandSpec::new("sketch.spline.fit_point", "Fit Point Spline", spline_fit)
-            .at("SKETCH", "CREATE")
-            .icon("spline")
-            .enabled(in_sketch)
-            .params("points: [[x,y] or point refs…] (2…500), periodic?: boolean (default false); periodic cubic fit closes smoothly through at least 3 distinct samples"),
-        CommandSpec::new("sketch.spline.control_point", "Control Point Spline", spline_cv3)
-            .at("SKETCH", "CREATE")
-            .icon("spline_cv")
-            .enabled(in_sketch)
-            .params("points: control points (2…500), cubic"),
-        CommandSpec::new("sketch.spline.control_point_5", "Control Point Spline (Degree 5)", spline_cv5)
-            .at("SKETCH", "CREATE")
-            .icon("spline_cv")
-            .enabled(in_sketch)
-            .params("points: control points (2…500), degree 5"),
-        CommandSpec::new("sketch.conic", "Conic Curve", conic)
-            .at("SKETCH", "CREATE")
-            .icon("conic")
-            .enabled(in_sketch)
-            .params("start, end, apex: [x,y] or point refs; rho?: 0…1 (default 0.5: parabola)"),
-        CommandSpec::new("sketch.blend_curve", "Blend Curve", blend)
-            .at("SKETCH", "MODIFY")
-            .icon("blend")
-            .enabled(in_sketch)
-            .params("a, b: end points of two curves (\"l1.end\", \"a2.start\"): a smooth (tangent) spline joining them"),
-        CommandSpec::new("sketch.centerline", "Centerline", centerline)
-            .enabled(in_sketch)
-            .params("curves: [line ids], value?: bool (default toggles): centerline line type (not in profiles; an axis)"),
-        CommandSpec::new("sketch.text", "Text", text)
-            .at("SKETCH", "CREATE")
-            .icon("text")
-            .enabled(in_sketch)
-            .params("text: string (\\n breaks lines), at: baseline start [x,y], height?: capital height mm (default 5), angle?: deg"),
-        CommandSpec::new("sketch.edit_text", "Edit Text", edit_text)
-            .enabled(in_sketch)
-            .params("link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg"),
-    ];
+pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("sketch.line.midpoint", "Midpoint Line", midpoint_line)
+        .at("SKETCH", "CREATE")
+        .icon("line_mid")
+        .enabled(in_sketch)
+        .params(concat!("mid: [x,y] or point ref, end: [x,y]; construction?", created_doc!())),
+    CommandSpec::new("sketch.arc.tangent", "Tangent Arc", arc_tangent).at("SKETCH", "CREATE").icon("arc_tangent").enabled(in_sketch).params(concat!(
+        "start: end point of a line or arc (\"l1.end\"), end: [x,y]; curve?: the curve to be tangent to (default: the one ending at start)",
+        created_doc!()
+    )),
+    CommandSpec::new("sketch.circle.two_tangent", "2-Tangent Circle", circle_tan_tan)
+        .at("SKETCH", "CREATE")
+        .icon("circle_tt")
+        .enabled(in_sketch)
+        .params(concat!("curves: [two lines/circles/arcs], radius | diameter: expr, near: [x,y] (which of the solutions)", created_doc!())),
+    CommandSpec::new("sketch.circle.three_tangent", "3-Tangent Circle", circle_three_tan)
+        .at("SKETCH", "CREATE")
+        .icon("circle_ttt")
+        .enabled(in_sketch)
+        .params(concat!("curves: [three lines/circles/arcs], near: [x,y] (which of the solutions)", created_doc!())),
+    CommandSpec::new("sketch.slot.center_point", "Center Point Slot", slot_center_point)
+        .at("SKETCH", "CREATE")
+        .icon("slot")
+        .enabled(in_sketch)
+        .params(concat!("center: slot centre, end: one arc centre, width", created_doc!())),
+    CommandSpec::new("sketch.slot.arc_three_point", "Three Point Arc Slot", arc_slot_three)
+        .at("SKETCH", "CREATE")
+        .icon("arc_slot")
+        .enabled(in_sketch)
+        .params(concat!("start, through, end: points on the centre arc, width", created_doc!())),
+    CommandSpec::new("sketch.slot.arc_center", "Center Point Arc Slot", arc_slot_center)
+        .at("SKETCH", "CREATE")
+        .icon("arc_slot")
+        .enabled(in_sketch)
+        .params(concat!("center, start: centre arc start, end: direction of the centre arc end (counter-clockwise), width", created_doc!())),
+    CommandSpec::new("sketch.ellipse", "Ellipse", ellipse).at("SKETCH", "CREATE").icon("ellipse").enabled(in_sketch).params(concat!(
+        "center, major: end of the major axis [x,y], minor: a point the ellipse passes through on the minor side [x,y] | minor_radius",
+        created_doc!()
+    )),
+    CommandSpec::new("sketch.spline.fit_point", "Fit Point Spline", spline_fit)
+        .at("SKETCH", "CREATE")
+        .icon("spline")
+        .enabled(in_sketch)
+        .params(concat!("points: [[x,y] or point refs…] (2…500): the spline passes through them, periodic?: boolean (default false); periodic cubic fit closes smoothly through at least 3 distinct samples", created_doc!())),
+    CommandSpec::new("sketch.spline.control_point", "Control Point Spline", spline_cv3)
+        .at("SKETCH", "CREATE")
+        .icon("spline_cv")
+        .enabled(in_sketch)
+        .params(concat!("points: control points (2…500), cubic", created_doc!())),
+    CommandSpec::new("sketch.spline.control_point_5", "Control Point Spline (Degree 5)", spline_cv5)
+        .at("SKETCH", "CREATE")
+        .icon("spline_cv")
+        .enabled(in_sketch)
+        .params(concat!("points: control points (2…500), degree 5", created_doc!())),
+    CommandSpec::new("sketch.conic", "Conic Curve", conic)
+        .at("SKETCH", "CREATE")
+        .icon("conic")
+        .enabled(in_sketch)
+        .params(concat!("start, end, apex: [x,y] or point refs; rho?: 0…1 (default 0.5: parabola)", created_doc!())),
+    CommandSpec::new("sketch.blend_curve", "Blend Curve", blend)
+        .at("SKETCH", "MODIFY")
+        .icon("blend")
+        .enabled(in_sketch)
+        .params(concat!("a, b: end points of two curves (\"l1.end\", \"a2.start\"): a smooth (tangent) spline joining them", created_doc!())),
+    CommandSpec::new("sketch.centerline", "Centerline", centerline)
+        .enabled(in_sketch)
+        .params("curves: [line ids], value?: bool (default toggles): centerline line type (not in profiles; an axis)"),
+    CommandSpec::new("sketch.text", "Text", text).at("SKETCH", "CREATE").icon("text").enabled(in_sketch).params(concat!(
+        "text: string (\\n breaks lines), at: baseline start [x,y], height?: capital height mm (default 5), angle?: deg",
+        created_doc!()
+    )),
+    CommandSpec::new("sketch.edit_text", "Edit Text", edit_text)
+        .enabled(in_sketch)
+        .params(concat!("link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg", created_doc!())),
+];
 
 fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64)>) -> Result<LinkSource> {
     let (t0, at0, h0, a0) = old.unwrap_or((String::new(), Vec2::ZERO, 5.0, 0.0));

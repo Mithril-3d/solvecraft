@@ -13,41 +13,47 @@ use super::{CommandSpec, in_sketch};
 use crate::params::{bad, bool_, str_, vec3};
 use crate::{EngineError, Result, Session};
 
+macro_rules! refs_doc {
+    () => {
+        "refs: [{edge: [x,y,z], body?} | {face: [x,y,z], body?} (its edge loops) | {body: name} (silhouette) | {vertex: [x,y,z], body?} | {sketch, curve} | {sketch, point} | \"origin\" | {axis: X|Y|Z} | {plane: XY|XZ|YZ|name}]"
+    };
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("sketch.project", "Project", project_cmd).at("SKETCH", "CREATE").icon("project").key("P").enabled(in_sketch).params(REFS_DOC),
+    CommandSpec::new("sketch.project", "Project", project_cmd).at("SKETCH", "CREATE").icon("project").key("P").enabled(in_sketch).params(concat!(refs_doc!(), created_doc!())),
     CommandSpec::new("sketch.intersect", "Intersect", intersect_cmd).at("SKETCH", "CREATE").icon("intersect").enabled(in_sketch).params(
-        "refs: [{body}, {face: [x,y,z], body?}, {edge: [x,y,z], body?}, {sketch, curve}]: section curves (or points) with the sketch plane, linked",
+        concat!("refs: [{body}, {face: [x,y,z], body?}, {edge: [x,y,z], body?}, {sketch, curve}]: section curves (or points) with the sketch plane, linked", created_doc!()),
     ),
     CommandSpec::new("sketch.include_3d", "Include 3D Geometry", include_cmd)
         .at("SKETCH", "CREATE")
         .icon("include")
         .enabled(in_sketch)
-        .params("refs: like Project (edges, vertices, sketch curves and points); curves out of the sketch plane are flattened onto it"),
+        .params(concat!("refs: like Project (edges, vertices, sketch curves and points); curves out of the sketch plane are flattened onto it", created_doc!())),
     CommandSpec::new("sketch.project_to_surface", "Project To Surface", project_to_surface)
         .at("SKETCH", "CREATE")
         .icon("project_surface")
         .enabled(in_sketch)
-        .params("curves: [{sketch, curve}…] (curves of other sketches), face: [x,y,z] point on the target face, body?: projected along the active sketch's normal onto the face, as linked 3D curves"),
+        .params(concat!("curves: [{sketch, curve}…] (curves of other sketches), face: [x,y,z] point on the target face, body?: projected along the active sketch's normal onto the face, as linked 3D curves", created_doc!())),
     CommandSpec::new("sketch.intersection_curve", "Intersection Curve", intersection_curve)
         .at("SKETCH", "CREATE")
         .icon("intersection_curve")
         .enabled(in_sketch)
-        .params("a, b: {body} | {face: [x,y,z], body?}: where they meet, as linked 3D curves"),
+        .params(concat!("a, b: {body} | {face: [x,y,z], body?}: where they meet, as linked 3D curves", created_doc!())),
     CommandSpec::new("sketch.spun_profile", "Spun Profile", spun_profile)
         .at("SKETCH", "CREATE")
         .icon("spun")
         .enabled(in_sketch)
-        .params("body: name, axis: a line of the active sketch (curve id) | X|Y|Z: the body's outline revolved about the axis, in the sketch plane"),
+        .params(concat!("body: name, axis: a line of the active sketch (curve id) | X|Y|Z: the body's outline revolved about the axis, in the sketch plane", created_doc!())),
     CommandSpec::new("sketch.isoparametric_curve", "Isoparametric Curve", iso_curve)
         .at("SKETCH", "CREATE")
         .icon("iso_curve")
         .enabled(in_sketch)
-        .params("face: [x,y,z] point on the face (the curve passes through it), body?, direction?: u|v|[x,y,z] (default u): linked 3D curve"),
+        .params(concat!("face: [x,y,z] point on the face (the curve passes through it), body?, direction?: u|v|[x,y,z] (default u): linked 3D curve", created_doc!())),
     CommandSpec::new("sketch.fit_curves_to_section", "Fit Curves to Mesh Section", fit_section)
         .at("SKETCH", "CREATE")
         .icon("fit_section")
         .enabled(in_sketch)
-        .params("body: name (a mesh or solid body): its section with the sketch plane, fitted with lines and arcs, as normal (unlinked) geometry"),
+        .params(concat!("body: name (a mesh or solid body): its section with the sketch plane, fitted with lines and arcs, as normal (unlinked) geometry", created_doc!())),
     CommandSpec::new("sketch.break_link", "Break Link", break_link)
         .enabled(in_sketch)
         .params("link?: link id (j1) | entities?: [curve or point ids]: linked geometry becomes normal sketch geometry"),
@@ -55,8 +61,6 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .params("value?: bool (default toggles): project a face's edges when a sketch is created on it"),
 ];
-
-const REFS_DOC: &str = "refs: [{edge: [x,y,z], body?} | {face: [x,y,z], body?} (its edge loops) | {body: name} (silhouette) | {vertex: [x,y,z], body?} | {sketch, curve} | {sketch, point} | \"origin\" | {axis: X|Y|Z} | {plane: XY|XZ|YZ|name}]";
 
 /// Parse one reference.
 fn source(s: &Session, v: &Value, cmd: &str) -> Result<LinkSource> {

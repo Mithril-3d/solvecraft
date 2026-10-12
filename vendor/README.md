@@ -61,3 +61,14 @@ Changes:
   move both bodies and the result back) hung the app.
 - `lib.rs`: compiler warnings no longer fail the build. Test targets are dropped (their sources
   are not vendored).
+
+## egui-wgpu 0.36.2 (MIT OR Apache-2.0, Emil Ernerfeldt and contributors)
+
+Original package sources from https://github.com/emilk/egui/tree/0.36.2/crates/egui-wgpu,
+with both original licence texts retained. No images or bundled documentation are copied.
+
+SolidCraft changes:
+- `src/lib.rs`: use 1x MSAA on the selected OpenGL adapter before creating pipelines,
+  exposing the effective sample count so host paint callbacks can match it.
+- `src/winit.rs`: use that same effective count for depth and resolve attachments.
+- Other backends retain requested MSAA, without another adapter or device probe.

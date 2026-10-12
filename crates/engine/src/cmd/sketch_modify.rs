@@ -4,6 +4,7 @@
 use std::f64::consts::TAU;
 
 use serde_json::{Value, json};
+use solvecraft_doc::ProfileSel;
 use solvecraft_geom::Vec2;
 use solvecraft_sketch::{ConstraintKind, Curve, CurveKind, Shape, Sketch, intersections};
 
@@ -20,28 +21,28 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "MODIFY")
         .icon("sketch_fillet")
         .enabled(in_sketch)
-        .params("point: corner shared by two curves (\"l1.end\") | points: [corners] (all rounded alike: one radius, the rest equal) | a, b: two lines or arcs meeting at a corner; radius: expr. A corner that dimensions or constraints measure to stays as a virtual sharp corner on both curves' extensions (`virtual_corners`; the moved ones in `moved_to_virtual_corner`)"),
+        .params(concat!("point: corner shared by two curves (\"l1.end\") | points: [corners] (all rounded alike: one radius, the rest equal) | a, b: two lines or arcs meeting at a corner; radius: expr. A corner that dimensions or constraints measure to stays as a virtual sharp corner on both curves' extensions (`virtual_corners`; the moved ones in `moved_to_virtual_corner`)", created_doc!())),
     CommandSpec::new("sketch.chamfer.equal_distance", "Equal Distance Chamfer", chamfer_equal)
         .at("SKETCH", "MODIFY")
         .icon("sketch_chamfer")
         .enabled(in_sketch)
-        .params("point | a, b: a corner of two lines; distance"),
+        .params(concat!("point | a, b: a corner of two lines; distance", created_doc!())),
     CommandSpec::new("sketch.chamfer.distance_angle", "Distance and Angle Chamfer", chamfer_dist_angle)
         .at("SKETCH", "MODIFY")
         .icon("sketch_chamfer")
         .enabled(in_sketch)
-        .params("point | a, b: a corner of two lines; distance: along a, angle: deg from a"),
+        .params(concat!("point | a, b: a corner of two lines; distance: along a, angle: deg from a", created_doc!())),
     CommandSpec::new("sketch.chamfer.two_distance", "Two Distance Chamfer", chamfer_two)
         .at("SKETCH", "MODIFY")
         .icon("sketch_chamfer")
         .enabled(in_sketch)
-        .params("point | a, b: a corner of two lines; distance: along a, distance2: along b"),
+        .params(concat!("point | a, b: a corner of two lines; distance: along a, distance2: along b", created_doc!())),
     CommandSpec::new("sketch.offset", "Offset", offset)
         .at("SKETCH", "MODIFY")
         .icon("offset")
         .key("O")
         .enabled(in_sketch)
-        .params("curves: [ids], distance: number (positive = left of the chain, or toward `side`), side?: [x,y], chain?: bool (default true: the connected chain)"),
+        .params(concat!("curves: [ids], distance: number (positive = left of the chain, or toward `side`), side?: [x,y], chain?: bool (default true: the connected chain)", created_doc!())),
     CommandSpec::new("sketch.offset.break", "Break Offset Association", break_offset)
         .enabled(in_sketch)
         .params("curve: derived offset curve id (retains geometry and makes its points editable)"),
@@ -50,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("trim")
         .key("T")
         .enabled(in_sketch)
-        .params("curve: id, at: [x,y] (the piece to remove: between the nearest intersections around it)"),
+        .params(concat!("curve: id, at: [x,y] (the piece to remove: between the nearest intersections around it)", created_doc!())),
     CommandSpec::new("sketch.extend", "Extend", extend)
         .at("SKETCH", "MODIFY")
         .icon("extend")
@@ -60,7 +61,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "MODIFY")
         .icon("break")
         .enabled(in_sketch)
-        .params("curve: id, at: [x,y] (split at intersections) | points: [[x,y]…] (1…1000 positions projected onto the curve; duplicates are merged)"),
+        .params(concat!("curve: id, at: [x,y] (split at intersections) | points: [[x,y]…] (1…1000 positions projected onto the curve; duplicates are merged)", created_doc!())),
     CommandSpec::new("sketch.scale", "Sketch Scale", scale)
         .at("SKETCH", "MODIFY")
         .icon("scale")
@@ -68,22 +69,22 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("entities: [curve/point ids], base: [x,y] or point ref, factor: number"),
     CommandSpec::new("sketch.move", "Move/Copy Sketch Entities", move_copy)
         .enabled(in_sketch)
-        .params("entities: [ids], translate?: [dx,dy], angle?: deg, center?: [x,y], copy?: bool"),
+        .params(concat!("entities: [ids], translate?: [dx,dy], angle?: deg, center?: [x,y], copy?: bool", created_doc!())),
     CommandSpec::new("sketch.mirror", "Mirror", mirror)
         .at("SKETCH", "CREATE")
         .icon("sketch_mirror")
         .enabled(in_sketch)
-        .params("entities: [curve/point ids], line: mirror line id (symmetry constraints are added)"),
+        .params(concat!("entities: [curve/point ids], line: mirror line id (symmetry constraints are added)", created_doc!())),
     CommandSpec::new("sketch.pattern.circular", "Circular Pattern", pattern_circular)
         .at("SKETCH", "CREATE")
         .icon("sketch_circ_pattern")
         .enabled(in_sketch)
-        .params("entities: [ids], center: [x,y] or point ref, count: 2…500, angle?: total deg (default 360)"),
+        .params(concat!("entities: [ids], center: [x,y] or point ref, count: 2…500, angle?: total deg (default 360)", created_doc!())),
     CommandSpec::new("sketch.pattern.rectangular", "Rectangular Pattern", pattern_rect)
         .at("SKETCH", "CREATE")
         .icon("sketch_rect_pattern")
         .enabled(in_sketch)
-        .params("entities: [ids], dir?: [x,y] (default x), count, spacing; count2?, spacing2? (perpendicular direction)"),
+        .params(concat!("entities: [ids], dir?: [x,y] (default x), count, spacing; count2?, spacing2? (perpendicular direction)", created_doc!())),
 ];
 
 const TOL: f64 = 1e-7;
@@ -95,7 +96,9 @@ fn curve_arg(sk: &Sketch, p: &Value, cmd: &str) -> Result<usize> {
     if sk.is_linked_curve(c) {
         return Err(bad(cmd, format!("`{id}` is projected geometry: break its link first")));
     }
-    if sk.freeform_offsets.iter().any(|offset| offset.output == id) {
+    if sk.freeform_offsets.iter().any(|offset| offset.output == id)
+        || sk.offsets.iter().filter_map(|offset| offset.topology.as_ref()).any(|topology| topology.roles.iter().any(|role| role.output == id))
+    {
         return Err(bad(cmd, "break the offset association before editing its output"));
     }
     Ok(c)
@@ -184,7 +187,7 @@ fn split_at(sk: &mut Sketch, ci: usize, ts: &[f64]) -> Result<(Vec<usize>, Vec<u
     }
     let mut pieces = vec![ci];
     let mut push = |sk: &mut Sketch, kind: CurveKind, prefix: &str| -> Result<()> {
-        let id = sk.fresh(prefix);
+        let id = sk.fresh(prefix)?;
         sk.curves.push(Curve { id, kind, construction, reversed: false, link: None, centerline: false, fixed: false });
         pieces.push(sk.curves.len() - 1);
         Ok(())
@@ -549,7 +552,7 @@ fn keep_corner(sk: &mut Sketch, c: usize, [(ca, na), (cb, nb)]: [(usize, usize);
     let virtual_corner = if used || c == 0 {
         None
     } else {
-        let id = sk.fresh("corner");
+        let id = sk.fresh("corner")?;
         if let Some(pt) = sk.points.get_mut(c) {
             pt.id = id.clone();
         }
@@ -934,6 +937,14 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
         sk.refresh_offsets()?;
         let sel: Vec<usize> = ids.iter().map(|i| sk.curve_index(i).ok_or_else(|| bad(cmd, format!("unknown curve `{i}`")))).collect::<Result<_>>()?;
         let first = *sel.first().ok_or_else(|| bad(cmd, "no curves"))?;
+        if sk.offsets.iter().filter_map(|offset| offset.topology.as_ref()).any(|topology| {
+            topology.roles.iter().any(|role| role.retired) && topology.roles.iter().any(|role| !role.retired && ids.contains(&role.output))
+        }) {
+            return Err(bad(
+                cmd,
+                "offsets of a boundary with retired corner arcs are not supported yet; break its offset association to use the current fixed topology",
+            ));
+        }
         let mut made = Vec::new();
         let mut cons = Vec::new();
         // Circles offset on their own.
@@ -954,8 +965,9 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
                 outputs: ids_of(sk, &made),
                 distance: r - nr,
                 closed: true,
+                topology: None,
             });
-            return Ok((ids_of(sk, &made), cons));
+            return Ok((ids_of(sk, &made), cons, None));
         }
         let pool: Vec<usize> = if use_chain {
             (0..sk.curves.len())
@@ -986,7 +998,31 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
             }
             let (source, forward) = order[0];
             let output = sk.add_freeform_offset(source, forward, d)?;
-            return Ok((ids_of(sk, &[output]), cons));
+            return Ok((ids_of(sk, &[output]), cons, None));
+        }
+        let sources = order
+            .iter()
+            .map(|(index, forward)| {
+                sk.curves.get(*index).map(|curve| (curve.id.clone(), *forward)).ok_or_else(|| bad(cmd, "offset chain source vanished"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if closed && sk.convex_offset_supported(&sources)? {
+            let created = sk.add_convex_offset(sources.clone(), d)?;
+            let roles = sk
+                .offsets
+                .iter()
+                .filter_map(|offset| offset.topology.as_ref())
+                .find(|topology| topology.id == created.association)
+                .map(|topology| topology.roles.clone())
+                .ok_or_else(|| bad(cmd, "new offset association is missing"))?;
+            for (source, role) in sources.iter().zip(&roles) {
+                if role.kind == solvecraft_sketch::OffsetRoleKind::Line {
+                    let a = sk.curve_index(&source.0).ok_or_else(|| bad(cmd, "offset source line vanished"))?;
+                    let b = sk.curve_index(&role.output).ok_or_else(|| bad(cmd, "offset output line vanished"))?;
+                    cons.push(add_c(sk, ConstraintKind::Parallel { a, b })?);
+                }
+            }
+            return Ok((created.curves, cons, Some(created.association)));
         }
         let pieces: Vec<Piece> =
             order.iter().map(|(c, f)| offset_piece(sk, *c, *f, d)).collect::<Option<_>>().ok_or_else(|| bad(cmd, "the offset collapses an arc"))?;
@@ -1072,23 +1108,32 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
         let outputs = ids_of(sk, &made);
         if pieces.iter().all(|p| !matches!(p, Piece::Free(_))) {
             let sources = order.iter().filter_map(|(i, forward)| sk.curves.get(*i).map(|c| (c.id.clone(), *forward))).collect();
-            sk.offsets.push(solvecraft_sketch::OffsetChain { sources, outputs: outputs.clone(), distance: d, closed });
+            sk.offsets.push(solvecraft_sketch::OffsetChain { sources, outputs: outputs.clone(), distance: d, closed, topology: None });
             sk.refresh_offsets()?;
         }
-        Ok((outputs, cons))
+        Ok((outputs, cons, None))
     })?;
-    Ok(json!({"curves": out.0, "constraints": out.1, "sketch": info}))
+    let mut response = json!({"curves":out.0,"constraints":out.1,"sketch":info});
+    if let Some(association) = out.2 {
+        response["association"] = json!(association);
+    }
+    Ok(response)
 }
 
 fn break_offset(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.offset.break";
+    let sketch = super::sketch::target_sketch(s, p, cmd)?;
     let (out, info) = edit(s, p, cmd, true, |sk, doc| {
         let output = str_(p, "curve").ok_or_else(|| bad(cmd, "`curve` must name an offset output"))?;
-        let record = sk
-            .freeform_offsets
+        let record = sk.freeform_offsets.iter().position(|record| record.output == output);
+        let topology = sk
+            .offsets
             .iter()
-            .position(|record| record.output == output)
-            .ok_or_else(|| bad(cmd, "that curve has no free-form offset association"))?;
+            .filter_map(|record| record.topology.as_ref())
+            .any(|record| record.id == output || record.roles.iter().any(|role| role.output == output));
+        if record.is_none() && !topology {
+            return Err(bad(cmd, "curve is not an offset output"));
+        }
         // A parameter edit may have changed the evaluated source without
         // rewriting the stored fit points. Break must freeze the displayed,
         // current dimensioned geometry, rather than its stale stored predecessor.
@@ -1102,6 +1147,19 @@ fn break_offset(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, "cannot break an offset with conflicting derived dimensions"));
         }
         sk.validate_periodic_splines()?;
+        if let Some(association) = sk
+            .offsets
+            .iter()
+            .filter_map(|record| record.topology.as_ref())
+            .find(|record| record.id == output || record.roles.iter().any(|role| role.output == output))
+            .map(|record| record.id.clone())
+        {
+            freeze_offset_profiles(doc, sketch, sk, &association)?;
+        }
+        if let Some(curves) = sk.break_offset_topology(output)? {
+            return Ok((output.to_string(), Some(curves)));
+        }
+        let record = record.ok_or_else(|| bad(cmd, "offset association changed while materializing its current geometry"))?;
         let ci = sk.curve_index(output).ok_or_else(|| bad(cmd, "missing offset output"))?;
         let indices = sk.curves[ci].kind.point_ids();
         sk.freeform_offsets.remove(record);
@@ -1110,9 +1168,74 @@ fn break_offset(s: &mut Session, p: &Value) -> Result<Value> {
                 point.fixed = false;
             }
         }
-        Ok(output.to_string())
+        Ok((output.to_string(), None))
     })?;
-    Ok(json!({"curve":out,"sketch":info}))
+    let mut response = json!({"curve":out.0,"sketch":info});
+    if let Some(curves) = out.1 {
+        response["curves"] = json!(curves);
+    }
+    Ok(response)
+}
+
+/// A broken logical boundary becomes ordinary geometry. Keep downstream features
+/// on that exact current boundary while other associations retain their full roles.
+fn freeze_offset_profiles(doc: &mut solvecraft_doc::Document, sketch: u64, boundary: &Sketch, association: &str) -> Result<()> {
+    let cmd = "sketch.offset.break";
+    let mut groups = std::collections::BTreeMap::new();
+    let mut work = 0usize;
+    for offset in &boundary.offsets {
+        let Some(topology) = &offset.topology else { continue };
+        work = work.saturating_add(topology.roles.len());
+        if groups.len() >= 128 || topology.roles.len() > 512 || work > 1_000_000 {
+            return Err(bad(cmd, "too many offset roles to freeze safely"));
+        }
+        let reserved = topology.roles.iter().map(|role| role.output.clone()).collect::<Vec<_>>();
+        if groups.insert(topology.id.clone(), (offset.outputs.clone(), reserved)).is_some() {
+            return Err(bad(cmd, "ambiguous offset association identity"));
+        }
+    }
+    let (active, reserved) = groups.get(association).ok_or_else(|| bad(cmd, "offset association disappeared before freezing"))?;
+    let mut reserved_sorted = reserved.clone();
+    reserved_sorted.sort();
+    for feature in &mut doc.features {
+        for (source, selection) in feature.kind.profile_sels_mut() {
+            if source != sketch {
+                continue;
+            }
+            match selection {
+                ProfileSel::OffsetBoundaries { associations } if associations.iter().any(|id| id == association) => {
+                    let mut loops = Vec::with_capacity(associations.len());
+                    for id in associations.iter() {
+                        let (current, all_roles) = groups.get(id).ok_or_else(|| bad(cmd, format!("cannot freeze missing offset boundary `{id}`")))?;
+                        let roles = if id == association { current } else { all_roles };
+                        work = work.saturating_add(roles.len());
+                        if work > 1_000_000 {
+                            return Err(bad(cmd, "too many downstream offset references to freeze safely"));
+                        }
+                        loops.push(roles.clone());
+                    }
+                    *selection = ProfileSel::Curves { loops };
+                }
+                ProfileSel::Curves { loops } => {
+                    for ids in loops {
+                        work = work.saturating_add(ids.len());
+                        if work > 1_000_000 {
+                            return Err(bad(cmd, "too many downstream curve references to freeze safely"));
+                        }
+                        if ids.len() == reserved_sorted.len() {
+                            let mut sorted = ids.clone();
+                            sorted.sort();
+                            if sorted == reserved_sorted {
+                                *ids = active.clone();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1199,7 +1322,7 @@ fn copy_through(
                 }
             }
         };
-        let id = sk.fresh(prefix);
+        let id = sk.fresh(prefix)?;
         sk.curves.push(Curve {
             id,
             kind,

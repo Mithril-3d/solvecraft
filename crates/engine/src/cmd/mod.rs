@@ -2,6 +2,13 @@
 //! `sketch.rectangle.two_point`); the toolbar placement (`tab`, `panel`) follows the familiar
 //! Design workspace layout. Ids used before the rename still resolve (`legacy_ids`).
 
+/// The params-doc note of every command that adds sketch geometry (see `sketch::created`).
+macro_rules! created_doc {
+    () => {
+        ". Returns created: {points, curves, constraints, dimensions}: the ids of what it added (stable and never reused: usable right away in sketch.dimension, sketch.constraint.*, sketch.delete…)"
+    };
+}
+
 mod browser;
 mod clipboard;
 mod component;
@@ -30,6 +37,7 @@ mod plastic;
 mod sheet;
 mod sketch;
 pub(crate) use sketch::author_path_for_rebind;
+pub(crate) use sketch::created as sketch_created;
 mod sketch_3d;
 mod sketch_canvas;
 mod sketch_constraints;
