@@ -304,6 +304,9 @@ headline counts in-scope tabs only and lists the deferred ones separately.
 
 ## Kernel
 
+- Boolean intersection-curve construction refuses point-only, collapsed and non-finite
+  polylines without panicking. Direct constructor regressions retain valid open endpoints
+  and closed spherical intersections; the original interactive trigger remains unidentified.
 - Shell of a stepped, joined planar body no longer creates horizontal subdivisions across
   continuous walls. Fresh axis-aligned Cut walls are stitched using their exact construction
   support and shared topology, preserving real steps and intentional boundaries. The local

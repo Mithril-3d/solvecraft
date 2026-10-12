@@ -3297,6 +3297,7 @@ dependencies = [
  "embed-resource",
  "hidapi",
  "log",
+ "quick-xml 0.38.4",
  "rfd",
  "serde_json",
  "solvecraft-engine",
