@@ -19,8 +19,9 @@ licensed MIT OR Apache-2.0; ATTRIBUTION.md lists the files.
 The release packaging (.github/workflows/release.yml, packaging/) is adapted from PhotoCraft
 (https://github.com/storytold/photocraft), licensed under the Apache License 2.0.
 
-None of the bundled assets come from third parties: every icon is drawn in code. The per-file
-list is in ATTRIBUTION.md.
+Most bundled assets are drawn in code or contributed originally; third-party fonts (Liberation Sans
+for sketch text, BIZ UDPGothic for web Japanese display) are licensed under SIL OFL 1.1. The
+per-file list is in ATTRIBUTION.md.
 
 SolveCraft is an independent project and is not affiliated with, sponsored by or endorsed by
 Autodesk, Inc. Autodesk and Fusion are trademarks of Autodesk, Inc.; they are used here only to
