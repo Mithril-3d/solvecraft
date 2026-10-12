@@ -49,7 +49,7 @@ jobs:
         run: cargo xtask book
       - name: Build the web app
         working-directory: apps/solidcraft-web
-        run: trunk build --release --public-url /solidcraft/app/
+        run: trunk build --release --public-url ./
       - name: Test the web app offline and across an update (headless Chrome)
         run: cargo xtask web-offline-test --site dist/web
       - name: Assemble the site
