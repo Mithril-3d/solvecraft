@@ -88,8 +88,7 @@ fn generate(root: &Path) -> Result<String, String> {
         });
     }
     crates.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
-    let _ = root;
-    Ok(render(&crates))
+    Ok(render(root, &crates))
 }
 
 /// The licence and notice files at the top of a crate's package (and its `license-file`).
@@ -117,7 +116,7 @@ fn licence_files(dir: &Path, p: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-fn render(crates: &[Crate]) -> String {
+fn render(root: &Path, crates: &[Crate]) -> String {
     let rule = "=".repeat(80);
     let mut out = format!(
         "Third-party software in SolveCraft\n\nSolveCraft (the desktop app, solvecraft-cli and the web app) is built from the {} crates below.\n\
@@ -158,6 +157,26 @@ fn render(crates: &[Crate]) -> String {
             );
         }
     }
+
+    // Bundled font licences (SIL Open Font License, Version 1.1)
+    let font_rule = "=".repeat(80);
+    out += &format!(
+        "\n{font_rule}\nBundled fonts (SIL Open Font License, Version 1.1)\n{font_rule}\n\n\
+         - LiberationSans-Regular.ttf (crates/sketch/fonts/LiberationSans-Regular.ttf)\n  \
+           Copyright 2012 Red Hat, Inc. (Liberation Fonts 2.x; digitized data Google)\n  \
+           Source: https://github.com/liberationfonts\n\n\
+         - BIZUDPGothic-Regular.ttf (apps/solvecraft-web/fonts/BIZUDPGothic-Regular.ttf)\n  \
+           Copyright 2022 The BIZ UDGothic Project Authors (https://github.com/googlefonts/morisawa-biz-ud-mincho)\n  \
+           Source: https://github.com/googlefonts/morisawa-biz-ud-gothic\n\n"
+    );
+    let ofl_path = root.join("apps/solvecraft-web/fonts/OFL.txt");
+    let fallback_path = root.join("crates/sketch/fonts/OFL.txt");
+    let ofl_text = std::fs::read_to_string(&ofl_path).or_else(|_| std::fs::read_to_string(&fallback_path)).unwrap_or_default();
+    let ofl_clean = ofl_text.replace("\r\n", "\n").trim().to_string();
+    if !ofl_clean.is_empty() {
+        out += &format!("{font_rule}\nSIL OPEN FONT LICENSE Version 1.1\n{font_rule}\n\n{ofl_clean}\n");
+    }
+
     out
 }
 

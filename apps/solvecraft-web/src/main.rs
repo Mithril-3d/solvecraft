@@ -46,6 +46,18 @@ mod web {
         on_unload.forget();
     }
 
+    const JAPANESE_FONT_PATH: &str = "./fonts/BIZUDPGothic-Regular.ttf";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FontStatus {
+        Unloaded,
+        Loading,
+        Installed,
+        Failed,
+    }
+
+    type FontLoadResult = Rc<std::cell::RefCell<Option<Result<Vec<u8>, String>>>>;
+
     struct Shell {
         app: SolveApp,
         files: Rc<Files>,
@@ -58,6 +70,8 @@ mod web {
         rename_focus: bool,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
+        font_status: FontStatus,
+        font_result: FontLoadResult,
     }
 
     impl Shell {
@@ -304,10 +318,59 @@ mod web {
             }
             files::autosave(&self.files, None);
         }
+
+        /// Check language preference and manage on-demand Japanese font loading.
+        fn tick_font(&mut self, ctx: &egui::Context) {
+            if self.font_status == FontStatus::Loading {
+                if let Some(res) = self.font_result.borrow_mut().take() {
+                    match res {
+                        Ok(bytes) => {
+                            if solvecraft_ui_egui::fonts::install_cjk_font(ctx, bytes) {
+                                log::info!("loaded web Japanese font from {JAPANESE_FONT_PATH}");
+                                self.font_status = FontStatus::Installed;
+                                ctx.request_repaint();
+                            } else {
+                                log::warn!("failed to install Japanese font: invalid font data; falling back to English");
+                                self.font_status = FontStatus::Failed;
+                                self.app.preferences.language = "en".to_string();
+                                ctx.request_repaint();
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!("failed to fetch Japanese font from {JAPANESE_FONT_PATH}: {err}; falling back to English");
+                            self.font_status = FontStatus::Failed;
+                            self.app.preferences.language = "en".to_string();
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            if self.app.preferences.language == "ja" {
+                match self.font_status {
+                    FontStatus::Unloaded => {
+                        self.font_status = FontStatus::Loading;
+                        let slot = self.font_result.clone();
+                        let ctx_clone = ctx.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let res = fetch_font_bytes(JAPANESE_FONT_PATH).await;
+                            *slot.borrow_mut() = Some(res);
+                            ctx_clone.request_repaint();
+                        });
+                    }
+                    FontStatus::Failed => {
+                        // Prevent tofu glyphs if font loading failed
+                        self.app.preferences.language = "en".to_string();
+                    }
+                    FontStatus::Loading | FontStatus::Installed => {}
+                }
+            }
+        }
     }
 
     impl eframe::App for Shell {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.tick_font(ctx);
             self.app.logic(ctx);
             self.files_tick(ctx);
             UNSAVED.with(|u| u.set(solvecraft_ui_egui::documents::any_dirty(&self.app)));
@@ -347,32 +410,6 @@ mod web {
         Ok(uint8_arr.to_vec())
     }
 
-    /// Load Japanese/CJK fallback font in the browser.
-    fn load_web_fonts(ctx: egui::Context) {
-        wasm_bindgen_futures::spawn_local(async move {
-            let urls = [
-                "./fonts/BIZUDPGothic-Regular.ttf",
-                "./fonts/NotoSansCJKjp-Regular.otf",
-                "https://cdn.jsdelivr.net/gh/googlefonts/morisawa-biz-ud-gothic@main/fonts/ttf/BIZUDPGothic-Regular.ttf",
-            ];
-
-            for url in urls {
-                match fetch_font_bytes(url).await {
-                    Ok(bytes) => {
-                        if solvecraft_ui_egui::fonts::install_cjk_font(&ctx, bytes) {
-                            log::info!("loaded web CJK font from {url}");
-                            ctx.request_repaint();
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        log::debug!("fetching font from {url} failed: {err}");
-                    }
-                }
-            }
-        });
-    }
-
     pub fn start() {
         eframe::WebLogger::init(log::LevelFilter::Info).ok();
         wasm_bindgen_futures::spawn_local(async {
@@ -395,7 +432,6 @@ mod web {
                     options,
                     Box::new(move |cc| {
                         solvecraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
-                        load_web_fonts(cc.egui_ctx.clone());
                         let files = Rc::new(Files::default());
                         files::start(&files);
                         let panel = files.clone();
@@ -439,6 +475,8 @@ mod web {
                             renaming: None,
                             rename_focus: false,
                             recents_synced: false,
+                            font_status: FontStatus::Unloaded,
+                            font_result: Rc::new(std::cell::RefCell::new(None)),
                         }))
                     }),
                 )
