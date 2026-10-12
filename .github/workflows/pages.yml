@@ -49,7 +49,7 @@ jobs:
         run: cargo xtask book
       - name: Build the web app
         working-directory: apps/solvecraft-web
-        run: trunk build --release --public-url /solidcraft/app/
+        run: trunk build --release --public-url ./
       - name: Assemble the site
         run: |
           mkdir -p site
