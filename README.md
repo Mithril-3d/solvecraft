@@ -4,7 +4,7 @@
 
 Sketch, constrain, and build solids with a parametric feature timeline. Change a dimension
 and watch your model rebuild. Run it on your desktop, in your browser, or let AI agents
-model through the built-in MCP server. Part of the storytold "craft" family.
+model through the built-in MCP server.
 
 ![SolidCraft: draw a rounded electronics enclosure, sketch its USB port directly on a face, add four mounting bosses and resize it through Parameters](docs/screenshots/enclosure-demo-0.2.1.gif)
 

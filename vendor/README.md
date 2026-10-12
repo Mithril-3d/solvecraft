@@ -7,6 +7,9 @@ are marked `SolveCraft:` in the source.
 ## truck-shapeops 0.4.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 
 Changes:
+- `transversal/intersection_curve/mod.rs`: reject empty/single-point polylines and
+  collapsed or non-finite segments before endpoint indexing and normalization. A hidden
+  constructor re-export lets the kernel workspace tests exercise the actual vendored code.
 - `transversal/integrate/mod.rs`: mesh both shells with `robust_triangulation` (faces made by
   earlier booleans have boundaries that lie on their surface only within tolerance).
 - `transversal/divide_face/mod.rs`: when projecting a loop onto a face's surface, fall back to

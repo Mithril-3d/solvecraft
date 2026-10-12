@@ -46,6 +46,18 @@ mod web {
         on_unload.forget();
     }
 
+    const JAPANESE_FONT_PATH: &str = "./fonts/BIZUDPGothic-Regular.ttf";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FontStatus {
+        Unloaded,
+        Loading,
+        Installed,
+        Failed,
+    }
+
+    type FontLoadResult = Rc<std::cell::RefCell<Option<Result<Vec<u8>, String>>>>;
+
     struct Shell {
         app: SolveApp,
         files: Rc<Files>,
@@ -58,6 +70,8 @@ mod web {
         rename_focus: bool,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
+        font_status: FontStatus,
+        font_result: FontLoadResult,
     }
 
     impl Shell {
@@ -304,10 +318,59 @@ mod web {
             }
             files::autosave(&self.files, None);
         }
+
+        /// Check language preference and manage on-demand Japanese font loading.
+        fn tick_font(&mut self, ctx: &egui::Context) {
+            if self.font_status == FontStatus::Loading {
+                if let Some(res) = self.font_result.borrow_mut().take() {
+                    match res {
+                        Ok(bytes) => {
+                            if solvecraft_ui_egui::fonts::install_cjk_font(ctx, bytes) {
+                                log::info!("loaded web Japanese font from {JAPANESE_FONT_PATH}");
+                                self.font_status = FontStatus::Installed;
+                                ctx.request_repaint();
+                            } else {
+                                log::warn!("failed to install Japanese font: invalid font data; falling back to English");
+                                self.font_status = FontStatus::Failed;
+                                self.app.preferences.language = "en".to_string();
+                                ctx.request_repaint();
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!("failed to fetch Japanese font from {JAPANESE_FONT_PATH}: {err}; falling back to English");
+                            self.font_status = FontStatus::Failed;
+                            self.app.preferences.language = "en".to_string();
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            if self.app.preferences.language == "ja" {
+                match self.font_status {
+                    FontStatus::Unloaded => {
+                        self.font_status = FontStatus::Loading;
+                        let slot = self.font_result.clone();
+                        let ctx_clone = ctx.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let res = fetch_font_bytes(JAPANESE_FONT_PATH).await;
+                            *slot.borrow_mut() = Some(res);
+                            ctx_clone.request_repaint();
+                        });
+                    }
+                    FontStatus::Failed => {
+                        // Prevent tofu glyphs if font loading failed
+                        self.app.preferences.language = "en".to_string();
+                    }
+                    FontStatus::Loading | FontStatus::Installed => {}
+                }
+            }
+        }
     }
 
     impl eframe::App for Shell {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.tick_font(ctx);
             self.app.logic(ctx);
             self.files_tick(ctx);
             UNSAVED.with(|u| u.set(solvecraft_ui_egui::documents::any_dirty(&self.app)));
@@ -334,6 +397,35 @@ mod web {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
     }
 
+    /// Fetch font bytes asynchronously through the browser.
+    async fn fetch_font_bytes(path: &str) -> Result<Vec<u8>, String> {
+        let window = web_sys::window().ok_or("no window")?;
+        let mut candidates = vec![path.to_string()];
+        let trimmed = path.trim_start_matches("./");
+        if trimmed != path {
+            candidates.push(trimmed.to_string());
+        }
+        if let Ok(pathname) = window.location().pathname() {
+            let base = if pathname.ends_with('/') {
+                pathname
+            } else {
+                format!("{pathname}/")
+            };
+            candidates.push(format!("{base}{trimmed}"));
+        }
+        for url in candidates {
+            if let Ok(resp_val) = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&url)).await
+                && let Ok(resp) = resp_val.dyn_into::<web_sys::Response>()
+                && resp.ok()
+                && let Ok(ab_val) = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await
+            {
+                let uint8_arr = js_sys::Uint8Array::new(&ab_val);
+                return Ok(uint8_arr.to_vec());
+            }
+        }
+        Err(format!("failed to fetch font bytes for {path}"))
+    }
+
     pub fn start() {
         eframe::WebLogger::init(log::LevelFilter::Info).ok();
         wasm_bindgen_futures::spawn_local(async {
@@ -355,6 +447,7 @@ mod web {
                     canvas,
                     options,
                     Box::new(move |cc| {
+                        solvecraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
                         let files = Rc::new(Files::default());
                         files::start(&files);
                         let panel = files.clone();
@@ -398,6 +491,8 @@ mod web {
                             renaming: None,
                             rename_focus: false,
                             recents_synced: false,
+                            font_status: FontStatus::Unloaded,
+                            font_result: Rc::new(std::cell::RefCell::new(None)),
                         }))
                     }),
                 )

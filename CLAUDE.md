@@ -2,10 +2,9 @@
 
 SolidCraft is a clean-room, open-source, pure-Rust parametric 3D CAD application:
 sketches with a constraint solver, a parametric timeline of features, a B-rep
-kernel, and a desktop UI that agents can drive. Siblings with the same conventions live next to
-it in `storytold/`: `cadcraft` (AutoCAD-style, the closest relative), `photocraft`, `vectorcraft`,
-`gridcraft`, `designcraft`, `wordcraft`, `deckcraft`, `soundcraft`. Repos don't share code; when
-code is adapted from a sibling (MIT OR Apache-2.0) it is noted in ATTRIBUTION.md.
+kernel, and a desktop UI that agents can drive. Projects published by
+[storytold](https://github.com/storytold) can serve as references for implementation conventions.
+Any code adapted from other projects (MIT OR Apache-2.0) is noted in ATTRIBUTION.md.
 
 ## Product name and compatibility
 SolidCraft is the displayed product name; `solidcraft` is the repository name. Keep existing

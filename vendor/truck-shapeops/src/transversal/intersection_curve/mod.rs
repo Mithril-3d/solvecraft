@@ -19,12 +19,21 @@ impl<S> From<IntersectionCurveWithParameters<S>> for IntersectionCurve<PolylineC
 impl<S> IntersectionCurveWithParameters<S>
 where S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>
 {
+    /// SolveCraft: construct a projected curve, returning `None` for degenerate input.
     pub fn try_new(
         surface0: S,
         surface1: S,
         poly: PolylineCurve<Point3>,
         tol: f64,
     ) -> Option<Self> {
+        // SolveCraft: a point contact is not a curve. Reject it before indexing the
+        // endpoints, and reject collapsed/non-finite segments before normalizing.
+        if poly.len() < 2 || poly.windows(2).any(|p| {
+            let length2 = (p[1] - p[0]).magnitude2();
+            !length2.is_finite() || length2 <= 0.0
+        }) {
+            return None;
+        }
         let mut polyline = PolylineCurve(Vec::new());
         let mut params0 = PolylineCurve(Vec::new());
         let mut params1 = PolylineCurve(Vec::new());

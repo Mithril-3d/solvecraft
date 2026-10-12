@@ -54,7 +54,7 @@ deployment. The stable Flatpak repository is not automatically updated with nigh
 2. Update `[workspace.package] version` in root `Cargo.toml`. Then run
    `cargo metadata --format-version 1 --no-deps > /dev/null` to refresh workspace package
    versions in `Cargo.lock`. Inspect the diff and keep unrelated dependency changes out.
-   SolidCraft does not currently implement the siblings' `cargo xtask version set` command.
+   SolidCraft does not currently implement `cargo xtask version set`.
 3. Run `cargo xtask ci` and the packaging checks in `.github/workflows/packaging-lint.yml`.
    Commit the version files through the normal review flow and land them on `main`.
    Do not use `[skip ci]`. Record the exact commit SHA to release. If it changes, revalidate it.
