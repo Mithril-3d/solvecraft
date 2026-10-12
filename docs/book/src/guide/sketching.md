@@ -85,16 +85,29 @@ fresh link once the source is available; their stored point values are preserved
 including the origin, endpoints and circle centres. For two points, it chooses horizontal
 or vertical alignment from their current positions. Esc cancels a pending first point.
 
-The solver is SolveCraft's own (damped Gauss–Newton with degree-of-freedom analysis). Constraints:
+The solver is SolidCraft's own (damped Gauss–Newton with degree-of-freedom analysis). Constraints:
 coincident, horizontal/vertical, parallel, perpendicular, tangent, equal, concentric, collinear,
 midpoint, symmetry, fix, curvature (G2) and polygon. **Sketch Dimension** (D) adds linear,
 aligned, horizontal, vertical, radius, diameter and angle dimensions. Each is a parameter
 (`d1`, `d2`, …), so it can hold an expression.
 
+For **Coincident**, pick two points, a point and a curve (in either order), or two
+distinct straight lines. Two lines join their closest pair of endpoints; the first
+picked line stays in place when the existing constraints allow it. Pick endpoints
+explicitly when you want to connect a different pair.
+
+Horizontal/Vertical also applies immediately to one selected line or two distinct selected
+points. Shift-click to add the second point before choosing the constraint.
+
 For Parallel, Perpendicular, Equal, Tangent, Concentric and Collinear, select exactly two
 sketch curves (Shift-click to add the second) and choose the constraint to apply it immediately.
 You can also start the constraint first and then pick its curves. An incomplete or mixed
-selection starts that pick workflow; a rejected constraint keeps the selection for correction.
+selection leaves the tool ready for ordinary picking.
+
+Coincident accepts an exact selection of two points or a point and a curve. Midpoint
+accepts one point and one line, in either selection order. Symmetry accepts two distinct
+points and one symmetry line, regardless of where the line occurs in the selection.
+Successful constraints clear the selection; rejected constraints preserve it.
 
 Under-constrained geometry is blue and fully constrained geometry turns dark, and the status
 shows the remaining degrees of freedom. A constraint or dimension that would over-constrain the

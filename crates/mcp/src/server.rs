@@ -3,6 +3,8 @@
 use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
+/// Longest accepted request line, shared with the control server.
+use solvecraft_engine::MAX_LINE;
 
 use crate::backend::Backend;
 use crate::tools::{call_tool, check_arguments, tool_definitions};
@@ -18,12 +20,10 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
-/// Longest accepted request line (a guard against runaway input).
-const MAX_LINE: usize = 16 << 20;
 /// Most messages in one JSON-RPC batch.
 const MAX_BATCH: usize = 1000;
 
-const INSTRUCTIONS: &str = "SolveCraft is a parametric 3D CAD app in the style of Autodesk Fusion. Units are millimetres \
+const INSTRUCTIONS: &str = "SolidCraft is a parametric 3D CAD app in the style of Autodesk Fusion. Units are millimetres \
 and degrees in expressions (internally radians), Z is up. Model like in Fusion: `sketch.create {plane: XY}`, draw \
 (`sketch.rectangle.two_point {p0, p1}`, `sketch.circle.center {center, radius}`, `sketch.line {points, closed}`), constrain \
 and dimension (`sketch.dimension {entities, value}`; values may name parameters), `sketch.finish`, then features \
@@ -133,7 +133,7 @@ impl Server {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
-                    "serverInfo": {"name": "solvecraft", "title": "SolveCraft", "version": env!("CARGO_PKG_VERSION")},
+                    "serverInfo": {"name": "solvecraft", "title": "SolidCraft", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": format!("{INSTRUCTIONS} Backend: {}.", self.backend.describe()),
                 }))
             }

@@ -89,7 +89,7 @@ impl Backend for Remote {
         let reply = match self.roundtrip(&line) {
             Ok(r) => r,
             // One retry on a fresh connection (the app may have restarted).
-            Err(_) => self.roundtrip(&line).map_err(|e| format!("SolveCraft at {}: {e}", self.addr))?,
+            Err(_) => self.roundtrip(&line).map_err(|e| format!("SolidCraft at {}: {e}", self.addr))?,
         };
         let v: Value = serde_json::from_str(&reply).map_err(|e| format!("bad reply from the app: {e}"))?;
         if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -102,7 +102,7 @@ impl Backend for Remote {
         true
     }
     fn describe(&self) -> String {
-        format!("connected to the SolveCraft app at {} (the user watches the viewport)", self.addr)
+        format!("connected to the SolidCraft app at {} (the user watches the viewport)", self.addr)
     }
 }
 
@@ -168,6 +168,6 @@ impl Backend for Headless {
         false
     }
     fn describe(&self) -> String {
-        "headless in-process SolveCraft session".into()
+        "headless in-process SolidCraft session".into()
     }
 }

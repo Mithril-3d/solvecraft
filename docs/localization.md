@@ -1,6 +1,6 @@
 # UI localization
 
-SolveCraft embeds its translations and works offline. English and Japanese are currently
+SolidCraft embeds its translations and works offline. English and Japanese are currently
 registered in `crates/ui-egui/src/i18n.rs`. Adding a language requires an embedded catalog and
 one registration there; the preferences selector and validation use the same registry.
 

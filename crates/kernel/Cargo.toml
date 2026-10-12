@@ -1,6 +1,6 @@
 [package]
 name = "solvecraft-kernel"
-description = "SolveCraft B-rep kernel boundary: solids, extrude/revolve/booleans/fillets, tessellation, measures and STEP, behind our own API (implemented with truck)"
+description = "SolidCraft B-rep kernel boundary: solids, extrude/revolve/booleans/fillets, tessellation, measures and STEP, behind our own API (implemented with truck)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

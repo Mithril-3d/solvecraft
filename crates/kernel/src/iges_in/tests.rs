@@ -157,3 +157,55 @@ fn a_drill_point_round_trips_through_iges() {
     assert!(rel(measure(&drilled).unwrap().volume, v) < 1e-3);
     round_trip(&drilled);
 }
+
+/// A composite curve (102) names its children by pointer, and nothing stops a tree whose every
+/// node names the same child twice. Twenty levels under the depth cap is a million leaf visits
+/// and thirty is 2^30; only counting the work sees that, because the depth never grows past the
+/// cap and a node that yields no segment trips no bound on the output.
+#[test]
+fn composite_curve_fan_out_is_bounded() {
+    let quad = |z: f64| {
+        let c = [[0.0, 0.0, z], [10.0, 0.0, z], [10.0, 20.0, z], [0.0, 20.0, z]];
+        let fmt = |p: [f64; 3]| format!("{:?},{:?},{:?}", p[0], p[1], p[2]);
+        format!("1,1,1,1,0,0,1,0,0,0.,0.,1.,1.,0.,0.,1.,1.,1.,1.,1.,1.,{},{},{},{},0.,1.,0.,1.", fmt(c[0]), fmt(c[1]), fmt(c[3]), fmt(c[2]))
+    };
+    let mut ents: Vec<(i64, i64, String)> = vec![(128, 0, quad(0.0)), (110, 0, "0.,0.,0.,10.,0.,0.".into())];
+    let (surface, mut child) = (1, 3);
+    // Twenty composites, each naming the one below it twice.
+    for _ in 0..20 {
+        ents.push((102, 0, format!("2,{child},{child}")));
+        child = 2 * ents.len() - 1;
+    }
+    ents.push((142, 0, format!("0,{surface},0,{child},2")));
+    let cos = 2 * ents.len() - 1;
+    ents.push((144, 0, format!("{surface},1,0,{cos}")));
+
+    let reported = match iges_to_step(&iges_file(&ents)) {
+        Ok((_, warnings)) => warnings.join(" "),
+        Err(error) => error,
+    };
+    // Check the work-budget rejection, not elapsed time: CI runs test binaries concurrently.
+    assert!(reported.contains("too complex") || reported.contains("too many segments"), "{reported}");
+}
+
+/// Nothing stops directory entries from all naming the same parameter range, and each one
+/// materialises it as its own string and token list. Ten thousand entries over a million
+/// shared lines retained about a gigabyte each.
+#[test]
+fn directory_entries_cannot_share_their_way_past_the_file_size() {
+    let mut out = vec![format!("{:<72}S{:>7}", "test", 1), format!("{:<72}G{:>7}", "1H,,1H;,,,,,,,,,,,1.,2,2HMM,,,,1.E-6;", 1)];
+    // 1,000 entries, each claiming the same 2,000 parameter lines.
+    for k in 0..1_000 {
+        out.push(format!("{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}D{:>7}", 110, 1, 0, 0, 0, 0, 0, 0, "00000000", 2 * k + 1));
+        out.push(format!("{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}D{:>7}", 110, 0, 0, 2_000, 0, 0, 0, "", 0, 2 * k + 2));
+    }
+    for i in 0..2_000 {
+        out.push(format!("{:<64}{:>8}P{:>7}", "0.,0.,0.,1.,0.,0.;", 1, i + 1));
+    }
+    out.push(format!("{:<72}T{:>7}", "", 1));
+
+    let t = std::time::Instant::now();
+    let error = iges_to_step(&out.join("\n")).unwrap_err();
+    assert!(error.contains("parameter data is too large"), "{error}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "took {:?}", t.elapsed());
+}

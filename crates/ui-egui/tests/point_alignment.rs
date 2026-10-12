@@ -5,6 +5,97 @@ use solvecraft_engine::sketch::ConstraintKind;
 use solvecraft_ui_egui::scenario::Harness;
 
 #[test]
+fn horizontal_vertical_uses_preselected_line_and_preserves_rejection() {
+    for fixed in [false, true] {
+        let mut h = Harness::new();
+        h.run(&json!([
+            {"call":"engine.execute","params":{"command":"sketch.create","params":{"plane":"XY"}}},
+            {"call":"engine.execute","params":{"command":"sketch.line","params":{"points":[[10,10],[40,13]],"infer":false}}},
+            {"call":"ui.view","params":{"view":"top"}}
+        ]))
+        .unwrap();
+        if fixed {
+            h.app.session.execute("sketch.constraint.fix", &json!({"entity":"l1"})).unwrap();
+        }
+        h.run(&json!([{"click":{"sketch":[25,11.5]}}])).unwrap();
+        assert_eq!(h.app.session.selection.len(), 1);
+        let selection = h.app.session.selection.clone();
+        let before = serde_json::to_value(&h.app.session.doc).unwrap();
+        let undo = h.app.session.undo.len();
+        h.run(&json!([{"start":"sketch.constraint.horizontal_vertical"}])).unwrap();
+        assert_eq!(h.app.status.as_ref().is_some_and(|(_, _, error)| *error), fixed);
+        if fixed {
+            assert_eq!(serde_json::to_value(&h.app.session.doc).unwrap(), before);
+            assert_eq!(h.app.session.selection, selection);
+            assert_eq!(h.app.session.undo.len(), undo);
+        } else {
+            let sk = &h.app.session.model.state().sketches[0].sketch;
+            let a = sk.point(sk.resolve_point("l1.start").unwrap()).unwrap();
+            let b = sk.point(sk.resolve_point("l1.end").unwrap()).unwrap();
+            assert!((a.y - b.y).abs() < 1e-6);
+            assert_eq!(h.app.session.undo.len(), undo + 1);
+            assert!(h.app.session.selection.is_empty());
+        }
+        assert!(h.app.tool.is_none());
+    }
+}
+
+#[test]
+fn horizontal_vertical_leaves_ambiguous_preselection_to_pick_tool() {
+    use solvecraft_engine::Sel;
+    for selection in [
+        vec![Sel::SketchPoint { id: "origin".into() }],
+        vec![Sel::SketchPoint { id: "origin".into() }, Sel::SketchCurve { id: "c1".into() }],
+        vec![Sel::SketchPoint { id: "origin".into() }, Sel::SketchPoint { id: "c1.center".into() }, Sel::SketchCurve { id: "c1".into() }],
+    ] {
+        let mut h = Harness::new();
+        h.app.session.execute("sketch.create", &json!({"plane":"XY"})).unwrap();
+        h.app.session.execute("sketch.circle.center", &json!({"center":[20,3],"radius":5})).unwrap();
+        h.app.session.selection = selection.clone();
+        let undo = h.app.session.undo.len();
+        h.run(&json!([{"start":"sketch.constraint.horizontal_vertical"}])).unwrap();
+        assert!(h.app.tool.as_ref().unwrap().picks.is_empty());
+        assert_eq!(h.app.session.undo.len(), undo);
+        assert_eq!(h.app.session.selection, selection);
+        assert!(!h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+    }
+}
+
+#[test]
+fn horizontal_vertical_uses_preselected_points() {
+    for center in [[20.0, 3.0], [3.0, 20.0]] {
+        for reverse in [false, true] {
+            let mut h = Harness::new();
+            let (first, second) = if reverse { (center, [0.0, 0.0]) } else { ([0.0, 0.0], center) };
+            h.run(&json!([
+                {"call":"engine.execute","params":{"command":"sketch.create","params":{"plane":"XY"}}},
+                {"call":"engine.execute","params":{"command":"sketch.circle.center","params":{"center":center,"radius":5}}},
+                {"call":"ui.view","params":{"view":"top"}},
+                {"click":{"sketch":first}},
+                {"click":{"sketch":second},"shift":true}
+            ]))
+            .unwrap();
+            assert_eq!(h.app.session.selection.len(), 2);
+            let before = serde_json::to_value(&h.app.session.doc).unwrap();
+            let undo = h.app.session.undo.len();
+            h.run(&json!([{"start":"sketch.constraint.horizontal_vertical"}])).unwrap();
+            assert!(!h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+            let sk = &h.app.session.model.state().sketches[0].sketch;
+            let p = sk.point(sk.resolve_point("c1.center").unwrap()).unwrap();
+            assert!((if center[0] > center[1] { p.y } else { p.x }).abs() < 1e-6);
+            assert!(h.app.tool.is_none());
+            assert!(h.app.session.selection.is_empty());
+            assert_eq!(h.app.session.undo.len(), undo + 1);
+            let after = serde_json::to_value(&h.app.session.doc).unwrap();
+            h.app.session.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(serde_json::to_value(&h.app.session.doc).unwrap(), before);
+            h.app.session.execute("edit.redo", &json!({})).unwrap();
+            assert_eq!(serde_json::to_value(&h.app.session.doc).unwrap(), after);
+        }
+    }
+}
+
+#[test]
 fn horizontal_vertical_aligns_origin_and_circle_center() {
     for (center, horizontal) in [([20.0, 3.0], true), ([3.0, 20.0], false)] {
         for origin_first in [true, false] {

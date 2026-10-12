@@ -349,7 +349,7 @@ pub fn rename(files: &Rc<Files>, from: &str, to: &str) -> Result<(), String> {
     if files.entries.borrow().iter().any(|e| e.name == to) {
         return Err(format!("there is already a file named {to}"));
     }
-    let bytes = vfs::read(&format!("{OPFS}{from}")).map_err(|e| e.to_string())?;
+    let bytes = vfs::read(&format!("{OPFS}{from}"), solvecraft_engine::io::MAX_DESIGN_BYTES).map_err(|e| e.to_string())?;
     vfs::write(&format!("{OPFS}{to}"), &bytes).map_err(|e| e.to_string())?;
     delete(files, from);
     flush(files);

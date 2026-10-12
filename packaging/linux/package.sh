@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and package SolveCraft for Linux (<arch> is x86_64 or aarch64):
+# Build and package SolidCraft for Linux (<arch> is x86_64 or aarch64):
 #
 #   $DIST/solvecraft-<version>-linux-<arch>.AppImage        any distro with glibc >= the build host's
 #   $DIST/solvecraft-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
@@ -37,10 +37,10 @@ case "$ARCH" in
   aarch64 | arm64) ARCH=aarch64; DEB_ARCH=arm64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-export SOLVECRAFT_MAINTAINER="${SOLVECRAFT_MAINTAINER:-SolveCraft contributors <https://github.com/bherbruck/solvecraft>}"
+export SOLVECRAFT_MAINTAINER="${SOLVECRAFT_MAINTAINER:-SolidCraft contributors <https://github.com/bherbruck/solidcraft>}"
 BASENAME="solvecraft-$VERSION-linux-$ARCH"
 
-echo "==> SolveCraft $VERSION for Linux $ARCH ($FORMATS)"
+echo "==> SolidCraft $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   if [ -n "${CROSS_TARGET:-}" ]; then

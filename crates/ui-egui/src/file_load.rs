@@ -102,6 +102,8 @@ fn start(app: &mut SolveApp) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn compute(mut session: Session, path: &str, insert: bool, phase: &AtomicU8, cancelled: &AtomicBool) -> Job {
+    let profile = std::env::var_os("SOLVECRAFT_PROFILE_OPEN").is_some();
+    let began = std::time::Instant::now();
     if cancelled.load(Ordering::Relaxed) {
         return Err("file operation cancelled".into());
     }
@@ -113,16 +115,31 @@ fn compute(mut session: Session, path: &str, insert: bool, phase: &AtomicU8, can
         "file.insert_step"
     };
     let result = session.execute(command, &json!({"path": path})).map_err(|e| e.to_string())?;
+    let geometry_ms = began.elapsed().as_secs_f64() * 1000.0;
+    let view_began = std::time::Instant::now();
     phase.store(1, Ordering::Relaxed);
+    let world = session.world_state();
+    let placement_ms = view_began.elapsed().as_secs_f64() * 1000.0;
+    let mesh_began = std::time::Instant::now();
     // Fit, picking and the first viewport frame must not trigger cold tessellation on the UI.
-    for b in &session.world_state().bodies {
+    for b in &world.bodies {
         if cancelled.load(Ordering::Relaxed) {
             return Err("file operation cancelled".into());
         }
         let _ = b.mesh();
     }
+    let tessellation_ms = mesh_began.elapsed().as_secs_f64() * 1000.0;
     phase.store(2, Ordering::Relaxed);
+    let view_ms = view_began.elapsed().as_secs_f64() * 1000.0;
+    let thumbnail_began = std::time::Instant::now();
     let image = if insert { None } else { crate::home::remember(&session) };
+    if profile {
+        eprintln!(
+            "SolidCraft open phases: geometry_ms={geometry_ms:.3} placement_ms={placement_ms:.3} tessellation_ms={tessellation_ms:.3} display_warmup_ms={view_ms:.3} thumbnail_ms={:.3} total_ms={:.3}",
+            thumbnail_began.elapsed().as_secs_f64() * 1000.0,
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(Made { session, result, image })
 }
 

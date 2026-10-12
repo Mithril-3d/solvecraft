@@ -30,7 +30,7 @@ pub use curves::{
 pub use dims::{DimFrame, DimLayout, chain_centres, default_text, dim_frame, dim_layout, encode_text};
 pub use freeform_offset::{FreeformOffset, OFFSET_TOLERANCE};
 pub use link::{Link, LinkGeom, LinkKind, LinkSource, MAX_LINK_ENTITIES};
-pub use model::{Constraint, ConstraintKind, Curve, CurveKind, SPoint, Sketch, SketchError, SketchView};
+pub use model::{Constraint, ConstraintKind, Curve, CurveKind, MAX_CONSTRAINTS, MAX_CURVES, MAX_POINTS, SPoint, Sketch, SketchError, SketchView};
 pub use offset::OffsetChain;
 pub use offset_topology::{OffsetCreated, OffsetRole, OffsetRoleFlags, OffsetRoleKind, OffsetTopology};
 pub use periodic::periodic_beziers;

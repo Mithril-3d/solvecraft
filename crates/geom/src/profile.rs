@@ -244,8 +244,24 @@ impl Seg2 {
             }
         }
     }
-    /// Parameter of the point of the segment closest to `p` (sampling, then Newton).
+    /// Parameter of the closest point: exact projection for lines,
+    /// sampling followed by Newton for the remaining curves.
     pub fn closest_param(&self, p: Vec2) -> f64 {
+        let finite = |p: Vec2| p.x.is_finite() && p.y.is_finite();
+        match *self {
+            Seg2::Line { a, b } if finite(a) && finite(b) && finite(p) => {
+                let d = b - a;
+                if a == b {
+                    return 0.0;
+                }
+                let denominator = d.len2();
+                let t = (p - a).dot(d) / denominator;
+                if denominator > 0.0 && denominator.is_finite() && t.is_finite() {
+                    return t.clamp(0.0, 1.0);
+                }
+            }
+            _ => {}
+        }
         let n = 64;
         let mut t =
             (0..=n).map(|i| i as f64 / n as f64).min_by(|x, y| self.point_at(*x).dist(p).total_cmp(&self.point_at(*y).dist(p))).unwrap_or(0.0);
@@ -539,6 +555,76 @@ impl Region2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closest_line_projection_and_degeneracy() {
+        let line = Seg2::Line { a: Vec2::new(-3.0, 4.0), b: Vec2::new(7.0, 4.0) };
+        for (p, t) in [(Vec2::new(-9.0, 20.0), 0.0), (Vec2::new(2.0, -5.0), 0.5), (Vec2::new(15.0, 4.0), 1.0)] {
+            assert_eq!(line.closest_param(p), t);
+            assert_eq!(line.reversed().closest_param(p), 1.0 - t);
+        }
+        let a = Vec2::new(1e100, -1e100);
+        let b = a + Vec2::new(1e90, 2e90);
+        let large = Seg2::Line { a, b };
+        assert!((large.closest_param(a.lerp(b, 0.5)) - 0.5).abs() < 1e-6);
+        assert_eq!(Seg2::Line { a, b: a }.closest_param(Vec2::ZERO), 0.0);
+        let tiny = Seg2::Line { a: Vec2::ZERO, b: Vec2::new(1e-12, 0.0) };
+        assert_eq!(tiny.closest_param(Vec2::new(0.5e-12, 1.0)), 0.5);
+        for line in [line, line.reversed(), tiny] {
+            for k in 0..53 {
+                let p = Vec2::new((k * 17 % 37) as f64 - 18.0, (k * 31 % 29) as f64 - 14.0);
+                let closest = line.point_at(line.closest_param(p)).dist(p);
+                let dense = (0..=8192).map(|i| line.point_at(i as f64 / 8192.0).dist(p)).fold(f64::INFINITY, f64::min);
+                assert!(closest <= dense + 1e-12);
+            }
+        }
+    }
+
+    fn sampled_closest(s: &Seg2, p: Vec2) -> f64 {
+        let mut t = (0..=64).map(|i| i as f64 / 64.0).min_by(|x, y| s.point_at(*x).dist(p).total_cmp(&s.point_at(*y).dist(p))).unwrap_or(0.0);
+        for _ in 0..30 {
+            let (q, d) = (s.point_at(t), s.derivative(t));
+            let (d2, h) = ((s.derivative((t + 1e-6).min(1.0)) - s.derivative((t - 1e-6).max(0.0))) / 2e-6, q - p);
+            let df = d.dot(d) + h.dot(d2);
+            if df.abs() < 1e-300 {
+                break;
+            }
+            let nt = (t - h.dot(d) / df).clamp(0.0, 1.0);
+            if (nt - t).abs() < 1e-14 {
+                t = nt;
+                break;
+            }
+            t = nt;
+        }
+        t
+    }
+
+    #[test]
+    fn closest_projection_preserves_clearance_tolerance_and_generic_fallback() {
+        use std::f64::consts::TAU;
+        let curves = [
+            Seg2::Line { a: Vec2::new(-4.0, 7.0), b: Vec2::new(3.0, -2.0) },
+            Seg2::Arc { center: Vec2::new(3.0, -2.0), radius: 6.0, start: 5.9, sweep: 1.3 },
+            Seg2::Arc { center: Vec2::ZERO, radius: 2.0, start: 0.2, sweep: -TAU },
+            Seg2::Arc { center: Vec2::ZERO, radius: 2.0, start: 0.0, sweep: TAU },
+            Seg2::Arc { center: Vec2::ZERO, radius: 2.0, start: 0.0, sweep: 0.0 },
+            Seg2::Arc { center: Vec2::ZERO, radius: 2.0, start: 0.0, sweep: 1e-12 },
+            Seg2::Cubic { p0: Vec2::ZERO, p1: Vec2::new(2.0, 7.0), p2: Vec2::new(6.0, -3.0), p3: Vec2::new(8.0, 4.0) },
+        ];
+        for (i, s) in curves.iter().enumerate() {
+            for k in 0..101 {
+                let p = Vec2::new((k * 17 % 37) as f64 - 18.0, (k * 31 % 29) as f64 - 14.0);
+                let old = sampled_closest(s, p);
+                let new = s.closest_param(p);
+                if i > 0 {
+                    assert_eq!(new.to_bits(), old.to_bits());
+                }
+                assert!(s.point_at(new).dist(p) <= s.point_at(old).dist(p) + 1e-10);
+                let on_curve = s.point_at(k as f64 / 100.0);
+                assert!(s.point_at(s.closest_param(on_curve)).dist(on_curve) < 1e-9);
+            }
+        }
+    }
 
     #[test]
     fn triangulated_area() {

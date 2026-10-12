@@ -30,6 +30,8 @@ mod heal;
 mod helix;
 mod iges_in;
 mod iges_out;
+#[cfg(test)]
+mod intersection_curve_tests;
 mod lip;
 mod loopblend;
 mod measure;

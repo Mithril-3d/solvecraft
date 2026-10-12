@@ -4,6 +4,8 @@ use solvecraft_geom::{Seg2, Vec2};
 /// Hard caps that keep hostile input from exhausting memory or time.
 pub const MAX_POINTS: usize = 20_000;
 pub const MAX_CONSTRAINTS: usize = 40_000;
+/// Curves need points, so this follows the point cap.
+pub const MAX_CURVES: usize = MAX_POINTS;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SketchError {

@@ -12,37 +12,47 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+#[path = "../../app_icon.rs"]
+mod app_icon;
 mod control_server;
+#[cfg(target_os = "windows")]
+mod space_mouse;
 
 use solvecraft_engine::Session;
 use solvecraft_ui_egui::{Services, SolveApp};
 
-struct App(SolveApp);
+struct App {
+    solve: SolveApp,
+    #[cfg(target_os = "windows")]
+    space_mouse: space_mouse::SpaceMouse,
+}
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The OS closing the window (Alt+F4, Cmd+Q, the window manager): ask about unsaved
         // designs first; the window closes once they are answered (`quit_requested`).
-        if ctx.input(|i| i.viewport().close_requested()) && !self.0.quit_requested {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.solve.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            solvecraft_ui_egui::documents::request_quit(&mut self.0);
+            solvecraft_ui_egui::documents::request_quit(&mut self.solve);
         }
-        self.0.logic(ctx);
-        if self.0.quit_requested {
+        self.solve.logic(ctx);
+        #[cfg(target_os = "windows")]
+        self.space_mouse.tick(&mut self.solve, ctx);
+        if self.solve.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+        self.solve.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.solve.ui(ui);
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(PREFS_KEY, self.0.prefs());
+        storage.set_string(PREFS_KEY, self.solve.prefs());
     }
     fn on_exit(&mut self) {
-        solvecraft_ui_egui::recovery_ui::close(&mut self.0);
+        solvecraft_ui_egui::recovery_ui::close(&mut self.solve);
     }
 }
 
@@ -57,7 +67,7 @@ fn services() -> Services {
                     "Designs, STEP, IGES and meshes",
                     &["solvecraft", "step", "stp", "STEP", "STP", "igs", "iges", "IGS", "IGES", "3mf", "3MF", "stl", "STL"],
                 )
-                .add_filter("SolveCraft design", &["solvecraft"])
+                .add_filter("SolidCraft design", &["solvecraft"])
                 .add_filter("STEP", &["step", "stp", "STEP", "STP"])
                 .add_filter("IGES", &["igs", "iges", "IGS", "IGES"])
                 .add_filter("Mesh (3MF, STL)", &["3mf", "3MF", "stl", "STL"])
@@ -116,6 +126,24 @@ const DEPTH_BITS: u8 = 24;
 const STENCIL_BITS: u8 = 8;
 const MSAA: u16 = 4;
 
+fn app_viewport() -> Result<egui::ViewportBuilder, eframe::Error> {
+    Ok(egui::ViewportBuilder::default()
+        .with_title("SolidCraft")
+        .with_icon(egui::IconData {
+            rgba: app_icon::rgba(64).map_err(|e| eframe::Error::AppCreation(std::io::Error::other(e).into()))?,
+            width: 64,
+            height: 64,
+        })
+        .with_inner_size([1600.0, 1000.0])
+        .with_min_inner_size([960.0, 600.0])
+        .with_drag_and_drop(true)
+        .with_decorations(!CUSTOM_TITLEBAR)
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_app_id("ai.storyteller.solvecraft"))
+}
+
 fn main() -> eframe::Result {
     let samples = msaa();
     let mut control_port: Option<u16> = std::env::var("SOLVECRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
@@ -138,16 +166,7 @@ fn main() -> eframe::Result {
         }
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("SolveCraft")
-            .with_inner_size([1600.0, 1000.0])
-            .with_min_inner_size([960.0, 600.0])
-            .with_drag_and_drop(true)
-            .with_decorations(!CUSTOM_TITLEBAR)
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
-            .with_app_id("ai.storyteller.solvecraft"),
+        viewport: app_viewport()?,
         depth_buffer: DEPTH_BITS,
         stencil_buffer: STENCIL_BITS,
         multisampling: samples,
@@ -166,7 +185,7 @@ fn main() -> eframe::Result {
         }));
     }
     eframe::run_native(
-        "SolveCraft",
+        "SolidCraft",
         options,
         Box::new(move |cc| {
             solvecraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
@@ -177,7 +196,8 @@ fn main() -> eframe::Result {
                 app.load_prefs(&p);
             }
             if let Some(rs) = &cc.wgpu_render_state {
-                app.set_wgpu(rs, DEPTH_BITS, STENCIL_BITS, u32::from(samples));
+                eprintln!("SolidCraft graphics: {:?}, MSAA {}x (requested {}x)", rs.adapter.get_info().backend, rs.msaa_samples, samples);
+                app.set_wgpu(rs, DEPTH_BITS, STENCIL_BITS, rs.msaa_samples);
             }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
@@ -205,7 +225,39 @@ fn main() -> eframe::Result {
                 let every = if app.autosave_minutes > 0.0 { app.autosave_minutes * 60.0 } else { f64::MAX / 4.0 };
                 solvecraft_ui_egui::recovery_ui::start(&mut app, &dir, std::time::Duration::from_secs_f64(every.min(1e9)));
             }
-            Ok(Box::new(App(app)))
+            #[cfg(target_os = "windows")]
+            let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
+            Ok(Box::new(App {
+                solve: app,
+                #[cfg(target_os = "windows")]
+                space_mouse,
+            }))
         }),
     )
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn desktop_viewport_supplies_the_original_mark_to_the_window() {
+        let viewport = super::app_viewport().expect("viewport");
+        let icon = viewport.icon.expect("running window must have an icon");
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.rgba, super::app_icon::rgba(64).expect("original mark"));
+        assert_eq!(viewport.app_id.as_deref(), Some("ai.storyteller.solvecraft"));
+    }
+}
+
+#[cfg(test)]
+mod msaa_tests {
+    #[test]
+    fn saved_multisampling_uses_the_selected_backend_policy() {
+        use eframe::wgpu::Backend;
+        for requested in [1, 2, 4, 8] {
+            assert_eq!(eframe::egui_wgpu::effective_msaa_samples(Backend::Gl, requested), 1);
+            for backend in [Backend::Vulkan, Backend::Dx12, Backend::Metal] {
+                assert_eq!(eframe::egui_wgpu::effective_msaa_samples(backend, requested), requested);
+            }
+        }
+    }
 }

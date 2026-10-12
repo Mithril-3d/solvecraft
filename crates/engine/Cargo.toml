@@ -1,6 +1,6 @@
 [package]
 name = "solvecraft-engine"
-description = "SolveCraft engine: the session, the command registry (everything is a command), undo/redo and selection"
+description = "SolidCraft engine: the session, the command registry (everything is a command), undo/redo and selection"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

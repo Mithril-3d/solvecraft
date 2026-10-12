@@ -683,12 +683,17 @@ fn sew_stack(plane: &Plane, d: Vec3, pa: &Prism, pb: &Prism, tol: f64) -> Option
         };
         slabs.push(oriented(&s));
     }
-    sew_sections(plane, d, &levels, &slabs, tol)
+    sew_sections(plane, d, &levels, &slabs, tol, false)
 }
 
 /// Sew the exact sections between successive levels, including empty gaps.
-fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64) -> Option<Result<Body>> {
-    if levels.len() != slabs.len() + 1 || slabs.len() > 128 || plane.normal().dot(d) < 1. - 1e-12 {
+fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64, coalesce: bool) -> Option<Result<Body>> {
+    if levels.len() != slabs.len() + 1
+        || slabs.len() > 128
+        || plane.normal().dot(d) < 1. - 1e-12
+        || levels.iter().any(|z| !z.is_finite())
+        || levels.windows(2).any(|z| z[0] >= z[1])
+    {
         return None;
     }
     let mut blocks = Vec::new();
@@ -732,7 +737,7 @@ fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], 
                     pieces.push(piece);
                 }
             } else {
-                let piece = sew_connected_sections(plane, d, &levels[first..=end], &slabs[first..end], tol)
+                let piece = sew_connected_sections(plane, d, &levels[first..=end], &slabs[first..end], tol, coalesce)
                     .ok_or_else(|| KernelError::Failed("stepped prism construction failed".into()))??;
                 remaining_faces =
                     remaining_faces.checked_sub(piece.face_count()).ok_or_else(|| KernelError::Failed("prism output face budget".into()))?;
@@ -765,8 +770,18 @@ fn sew_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], 
     })())
 }
 
+/// Stable exact identity for the bounded analytic segment subset.
+fn wall_key(s: &Seg2) -> Option<[u64; 6]> {
+    let bits = |v: f64| v.is_finite().then(|| if v == 0. { 0 } else { v.to_bits() });
+    match s {
+        Seg2::Line { a, b } => Some([0, bits(a.x)?, bits(a.y)?, bits(b.x)?, bits(b.y)?, 0]),
+        Seg2::Arc { center, radius, start, sweep } => Some([1, bits(center.x)?, bits(center.y)?, bits(*radius)?, bits(*start)?, bits(*sweep)?]),
+        _ => None,
+    }
+}
+
 /// A genuinely stepped connected axial block has no single extrusion footprint.
-fn sew_connected_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64) -> Option<Result<Body>> {
+fn sew_connected_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<Region2>], tol: f64, coalesce: bool) -> Option<Result<Body>> {
     use crate::sew::{EdgeSpec, FaceSpec, SurfSpec};
     // Faces at each level: up where the slab below sticks out, down where the one above does.
     let diff = |x: &[Region2], y: &[Region2]| -> Option<Vec<Region2>> {
@@ -800,29 +815,91 @@ fn sew_connected_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<R
             _ => EdgeSpec::Line { a: at(sg.start(), z), b: at(sg.end(), z) },
         }
     };
-    let mut faces: Vec<FaceSpec> = Vec::new();
-    for (i, s) in slabs.iter().enumerate() {
-        let (z0, z1) = (*levels.get(i)?, *levels.get(i + 1)?);
-        for lp in loops_of(s) {
+    // Exact oriented generated segments alone define a run. No support fitting,
+    // proximity matching, or old face lineage is used here.
+    let mut runs: Vec<(usize, usize, Seg2)> = Vec::new();
+    let mut last = std::collections::BTreeMap::new();
+    let mut remaining = MAX_PLANAR_SEGMENTS * 2;
+    for (i, slab) in slabs.iter().enumerate() {
+        for lp in loops_of(slab) {
             for sg0 in &lp.segs {
                 for sg in split_seg(sg0, &pts, tol)? {
-                    let (a, b) = (sg.start(), sg.end());
-                    let lp3 = vec![
-                        edge(&sg, z0),
-                        EdgeSpec::Line { a: at(b, z0), b: at(b, z1) },
-                        edge(&sg.reversed(), z1),
-                        EdgeSpec::Line { a: at(a, z1), b: at(a, z0) },
-                    ];
-                    let tangent = plane.dir_to_world(sg.derivative(0.5));
-                    let outward = tangent.cross(d).normalized()?;
-                    let surface = match sg {
-                        Seg2::Arc { .. } => SurfSpec::Extruded { a: at(a, z0), b: at(b, z0), mid: at(sg.point_at(0.5), z0), dir: d * (z1 - z0) },
-                        _ => SurfSpec::Plane,
-                    };
-                    faces.push(FaceSpec { loops: vec![lp3], surface, probe: Some((at(sg.point_at(0.5), (z0 + z1) / 2.0), outward)) });
+                    remaining = remaining.checked_sub(1)?;
+                    let key = wall_key(&sg)?;
+                    if coalesce {
+                        if let Some(&index) = last.get(&key) {
+                            let run: &mut (usize, usize, Seg2) = runs.get_mut(index)?;
+                            if run.1 == i {
+                                run.1 = i + 1;
+                                continue;
+                            }
+                            // Duplicate oriented boundaries in one slab are not
+                            // a valid reason to reconstruct a larger wall.
+                            if run.1 == i + 1 {
+                                return None;
+                            }
+                        }
+                        last.insert(key, runs.len());
+                    }
+                    runs.push((i, i + 1, sg));
                 }
             }
         }
+    }
+    let mut faces: Vec<FaceSpec> = Vec::new();
+    let mut sources = Vec::new();
+    let frame_is_orthonormal = plane.origin.is_finite()
+        && plane.x.is_finite()
+        && plane.y.is_finite()
+        && d.is_finite()
+        && (plane.x.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && (plane.y.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && (d.len2() - 1.).abs() <= 64. * f64::EPSILON
+        && plane.x.dot(plane.y).abs() <= 64. * f64::EPSILON
+        && plane.x.dot(d).abs() <= 64. * f64::EPSILON
+        && plane.y.dot(d).abs() <= 64. * f64::EPSILON;
+    for (first, end, sg) in runs {
+        let (z0, z1) = (levels[first], levels[end]);
+        let (a, b) = (sg.start(), sg.end());
+        let mut lp3 = Vec::with_capacity(2 + 2 * (end - first));
+        lp3.push(edge(&sg, z0));
+        // Keep station vertices at both ends: neighboring stepped walls/caps
+        // must share complete edges rather than create T-junctions.
+        for k in first..end {
+            lp3.push(EdgeSpec::Line { a: at(b, levels[k]), b: at(b, levels[k + 1]) });
+        }
+        lp3.push(edge(&sg.reversed(), z1));
+        for k in (first..end).rev() {
+            lp3.push(EdgeSpec::Line { a: at(a, levels[k + 1]), b: at(a, levels[k]) });
+        }
+        let outward = plane.dir_to_world(sg.derivative(0.5)).cross(d).normalized()?;
+        let surface = match sg {
+            Seg2::Arc { .. } => SurfSpec::Extruded { a: at(a, z0), b: at(b, z0), mid: at(sg.point_at(0.5), z0), dir: d * (z1 - z0) },
+            _ => SurfSpec::Plane,
+        };
+        faces.push(FaceSpec { loops: vec![lp3], surface, probe: Some((at(sg.point_at(0.5), (z0 + z1) / 2.0), outward)) });
+        // Axis-aligned generated lines have a common oriented support frame
+        // independent of axial stations or along-line endpoint interpolation.
+        let generated_plane = if coalesce
+            && frame_is_orthonormal
+            && let Seg2::Line { a, b } = sg
+        {
+            let (origin, x) = if a.y == b.y && a.x != b.x {
+                (at(Vec2::new(0., a.y), 0.), plane.x * (b.x - a.x).signum())
+            } else if a.x == b.x && a.y != b.y {
+                (at(Vec2::new(a.x, 0.), 0.), plane.y * (b.y - a.y).signum())
+            } else {
+                (Vec3::ZERO, Vec3::ZERO)
+            };
+            (origin.is_finite() && x.len2() > 0.).then_some(Plane { origin, x, y: d })
+        } else {
+            None
+        };
+        sources.push((generated_plane.is_some() || end > first + 1).then_some(crate::FaceSource::ExtrudeSide {
+            segment: sg,
+            plane: generated_plane,
+            coalesced: end > first + 1,
+        }));
     }
     for (z, up, rs) in &caps {
         for r in rs {
@@ -836,9 +913,14 @@ fn sew_connected_sections(plane: &Plane, d: Vec3, levels: &[f64], slabs: &[Vec<R
                 loops.push(segs.iter().map(|sg| edge(sg, *z)).collect::<Vec<_>>());
             }
             faces.push(FaceSpec { loops, surface: SurfSpec::Plane, probe: None });
+            sources.push(None);
         }
     }
-    Some(crate::sew::sew_touching(&faces))
+    Some(crate::sew::sew_touching_with_sources(&faces, &sources).and_then(
+        |body| {
+            if coalesce { body.regularize_generated_planar_faces() } else { Ok(body) }
+        },
+    ))
 }
 
 fn simple_prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
@@ -1055,7 +1137,21 @@ fn stack_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>>
     if slabs.iter().all(Vec::is_empty) {
         return Some(Ok(None));
     }
-    sew_sections(&plane, d, &levels, &slabs, tol).map(|r| r.map(Some))
+    sew_sections(
+        &plane,
+        d,
+        &levels,
+        &slabs,
+        tol,
+        op == BoolOp::Cut
+            && !a.regularization_protected
+            && !b.regularization_protected
+            && a.split_keep().is_empty()
+            && b.split_keep().is_empty()
+            && a.paint().is_none_or(|p| p.faces.is_empty())
+            && b.paint().is_none_or(|p| p.faces.is_empty()),
+    )
+    .map(|r| r.map(Some))
 }
 
 pub(crate) fn prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
@@ -1144,7 +1240,12 @@ mod planar_tests {
                 assert!(mesh.contains(Vec3::new(21., 21., 3.)));
                 assert!(!mesh.contains(Vec3::new(25., 25., 3.)));
                 assert!(mesh.contains(Vec3::new(25., 25., 22.)));
-                assert!(lump.face_sources().is_none_or(|s| s.iter().all(Option::is_none)), "genuinely stepped geometry remains uncertified");
+                assert!(
+                    lump.face_sources().is_none_or(|s| s
+                        .iter()
+                        .all(|s| s.is_none() || matches!(s, Some(crate::FaceSource::ExtrudeSide { coalesced: true, plane: None, .. })))),
+                    "genuinely stepped geometry has no durable certificate"
+                );
                 assert!((mesh.measure().volume - (18. * (100. - 4. * std::f64::consts::PI) + 500.)).abs() < 0.02);
             }
         }
@@ -1152,6 +1253,128 @@ mod planar_tests {
         assert_eq!(crate::step_export(&[&tool], "tool").unwrap(), before_tool);
         assert_eq!(crate::step_export(&[&roof], "roof").unwrap(), before_roof);
     }
+    fn stepped_tab_stock() -> Body {
+        let stock = crate::box_solid(Vec3::new(-20., -15., 0.), Vec3::new(20., 15., 24.)).unwrap();
+        let tab = crate::box_solid(Vec3::new(-12., -25., 8.), Vec3::new(-4., -15., 16.)).unwrap();
+        crate::boolean(&stock, &tab, BoolOp::Union).unwrap().unwrap()
+    }
+
+    fn coplanar_joins(body: &Body) -> usize {
+        let faces: Vec<_> = body.solid.face_iter().collect();
+        let mut adjacency = std::collections::HashMap::<_, Vec<usize>>::new();
+        for (i, face) in faces.iter().enumerate() {
+            for edge in face.edge_iter() {
+                adjacency.entry(edge.id()).or_default().push(i);
+            }
+        }
+        adjacency
+            .values()
+            .filter(|faces| {
+                let [a, b] = faces.as_slice() else { return false };
+                let (Some(pa), Some(pb)) = (body.planar_face(*a), body.planar_face(*b)) else { return false };
+                let (na, nb) = (pa.normal(), pb.normal());
+                na.dot(nb) > 1. - 1e-12 && (pb.origin - pa.origin).dot(na).abs() < 1e-10
+            })
+            .count()
+    }
+
+    #[test]
+    fn shell_of_joined_stepped_tabs_has_no_artificial_planar_stations() {
+        let stock = stepped_tab_stock();
+        let snapshot = crate::step_export(&[&stock], "unchanged stock").unwrap();
+        assert_eq!(coplanar_joins(&stock), 0);
+        let shell = crate::shell(&stock, &[Vec3::new(0., 0., 24.)], 1.).unwrap();
+        assert_eq!(coplanar_joins(&shell), 0, "Shell must not add internal edges across continuous planar walls");
+        assert!(shell.validity().is_empty());
+        let mesh = shell.tessellate(1e-5).unwrap();
+        let expected = 40. * 30. * 24. + 8. * 10. * 8. - (38. * 28. * 23. + 6. * 10. * 6.);
+        assert!((mesh.measure().volume - expected).abs() < 1e-6);
+        for (point, material) in [
+            (Vec3::new(0., 0., 0.5), true),
+            (Vec3::new(0., 0., 10.), false),
+            (Vec3::new(0., -14.5, 10.), true),
+            (Vec3::new(19.5, 0., 10.), true),
+            (Vec3::new(-8., -24.5, 12.), true),
+            (Vec3::new(-8., -20., 12.), false),
+            (Vec3::new(0., -18., 9.), false),
+        ] {
+            assert_eq!(mesh.contains(point), material, "wrong material at {point:?}");
+        }
+        let step = crate::step_export(&[&shell], "stepped tab shell").unwrap();
+        let reopened = crate::step_import(&step).unwrap();
+        let body = &reopened.bodies[0].body;
+        assert_eq!(body.face_count(), shell.face_count());
+        assert_eq!(coplanar_joins(body), 0);
+        assert!((body.tessellate(1e-5).unwrap().measure().volume - expected).abs() < 1e-6);
+        assert_eq!(crate::step_export(&[&stock], "unchanged stock").unwrap(), snapshot);
+    }
+
+    #[test]
+    fn contiguous_analytic_walls_remove_faces_but_retain_vertical_stations() {
+        for curved in [false, true] {
+            let outer = if curved {
+                Region2 { outer: Loop2::circle(Vec2::ZERO, 10.), holes: vec![] }
+            } else {
+                rectangle(Vec2::new(-10., -10.), Vec2::new(10., 10.))
+            };
+            let mut upper = outer.clone();
+            upper.holes.push(if curved {
+                Loop2::circle(Vec2::ZERO, 5.).reversed()
+            } else {
+                rectangle(Vec2::new(-5., -5.), Vec2::new(5., 5.)).outer.reversed()
+            });
+            let slabs = vec![vec![outer], vec![upper]];
+            let old = sew_sections(&Plane::XY, Vec3::Z, &[0., 2., 20.], &slabs, 1e-7, false).unwrap().unwrap();
+            let merged = sew_sections(&Plane::XY, Vec3::Z, &[0., 2., 20.], &slabs, 1e-7, true).unwrap().unwrap();
+            let count = if curved { 2 } else { 4 };
+            assert_eq!(old.face_count() - merged.face_count(), count);
+            let marked: Vec<_> = merged.solid.face_iter().enumerate().filter(|(i, _)| merged.face_was_coalesced(*i)).collect();
+            assert_eq!(marked.len(), count);
+            for (_, face) in marked {
+                assert_eq!(face.boundaries()[0].len(), 6, "all axial station vertices are retained");
+                let heights: Vec<_> = face.vertex_iter().map(|v| v.point().z).collect();
+                for z in [0., 2., 20.] {
+                    assert!(heights.contains(&z));
+                }
+            }
+            assert!(old.face_sources().is_none_or(|s| s.iter().all(Option::is_none)));
+            let expected = if curved { std::f64::consts::PI * (100. * 20. - 25. * 18.) } else { 400. * 20. - 100. * 18. };
+            let mesh = merged.tessellate(1e-5).unwrap();
+            assert!((mesh.measure().volume - expected).abs() < 0.03);
+            assert!(mesh.contains(Vec3::new(0., 0., 1.)));
+            assert!(!mesh.contains(Vec3::new(0., 0., 10.)));
+            assert!(merged.validity().is_empty());
+            assert_ne!(wall_key(&slabs[0][0].outer.segs[0]), wall_key(&slabs[0][0].outer.segs[0].reversed()));
+        }
+    }
+
+    #[test]
+    fn cut_run_coalescing_respects_authored_splits_and_face_paint() {
+        let region = Region2 { outer: Loop2::circle(Vec2::ZERO, 10.), holes: vec![] };
+        let tool_region = Region2 { outer: Loop2::circle(Vec2::ZERO, 5.), holes: vec![] };
+        let stock = crate::extrude(&Plane::XY, &[region], 0., 20.).unwrap().pop().unwrap();
+        let cutter = crate::extrude(&Plane::XY, &[tool_region], 2., 22.).unwrap().pop().unwrap();
+        let merged = stack_boolean(&stock, &cutter, BoolOp::Cut).unwrap().unwrap().unwrap();
+        let protected = [
+            stock.clone().with_split_lines(Some(std::sync::Arc::new(vec![vec![Vec3::new(10., 0., 0.), Vec3::new(10., 0., 20.)]]))),
+            stock.with_paint(Some(crate::Paint { opacity: 1., faces: vec![crate::FacePaint { face: 0, color: [1., 0., 0.], opacity: 1. }] })),
+        ];
+        for input in protected {
+            let output = stack_boolean(&input, &cutter, BoolOp::Cut).unwrap().unwrap().unwrap();
+            assert_eq!(output.face_count(), merged.face_count() + 2);
+            assert!((0..output.face_count()).all(|i| !output.face_was_coalesced(i)));
+            // Independent circular chord-volume bound: 2*pi*(10*20+5*18)*1e-5 < .019.
+            let expected = std::f64::consts::PI * (100. * 20. - 25. * 18.);
+            for body in [&output, &merged] {
+                let mesh = body.tessellate(1e-5).unwrap();
+                assert!((mesh.measure().volume - expected).abs() < 0.03);
+                assert!(mesh.contains(Vec3::new(0., 0., 1.)));
+                assert!(!mesh.contains(Vec3::new(0., 0., 10.)));
+                assert!(mesh.contains(Vec3::new(7., 0., 10.)));
+            }
+        }
+    }
+
     #[test]
     fn annular_inward_tool_recovers_exact_stacks_before_cap_policy() {
         let plane = Plane::XY;

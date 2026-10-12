@@ -224,6 +224,9 @@ pub struct Camera {
     pub yaw: f64,
     /// Elevation above the XY plane, in (−π/2, π/2].
     pub pitch: f64,
+    /// Rotation about the viewing direction. Zero keeps the world's up axis vertical.
+    #[serde(default)]
+    pub roll: f64,
     /// Distance from target to eye.
     pub distance: f64,
     /// Vertical field of view (radians); 0 = orthographic.
@@ -236,7 +239,7 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         let (yaw, pitch) = StandardView::Iso.angles();
-        Camera { target: Vec3::ZERO, yaw, pitch, distance: 200.0, fov: 0.0, up: UpAxis::Z }
+        Camera { target: Vec3::ZERO, yaw, pitch, roll: 0.0, distance: 200.0, fov: 0.0, up: UpAxis::Z }
     }
 }
 
@@ -266,7 +269,8 @@ impl Camera {
         let b = self.back();
         let right = self.up.from_frame(Vec3::new(self.yaw.cos(), -self.yaw.sin(), 0.0));
         let up = b.cross(right).normalized().unwrap_or(self.up.dir());
-        (right, up, b)
+        let (s, c) = self.roll.sin_cos();
+        (right * c + up * s, up * c - right * s, b)
     }
     pub fn view(&self) -> Mat4 {
         let (r, u, b) = self.basis();
@@ -349,11 +353,18 @@ impl Camera {
         self.yaw = (self.yaw + dx * 0.008) % std::f64::consts::TAU;
         self.pitch = (self.pitch + dy * 0.008).clamp(-lim, lim);
     }
+    /// Rotate the image about the viewing direction.
+    pub fn roll_by(&mut self, radians: f64) {
+        if radians.is_finite() {
+            self.roll = (self.roll + radians) % std::f64::consts::TAU;
+        }
+    }
     pub fn set_view(&mut self, v: StandardView) {
         let lim = std::f64::consts::FRAC_PI_2 - 1e-6;
         let (y, p) = v.angles();
         self.yaw = y;
         self.pitch = p.clamp(-lim, lim);
+        self.roll = 0.0;
     }
     /// Frame a bounding box.
     pub fn fit(&mut self, b: &Aabb3) {
@@ -376,15 +387,14 @@ impl Camera {
         } else {
             (-b.x).atan2(-b.y)
         };
-        Camera { yaw, pitch, ..*self }
+        Camera { yaw, pitch, roll: 0.0, ..*self }
     }
     /// Orientation as a unit quaternion (camera → world rotation).
     pub fn orientation(&self) -> Quat {
         let (r, u, b) = self.basis();
         Quat::from_basis(r, u, b)
     }
-    /// Blend between two cameras at `s` in [0, 1]: heading (the shorter way), elevation,
-    /// target, distance and field of view linearly. The ends are returned exactly.
+    /// Blend between two cameras at `s` in [0, 1]: heading and roll take the shorter way.
     pub fn interpolate(a: &Camera, b: &Camera, s: f64) -> Camera {
         if !(s > 0.0) {
             return *a;
@@ -392,24 +402,29 @@ impl Camera {
         if s >= 1.0 {
             return *b;
         }
-        // The camera has no roll, so it turns in heading and elevation: both change smoothly
-        // to the very end (the heading the shorter way round). A slerp of orientations would
-        // need a roll-free heading at every step, and near straight up or down that heading
-        // swings fast, so a move to Top spun in its last frames.
+        // Keep heading and elevation smooth near straight up or down. A quaternion slerp
+        // swings the heading sharply there when moving to Top.
         let dy = (b.yaw - a.yaw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
         let yaw = a.yaw + dy * s;
+        let dr = (b.roll - a.roll + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
         let pitch = a.pitch + (b.pitch - a.pitch) * s;
         Camera {
             target: a.target + (b.target - a.target) * s,
             yaw,
             pitch,
+            roll: a.roll + dr * s,
             distance: a.distance + (b.distance - a.distance) * s,
             fov: a.fov + (b.fov - a.fov) * s,
             up: b.up,
         }
     }
     pub fn is_valid(&self) -> bool {
-        self.target.is_finite() && self.yaw.is_finite() && self.pitch.is_finite() && self.distance.is_finite() && self.distance > 0.0
+        self.target.is_finite()
+            && self.yaw.is_finite()
+            && self.pitch.is_finite()
+            && self.roll.is_finite()
+            && self.distance.is_finite()
+            && self.distance > 0.0
     }
 }
 
@@ -442,6 +457,26 @@ mod tests {
         c.orbit(20.0, 0.0);
         let x1 = c.to_screen(near, 800.0, 600.0, 10.0).unwrap().0;
         assert!(x1 > x0, "dragging right must move the near side right: {x0} -> {x1}");
+    }
+
+    #[test]
+    fn roll_rotates_the_picture_and_standard_views_level_it() {
+        let mut c = Camera::default();
+        c.set_view(StandardView::Front);
+        let (_, before_y, _) = c.to_screen(Vec3::X, 800.0, 600.0, 10.0).unwrap();
+        c.roll_by(std::f64::consts::FRAC_PI_2);
+        let (after_x, after_y, _) = c.to_screen(Vec3::X, 800.0, 600.0, 10.0).unwrap();
+        assert!((before_y - 300.0).abs() < 1e-9);
+        assert!((after_x - 400.0).abs() < 1e-9 && after_y > 300.0);
+        let (r, u, b) = c.basis();
+        assert!(r.dot(u).abs() < 1e-12 && r.dot(b).abs() < 1e-12 && u.dot(b).abs() < 1e-12);
+        c.set_view(StandardView::Front);
+        assert_eq!(c.roll, 0.0);
+        let saved = serde_json::to_value(c).unwrap();
+        let mut old = saved.as_object().unwrap().clone();
+        old.remove("roll");
+        let restored: Camera = serde_json::from_value(serde_json::Value::Object(old)).unwrap();
+        assert_eq!(restored.roll, 0.0);
     }
 
     #[test]

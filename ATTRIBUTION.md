@@ -18,7 +18,8 @@ Generated-in-code assets are original and have no file to list:
 | File | Author | Source | Licence |
 |---|---|---|---|
 | docs/screenshots/sample-plate.png | SolveCraft contributors | screenshot of SolveCraft itself (`solvecraft --sample`) | MIT OR Apache-2.0 |
-| docs/screenshots/demo.gif | SolveCraft contributors | original screen recording of the actual SolveCraft 0.2.0 English desktop UI (2× GIF preview; full video at real-time speed) | MIT OR Apache-2.0 |
+| docs/screenshots/enclosure-demo-0.2.1.gif | SolveCraft contributors | original electronics enclosure screen recording of the actual SolveCraft 0.2.1 English desktop UI, generated with examples/demo/record_ui.sh and its original animated pointer overlay (4× playback) | MIT OR Apache-2.0 |
+| docs/screenshots/enclosure-demo-0.2.1.mp4 | SolveCraft contributors | original electronics enclosure screen recording of the actual SolveCraft 0.2.1 English desktop UI, generated with examples/demo/record_ui.sh and its original animated pointer overlay (4× playback) | MIT OR Apache-2.0 |
 | docs/book/src/generated/sample-plate.png | SolveCraft contributors | copy of docs/screenshots/sample-plate.png made by `cargo xtask book` (gitignored) | MIT OR Apache-2.0 |
 | docs/book/src/generated/bracket.png | SolveCraft contributors | rendered by `cargo xtask book` (`solvecraft-cli snapshot examples/bracket.json`; gitignored) | MIT OR Apache-2.0 |
 | docs/book/src/generated/enclosure.png | SolveCraft contributors | rendered by `cargo xtask book` (`solvecraft-cli snapshot docs/book/scripts/enclosure.json`; gitignored) | MIT OR Apache-2.0 |
@@ -55,5 +56,14 @@ Generated-in-code assets are original and have no file to list:
 |---|---|---|---|
 | vendor/truck-meshalgo | truck-meshalgo 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | meshing: parameter searches kept inside the surface domain (vendor/README.md) |
 | vendor/truck-stepio | truck-stepio 0.3.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | STEP writer: intersection-curve surfaces written at unique ids (vendor/README.md) |
-| vendor/truck-shapeops | truck-shapeops 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | robust meshing and nearest-parameter fallback in booleans; trace macro (vendor/README.md) |
+| vendor/truck-shapeops | truck-shapeops 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | robust meshing and nearest-parameter fallback in booleans; degenerate intersection-curve rejection; trace macro (vendor/README.md) |
 | vendor/matext4cgmath | matext4cgmath 0.1.0, https://github.com/ricosjp/matext4cgmath (RICOS Co. Ltd.) | Apache-2.0 | root refinement stops after 100 Newton steps (vendor/README.md) |
+
+## Vendored renderer compatibility fix
+
+`vendor/egui-wgpu` is egui-wgpu 0.36.2 from https://github.com/emilk/egui
+(MIT OR Apache-2.0; both original licence texts are included). Rust sources and
+its original `egui.wgsl` shader are retained; no images or other artwork are copied.
+SolidCraft's narrow patch selects a safe 1x MSAA path on the chosen OpenGL adapter
+and shares that effective count with the surface attachments and CAD callbacks.
+Vulkan, DirectX 12, Metal and WebGPU retain their requested multisampling.

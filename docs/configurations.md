@@ -149,5 +149,5 @@ the current rule scope.
 Newly saved designs use file format 12, including optional durable face attachments and
 analytic offset boundary identities and qualified adaptive whole-profile references, including
 holes. Older designs upgrade on opening without
-changing their existing configuration values. Older SolveCraft versions must be updated to
+changing their existing configuration values. Older SolidCraft versions must be updated to
 open newly saved designs.

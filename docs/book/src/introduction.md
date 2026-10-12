@@ -1,11 +1,11 @@
-# SolveCraft
+# SolidCraft
 
-SolveCraft is an open-source parametric 3D CAD application written in pure Rust. It works the way
-Fusion-style modellers do: sketch on a plane, constrain and dimension the sketch, turn profiles
+SolidCraft is an open-source parametric 3D CAD application written in pure Rust.
+Sketch on a plane, constrain and dimension the sketch, turn profiles
 into solids with features on a timeline, and change a parameter to watch the whole timeline
 rebuild.
 
-![The sample plate in SolveCraft](generated/sample-plate.png)
+![The sample plate in SolidCraft](generated/sample-plate.png)
 
 It runs as:
 
@@ -18,15 +18,17 @@ Everything the user can do is a *command* with JSON parameters. The toolbar, the
 the CLI, the control channel and MCP all run the same commands, so anything you can click you can
 also script, test or hand to an agent.
 
-SolveCraft is early. Sketching, solid modelling, parameters, components with joints, sheet metal
+SolidCraft is early. Sketching, solid modelling, parameters, components with joints, sheet metal
 and a plastic-enclosure subset work; surfaces, drawings, CAM and simulation are deferred. The
-[roadmap](https://github.com/bherbruck/solvecraft/blob/main/ROADMAP.md) has the details, and
+[roadmap](https://github.com/bherbruck/solidcraft/blob/main/ROADMAP.md) has the details, and
 [command parity](dev/parity.md) and the [Fusion oracle](dev/oracle.md) measure how far along it
 is.
 
-This book has two halves: the **user guide** for people modelling with SolveCraft, and the
+Existing `.solvecraft` designs and `solvecraft-cli` commands keep their names and behavior.
+
+This book has two halves: the **user guide** for people modelling with SolidCraft, and the
 **developer guide** for people working on it. The [command reference](reference/commands.md) is
 generated from the code on every build.
 
-SolveCraft is licensed MIT OR Apache-2.0. It is a clean-room implementation and is not affiliated
+SolidCraft is licensed MIT OR Apache-2.0. It is a clean-room implementation and is not affiliated
 with Autodesk; Fusion is a trademark of Autodesk, Inc.

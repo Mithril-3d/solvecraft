@@ -61,6 +61,7 @@ mod status_tests {
         assert!(app.session.log.last().is_some_and(|l| l.starts_with("Redo: ") && !l.contains("edit.redo")), "{:?}", app.session.log.last());
     }
 }
+mod expression_complete;
 #[cfg(test)]
 mod extrude_edit_tests;
 mod file_load;
@@ -78,6 +79,8 @@ mod revolve_edit_tests;
 mod revolve_manipulator_tests;
 pub mod scenario;
 pub mod selection;
+#[cfg(test)]
+mod shell_face_sketch_ui_tests;
 pub mod shortcut_box;
 pub mod sketch3d;
 #[cfg(test)]
@@ -545,6 +548,13 @@ impl SolveApp {
             self.last_command = Some((spec.id.to_string(), spec.label.to_string()));
         }
         if let Some(mut t) = tools::Tool::for_command(id) {
+            if let Some(params) = tools::constraint_preselection(id, &self.session.selection) {
+                if self.run(id, params).is_ok() {
+                    let _ = self.session.execute("select.clear", &json!({}));
+                    self.set_status("Constraint applied", false);
+                }
+                return;
+            }
             // Curve-pair constraints can consume an exact preselection. Leave ambiguous
             // selections to the ordinary pick tool; never silently constrain a subset.
             if matches!(
@@ -854,6 +864,15 @@ impl SolveApp {
         self.cam_anim = None;
     }
 
+    /// Hand the view to an external navigation device without a pending mouse orbit or spin
+    /// immediately taking it back on the next frame.
+    pub fn begin_external_navigation(&mut self) {
+        self.cancel_view_animation();
+        self.viewport.orbit_snap = None;
+        self.viewport.orbit_free = None;
+        self.viewport.spin = false;
+    }
+
     fn step_view_animation(&mut self, ctx: &egui::Context) {
         let Some(anim) = self.cam_anim else { return };
         let (cam, done) = anim.sample(self.now);
@@ -935,6 +954,7 @@ impl SolveApp {
 
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        expression_complete::begin_frame(ui.ctx());
         let t0 = now_ms();
         let _language = crate::i18n::scope(&self.preferences.language);
         let mut report_input = None;
@@ -989,9 +1009,16 @@ impl SolveApp {
     }
 
     fn drain_control(&mut self, ctx: &egui::Context) {
+        /// Requests run on this thread, so a flood would starve rendering. The rest stay
+        /// queued for the next frame.
+        const PER_FRAME: usize = 64;
+
         let Some(rx) = self.control_rx.take() else { return };
         // While the agent cursor acts out a request, later ones wait their turn.
-        while !self.agent.busy() {
+        for _ in 0..PER_FRAME {
+            if self.agent.busy() {
+                break;
+            }
             let Ok(req) = rx.try_recv() else { break };
             let reply = req.reply.clone();
             if agent_cursor::intercept(self, &req.method, &req.params, &reply) {

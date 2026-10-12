@@ -150,6 +150,30 @@ fn try_bytes(bytes: &[u8]) {
     }
 }
 
+/// Hostile shapes that no mutation of a saved file produces: plane references that close a
+/// cycle, which resolve through the model and back into the document.
+fn generated() -> Vec<(String, Vec<u8>)> {
+    let to = |name: &str| json!({"type": "plane", "plane": {"type": "construction", "name": name}});
+    let plane = |id: u64, name: &str, side: Value| {
+        json!({"id": id, "name": name, "suppressed": false, "type": "construction_plane",
+               "plane": {"type": "midplane", "a": side, "b": {"type": "plane", "plane": {"type": "origin", "name": "XZ"}}}})
+    };
+    let design = |name: &str, features: Value| {
+        json!({"format": "solvecraft/11", "name": name, "units": "mm", "params": [], "next_id": 9, "features": features}).to_string().into_bytes()
+    };
+    // A sketch past the caps interactive editing enforces: solving it would size dense matrices
+    // by the point count and abort on the allocation.
+    let point = json!({"id": "p1", "pos": [0.0, 0.0], "fixed": false});
+    let oversized = json!([{"id": 1, "name": "Sketch1", "suppressed": false, "type": "sketch",
+                            "plane": {"type": "origin", "name": "XY"},
+                            "sketch": {"points": vec![point; 200_000], "curves": [], "constraints": []}}]);
+    vec![
+        ("construction plane is its own side".into(), design("selfplane", json!([plane(1, "P1", to("P1"))]))),
+        ("two construction planes refer to each other".into(), design("twoplanes", json!([plane(1, "P1", to("P2")), plane(2, "P2", to("P1"))]))),
+        ("sketch with 200,000 points".into(), design("bigsketch", oversized)),
+    ]
+}
+
 #[test]
 fn damaged_and_hostile_design_files_never_panic() {
     let mut rng = Rng(0x5eed_cafe_f00d_d00d);
@@ -201,6 +225,7 @@ fn damaged_and_hostile_design_files_never_panic() {
         cases.push(("binary".into(), (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect()));
         all_cases.extend(cases.into_iter().map(|(what, b)| (name.clone(), what, b)));
     }
+    all_cases.extend(generated().into_iter().map(|(what, b)| ("generated".to_string(), what, b)));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let failures: Vec<String> = std::thread::scope(|scope| {

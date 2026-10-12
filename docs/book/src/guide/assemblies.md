@@ -8,7 +8,7 @@ faded.
 
 A component is placed by its **occurrences**. Paste creates another instance of the same
 component, and **Paste New** creates an independent copy. Move an occurrence with the move
-triad, then **Capture Position** to keep it or **Revert** to put it back. SolveCraft asks before
+triad, then **Capture Position** to keep it or **Revert** to put it back. SolidCraft asks before
 the next command if a move wasn't captured. **Ground** fixes an occurrence in place.
 
 Paste New copies nested component definitions, sketches, feature histories and generated
@@ -16,7 +16,7 @@ dimension parameters. Repeated child instances remain shared within the new copy
 appearances and wholly internal joints/motion records receive copied references. Design-wide
 user parameters remain shared; retained external links and omitted cross-boundary motion
 records are reported. Unsupported destructive links refuse the entire copy. See
-[individual-instance and copy details](https://github.com/bherbruck/solvecraft/blob/main/docs/occurrence-workflows.md).
+[individual-instance and copy details](https://github.com/bherbruck/solidcraft/blob/main/docs/occurrence-workflows.md).
 
 **Joints** (`joint.create`, J) connect two components by joint origins that snap to faces, edges,
 circles and vertices: rigid, revolute, slider, cylindrical, pin-slot, planar and ball, with
@@ -35,4 +35,4 @@ uses its first placement; `occurrence.properties` selects a specific instance. R
 measures the complete assembly. Volumes are summed, including overlapping bodies, rather than
 measuring their union. The same workflow is available through `component.properties` and
 `occurrence.properties`; see
-[placement and measurement details](https://github.com/bherbruck/solvecraft/blob/main/docs/assembly-properties.md).
+[placement and measurement details](https://github.com/bherbruck/solidcraft/blob/main/docs/assembly-properties.md).

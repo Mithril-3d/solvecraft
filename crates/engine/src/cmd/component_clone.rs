@@ -314,7 +314,7 @@ pub(super) fn paste(
         let base = entered.as_ref().and_then(|st| st.body(&body.name)).or_else(|| before.as_ref().and_then(|st| st.body(&body.name))).unwrap_or(body);
         let baseline_component = source.model_body_component(base);
         let geometry = solvecraft_kernel::transform_matrix(&base.body, offset)?;
-        let step = solvecraft_kernel::step_export(&[&geometry], "SolveCraft independent reassigned body")?;
+        let step = solvecraft_kernel::step_export(&[&geometry], "SolidCraft independent reassigned body")?;
         let new_name = unique(&body.name, &mut used);
         bodies.insert(body.name.clone(), new_name.clone());
         let feature_name = unique(&format!("{} Base", body.name), &mut used);

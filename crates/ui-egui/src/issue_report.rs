@@ -10,7 +10,7 @@ use crate::{SolveApp, dialogs, help};
 
 const MAX_BODY: usize = 24_000;
 const MAX_IMAGE_PIXELS: usize = 16_000_000;
-const ISSUE_URL: &str = "https://github.com/bherbruck/solvecraft/issues/new";
+const ISSUE_URL: &str = "https://github.com/bherbruck/solidcraft/issues/new";
 
 thread_local! {
     static CAD_INPUT_BLOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -480,7 +480,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 if ui.add_enabled(draft.image.is_some() && app.services.pick_save.is_some(), egui::Button::new("Save screenshot…")).clicked()
                     && let Some(image) = draft.image.as_ref()
                     && let Some(path) =
-                        app.services.pick_save.as_ref().and_then(|pick| pick(&format!("solvecraft-issue-{}.png", app.shot_token), &["png"]))
+                        app.services.pick_save.as_ref().and_then(|pick| pick(&format!("solidcraft-issue-{}.png", app.shot_token), &["png"]))
                 {
                     let result = crate::control::save_screenshot(image, Some(&path));
                     draft.note = if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {

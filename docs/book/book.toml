@@ -1,7 +1,7 @@
 [book]
-title = "SolveCraft"
+title = "SolidCraft"
 description = "An open-source parametric 3D CAD application in pure Rust: user guide and developer guide."
-authors = ["SolveCraft contributors"]
+authors = ["SolidCraft contributors"]
 language = "en"
 src = "src"
 
@@ -10,9 +10,9 @@ build-dir = "../../target/book"
 create-missing = false
 
 [output.html]
-git-repository-url = "https://github.com/bherbruck/solvecraft"
-edit-url-template = "https://github.com/bherbruck/solvecraft/edit/main/docs/book/{path}"
-site-url = "/solvecraft/"
+git-repository-url = "https://github.com/bherbruck/solidcraft"
+edit-url-template = "https://github.com/bherbruck/solidcraft/edit/main/docs/book/{path}"
+site-url = "/solidcraft/"
 no-section-label = false
 
 [output.html.search]
@@ -23,7 +23,7 @@ enable = true
 # links; these send them to the right place.
 "/dev/mcp.html" = "../guide/mcp.html"
 "/dev/docs/oracle.html" = "../oracle.html"
-"/dev/README.html" = "https://github.com/bherbruck/solvecraft/blob/main/README.md"
-"/dev/ATTRIBUTION.html" = "https://github.com/bherbruck/solvecraft/blob/main/ATTRIBUTION.md"
-"/dev/AGENTS.html" = "https://github.com/bherbruck/solvecraft/blob/main/AGENTS.md"
-"/dev/ROADMAP.html" = "https://github.com/bherbruck/solvecraft/blob/main/ROADMAP.md"
+"/dev/README.html" = "https://github.com/bherbruck/solidcraft/blob/main/README.md"
+"/dev/ATTRIBUTION.html" = "https://github.com/bherbruck/solidcraft/blob/main/ATTRIBUTION.md"
+"/dev/AGENTS.html" = "https://github.com/bherbruck/solidcraft/blob/main/AGENTS.md"
+"/dev/ROADMAP.html" = "https://github.com/bherbruck/solidcraft/blob/main/ROADMAP.md"

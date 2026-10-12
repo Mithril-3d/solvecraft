@@ -1023,6 +1023,29 @@ mod tests {
         assert_eq!(cell_value("param:width", "90 mm"), json!("90 mm"));
     }
 
+    fn click_rule_button(h: &mut crate::scenario::Harness, name: &str) {
+        // The table header also contains this name. Its TextRun may be emitted
+        // after the popup, so select the actual choice rather than matching text.
+        let bounds = h
+            .output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .rev()
+            .find_map(|(_, n)| {
+                (n.role() == egui::accesskit::Role::Button && !n.is_disabled() && n.label() == Some(name)).then(|| n.bounds()).flatten()
+            })
+            .expect("rule button");
+        h.step(&json!({"click": [(bounds.x0 + bounds.x1) / 2.0, (bounds.y0 + bounds.y1) / 2.0]})).unwrap();
+    }
+
+    fn select_rule_parameter(h: &mut crate::scenario::Harness, name: &str) {
+        click_rule_button(h, name);
+        assert!(h.widget("Choose…").is_none(), "parameter choice should close and update the dropdown");
+    }
+
     #[test]
     fn configuration_compound_condition_and_rule_order_are_editable_in_dialog() {
         let mut h = crate::scenario::Harness::new();
@@ -1032,9 +1055,11 @@ mod tests {
             {"call":"engine.execute","params":{"command":"config.configure","params":{"params":["length"]}}},
             {"start":"config.table"},{"widget":"Add or edit rule"},
             {"widget":"Always"},{"widget":"All"},{"widget":"Always"},{"widget":"Parameter"},
-            {"widget":"Choose…"},{"widget":"length"},{"widget":"Save Rule"}
+            {"widget":"Choose…"}
         ]))
         .unwrap();
+        select_rule_parameter(&mut h, "length");
+        h.step(&json!({"widget":"Save Rule"})).unwrap();
         assert!(
             matches!(&h.app.session.doc.configs.rules[0].condition,solvecraft_engine::doc::config::RuleCondition::All{conditions} if matches!(&conditions[0],solvecraft_engine::doc::config::RuleCondition::Parameter{..}))
         );
@@ -1044,7 +1069,8 @@ mod tests {
         ])).unwrap();
         assert!(h.widget("length = 20 mm").is_some());
         assert_eq!(h.app.session.doc.param("length").unwrap().expr, "40 mm");
-        h.run(&json!([{"widget":"↑"},{"widget":"Preview Row"}])).unwrap();
+        click_rule_button(&mut h, "↑");
+        h.step(&json!({"widget":"Preview Row"})).unwrap();
         assert_eq!(h.app.session.doc.configs.rules[0].id, "last");
         assert!(h.widget("length = 10 mm").is_some());
         assert_eq!(h.app.session.doc.param("length").unwrap().expr, "40 mm");
@@ -1060,8 +1086,11 @@ mod tests {
             {"call":"engine.execute","params":{"command":"config.configure","params":{"params":["length"]}}},
             {"start":"config.table"},
             {"widget":"Add or edit rule"},
-            {"widget":"Choose…"},
-            {"widget":"length"},
+            {"widget":"Choose…"}
+        ]))
+        .unwrap();
+        select_rule_parameter(&mut h, "length");
+        h.run(&json!([
             {"widget":"Save Rule"}
         ]))
         .unwrap();

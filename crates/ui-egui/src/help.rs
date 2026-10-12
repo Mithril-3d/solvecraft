@@ -11,14 +11,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COMMIT: &str = env!("SOLVECRAFT_COMMIT");
 pub const BUILD_DATE: &str = env!("SOLVECRAFT_BUILD_DATE");
 /// The user and developer guide (docs/book, published by .github/workflows/pages.yml).
-pub const DOCS_URL: &str = "https://bherbruck.github.io/solvecraft/";
+pub const DOCS_URL: &str = "https://bherbruck.github.io/solidcraft/";
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
 use solvecraft_engine::licences::{LICENSE_APACHE, LICENSE_MIT, NOTICE, THIRD_PARTY};
 /// Fonts: what this build carries.
 pub const FONTS: &str = "The interface uses egui's built-in fonts (Ubuntu Light and Hack, under the Ubuntu Font Licence and \
 the MIT/Bitstream Vera licence; Noto Emoji and the emoji icon font, under the OFL and MIT). Sketch text uses Liberation Sans \
 (SIL OFL 1.1). The Crafting Apps' optional font pack, craft-fonts (BIZ UDPGothic, Shippori Mincho, BIZ UDMincho, Noto Sans \
-CJK SC, Noto Sans Arabic; SIL OFL 1.1), is not bundled in SolveCraft builds.";
+CJK SC, Noto Sans Arabic; SIL OFL 1.1), is not bundled in SolidCraft builds.";
 
 #[derive(Default)]
 pub struct HelpState {
@@ -32,7 +32,7 @@ pub struct HelpState {
 pub fn diagnostics(app: &SolveApp) -> String {
     let renderer = if app.viewport.gpu.is_some() { "GPU" } else { "CPU" };
     format!(
-        "SolveCraft {VERSION} ({COMMIT}, built {BUILD_DATE})\nOS: {} {}\nRenderer: {renderer}{}\nWindow: {}\nDesign: {} ({} features, {} bodies)",
+        "SolidCraft {VERSION} ({COMMIT}, built {BUILD_DATE})\nOS: {} {}\nRenderer: {renderer}{}\nWindow: {}\nDesign: {} ({} features, {} bodies)",
         std::env::consts::OS,
         std::env::consts::ARCH,
         app.help.gpu.as_ref().map(|g| format!(", {g}")).unwrap_or_default(),
@@ -71,7 +71,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context, anchor: egui::Pos2) {
                 crate::context_menu::menu_frame(ui, |ui| {
                     for (id, label) in [
                         ("docs", "Documentation"),
-                        ("about", "About SolveCraft"),
+                        ("about", "About SolidCraft"),
                         ("shortcuts", "Keyboard Shortcuts"),
                         ("report", "Report an Issue…"),
                     ] {
@@ -100,12 +100,12 @@ fn about(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let t = Tokens::get();
     let mut open = true;
-    crate::frame::window(ctx, "About SolveCraft", crate::frame::Width::Normal)
+    crate::frame::window(ctx, "About SolidCraft", crate::frame::Width::Normal)
         .id(egui::Id::new("sc_about"))
         .open(&mut open)
         .default_size(vec2(440.0, 560.0))
         .show(ctx, |ui| {
-            ui.label(RichText::new("SolveCraft").size(22.0).strong());
+            ui.label(RichText::new("SolidCraft").size(22.0).strong());
             ui.label(format!("Version {VERSION} · commit {COMMIT} · built {BUILD_DATE}"));
             ui.label(RichText::new("Open-source parametric 3D CAD in Rust. Licensed MIT OR Apache-2.0.").color(t.text_dim));
             ui.add_space(6.0);

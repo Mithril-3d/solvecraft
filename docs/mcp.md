@@ -1,6 +1,6 @@
-# SolveCraft and AI agents (MCP)
+# SolidCraft and AI agents (MCP)
 
-SolveCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio
+SolidCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio
 (JSON-RPC 2.0, one message per line; protocol revisions 2025-06-18, 2025-03-26 and 2024-11-05).
 An agent models exactly like a person does: every tool runs engine commands, the same ones the
 toolbar, palette, scripts and control channel use, and never opens a dialog.

@@ -63,7 +63,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         .min_width(420.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            ui.label("SolveCraft closed before these designs were saved. Their last autosave can be opened.");
+            ui.label("SolidCraft closed before these designs were saved. Their last autosave can be opened.");
             ui.add_space(6.0);
             for e in app.recoverable.iter().take(20) {
                 ui.label(RichText::new(&e.name).strong());

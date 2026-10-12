@@ -15,6 +15,12 @@ use crate::linalg::{Mat, determined_vars, solve as lin_solve};
 use crate::model::{ConstraintKind, CurveKind, Sketch};
 
 const MAX_ITERS: usize = 500;
+/// Variables in one connected component. Each component is solved as a dense system: an n by n
+/// matrix for the Levenberg-Marquardt step, rows by n for the Jacobian. 4,000 variables is a
+/// 128 MB matrix; past that the request grows to gigabytes and an allocation failure aborts the
+/// process, which no panic guard can intercept. A component this size is reported as failed and
+/// its geometry left alone.
+const MAX_COMPONENT_VARS: usize = 4_000;
 /// Converged when every residual is below this (mm).
 const TOL: f64 = 1e-9;
 /// A solution is accepted when every residual is below this (mm).
@@ -1050,8 +1056,9 @@ pub fn solve_holding(sk: &mut Sketch, hold: &Hold) -> SolveReport {
     let mut iterations = 0;
     // Solve each component; `blocks` is consumed by index so rebuild per component.
     let all_blocks = blocks;
+    let oversized = |vars: &[usize]| vars.len() > MAX_COMPONENT_VARS;
     for (_, vars, bis) in &comps {
-        if bis.is_empty() {
+        if bis.is_empty() || oversized(vars) {
             continue;
         }
         let sub: Vec<(Block, Vec<usize>)> = bis.iter().filter_map(|&bi| all_blocks.get(bi).map(|(b, v)| (copy_block(b), v.clone()))).collect();
@@ -1064,6 +1071,10 @@ pub fn solve_holding(sk: &mut Sketch, hold: &Hold) -> SolveReport {
     let mut failing: Vec<String> = Vec::new();
     let mut det = vec![false; lay.n];
     let mut rank = 0;
+    // A component too large to solve is a failure, not an allocation.
+    if comps.iter().any(|(_, vars, bis)| !bis.is_empty() && oversized(vars)) {
+        max_residual = f64::MAX;
+    }
     let mut check = |r: &[f64], owner: &[usize], blocks: &[(Block, Vec<usize>)], failing: &mut Vec<String>| {
         max_residual = max_residual.max(max_abs(r));
         for (row, v) in r.iter().enumerate() {
@@ -1077,6 +1088,9 @@ pub fn solve_holding(sk: &mut Sketch, hold: &Hold) -> SolveReport {
         }
     };
     for (_, vars, bis) in &comps {
+        if oversized(vars) {
+            continue;
+        }
         let sub: Vec<(Block, Vec<usize>)> = bis.iter().filter_map(|&bi| all_blocks.get(bi).map(|(b, v)| (copy_block(b), v.clone()))).collect();
         if sub.is_empty() {
             continue;
@@ -1249,5 +1263,40 @@ mod typed_dimension_tests {
         assert!((direction.angle() + std::f64::consts::FRAC_PI_4).abs() < 1e-7);
         sk.remove_curves(&[l]);
         assert!(sk.constraints.is_empty());
+    }
+
+    /// One connected component is solved as a dense system, so its variable count sets the
+    /// allocation: 10,000 chained points are 20,000 variables and a 3.2 GB matrix. The solve
+    /// has to report failure instead of asking for the memory, because an allocation failure
+    /// aborts the process where a failed solve does not.
+    #[test]
+    fn components_too_large_to_solve_fail_instead_of_allocating() {
+        let mut sk = Sketch::new();
+        let mut previous = 0;
+        for i in 1..10_000 {
+            let p = sk.add_point(Vec2::new(0.001 * i as f64, 0.0), None).unwrap();
+            sk.add_constraint(ConstraintKind::Coincident { p: previous, q: p }, None).unwrap();
+            previous = p;
+        }
+        let before = sk.points.clone();
+        let t = std::time::Instant::now();
+        let report = solve(&mut sk);
+        assert_eq!(report.status, SolveStatus::Failed);
+        // Geometry is left as it was.
+        assert_eq!(sk.points, before);
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "took {:?}", t.elapsed());
+    }
+
+    /// A sketch whose components each stay under the cap still solves.
+    #[test]
+    fn many_small_components_still_solve() {
+        let mut sk = Sketch::new();
+        for i in 0..200 {
+            let a = sk.add_point(Vec2::new(i as f64, 0.0), None).unwrap();
+            let b = sk.add_point(Vec2::new(i as f64, 5.0), None).unwrap();
+            let l = sk.add_line_pts(a, b, None).unwrap();
+            sk.add_constraint(ConstraintKind::Vertical { l }, None).unwrap();
+        }
+        assert!(solve(&mut sk).ok());
     }
 }

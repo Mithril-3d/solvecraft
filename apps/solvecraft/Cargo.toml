@@ -1,6 +1,6 @@
 [package]
 name = "solvecraft"
-description = "SolveCraft desktop app"
+description = "SolidCraft desktop app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,5 +19,12 @@ serde_json = { workspace = true }
 log = { workspace = true }
 rfd = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+quick-xml = { workspace = true }
+
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[build-dependencies]
+embed-resource = "3.0.11"

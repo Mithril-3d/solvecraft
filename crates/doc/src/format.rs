@@ -36,13 +36,16 @@
 //! - 12: persistent analytic offset boundary roles and association profile references.
 //!   Older analytic chains retain their source/output correspondence and saved geometry;
 //!   migration never invents retired entities or renumbers existing curves.
+//! - 13: exact planar shell face anchors retain the shell producer, original certified
+//!   source and distinct inner/outer role. Version 12 anchors retain their identities;
+//!   migration never guesses attachments for older designs.
 
 use serde_json::Value;
 
 use crate::{DocError, Document, Result};
 
 /// The format this build writes.
-pub const FORMAT: u32 = 12;
+pub const FORMAT: u32 = 13;
 
 pub fn format_string(n: u32) -> String {
     format!("solvecraft/{n}")
@@ -55,8 +58,8 @@ pub fn version_of(s: &str) -> Option<u32> {
 
 /// JSON-level upgrades: entry `i` turns format `i + 1` into `i + 2`.
 type JsonStep = fn(&mut Value) -> Result<()>;
-const JSON_STEPS: [JsonStep; 11] =
-    [|_| Ok(()), v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(())];
+const JSON_STEPS: [JsonStep; 12] =
+    [|_| Ok(()), v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(()), |_| Ok(())];
 
 /// Old XZ references retain their exact frame, including nested offset and angled planes.
 /// New origin references use +Y; freezing the old frame avoids changing sketch coordinates,
@@ -129,21 +132,21 @@ fn v2_to_v3(v: &mut Value) -> Result<()> {
 
 /// Read a design file's JSON, upgrading older formats.
 pub fn read(s: &str) -> Result<Document> {
-    let mut v: Value = serde_json::from_str(s).map_err(|e| DocError::Invalid(format!("not a SolveCraft design: {e}")))?;
+    let mut v: Value = serde_json::from_str(s).map_err(|e| DocError::Invalid(format!("not a SolidCraft design: {e}")))?;
     let Some(obj) = v.as_object() else {
-        return Err(DocError::Invalid("not a SolveCraft design (expected a JSON object)".into()));
+        return Err(DocError::Invalid("not a SolidCraft design (expected a JSON object)".into()));
     };
     let version = match obj.get("format") {
         None => 1,
-        Some(Value::String(f)) => version_of(f).ok_or_else(|| DocError::Invalid(format!("not a SolveCraft design (format `{f}`)")))?,
-        Some(_) => return Err(DocError::Invalid("not a SolveCraft design (format is not a string)".into())),
+        Some(Value::String(f)) => version_of(f).ok_or_else(|| DocError::Invalid(format!("not a SolidCraft design (format `{f}`)")))?,
+        Some(_) => return Err(DocError::Invalid("not a SolidCraft design (format is not a string)".into())),
     };
     if version == 0 {
-        return Err(DocError::Invalid("not a SolveCraft design (format 0)".into()));
+        return Err(DocError::Invalid("not a SolidCraft design (format 0)".into()));
     }
     if version > FORMAT {
         return Err(DocError::Invalid(format!(
-            "this design was saved by a newer SolveCraft (file format {version}; this version reads formats up to {FORMAT}): update SolveCraft to open it"
+            "this design was saved by a newer SolidCraft (file format {version}; this version reads formats up to {FORMAT}): update SolidCraft to open it"
         )));
     }
     check_numbers(&v, 0)?;
@@ -153,6 +156,7 @@ pub fn read(s: &str) -> Result<Document> {
     validate_versioned_geometry(&v)?;
     validate_emboss_targets(&v)?;
     validate_freeform_offsets(&v)?;
+    validate_sketch_sizes(&v)?;
     crate::format_offsets::validate_raw(&v)?;
     let legacy_wires = validate_wires(&v, version)?;
     validate_body_transfers(&v)?;
@@ -211,6 +215,29 @@ pub fn read(s: &str) -> Result<Document> {
     normalise(&mut d)?;
     d.format = format_string(FORMAT);
     Ok(d)
+}
+
+/// The caps interactive editing enforces, applied to the raw JSON so an oversized sketch is
+/// never deserialised. Every sketch in the timeline is solved when the design opens, and the
+/// solver sizes its dense matrices by the sketch, so a file with hundreds of thousands of
+/// points would ask the allocator for terabytes and abort before anything could report it.
+fn validate_sketch_sizes(value: &Value) -> Result<()> {
+    let Some(features) = value.get("features").and_then(Value::as_array) else { return Ok(()) };
+    let invalid = || DocError::Invalid("damaged design: sketch too large".into());
+    for feature in features {
+        if feature.get("type").and_then(Value::as_str) != Some("sketch") {
+            continue;
+        }
+        let Some(sketch) = feature.get("sketch") else { continue };
+        let len = |key: &str| sketch.get(key).and_then(Value::as_array).map_or(0, Vec::len);
+        if len("points") > solvecraft_sketch::MAX_POINTS
+            || len("curves") > solvecraft_sketch::MAX_CURVES
+            || len("constraints") > solvecraft_sketch::MAX_CONSTRAINTS
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 /// Bound arrays before typed allocation; only old files with absent markers need migration.
@@ -923,7 +950,7 @@ mod tests {
             let error = read(&value.to_string()).unwrap_err().to_string();
             assert!(error.contains("free-form offset metadata"), "{error}");
             value["format"] = Value::from(format_string(FORMAT + 1));
-            assert!(read(&value.to_string()).unwrap_err().to_string().contains("newer SolveCraft"));
+            assert!(read(&value.to_string()).unwrap_err().to_string().contains("newer SolidCraft"));
         }
     }
 
@@ -948,7 +975,7 @@ mod tests {
             assert!(error.contains("emboss face"), "{error}");
             value["format"] = Value::from(format_string(FORMAT + 1));
             let error = read(&value.to_string()).unwrap_err().to_string();
-            assert!(error.contains("newer SolveCraft"), "{error}");
+            assert!(error.contains("newer SolidCraft"), "{error}");
         }
     }
 
@@ -1011,7 +1038,7 @@ mod tests {
         value["configs"]["columns"] = serde_json::json!([{"unknown_future_column":"Body"}]);
         value["configs"]["rules"] = serde_json::json!({"unknown_future_rule": true});
         let error = read(&value.to_string()).unwrap_err().to_string();
-        assert!(error.contains("newer SolveCraft") && error.contains("update SolveCraft"), "{error}");
+        assert!(error.contains("newer SolidCraft") && error.contains("update SolidCraft"), "{error}");
         assert!(!error.contains("unknown variant"), "format refusal precedes decoding new variants");
     }
 
@@ -1063,7 +1090,7 @@ mod tests {
         saved["format"] = Value::from(format_string(FORMAT + 1));
         saved["features"][0]["sketch"]["constraints"][0]["type"] = Value::from("future_dimension");
         let error = read(&saved.to_string()).unwrap_err().to_string();
-        assert!(error.contains("newer SolveCraft") && !error.contains("unknown variant"), "{error}");
+        assert!(error.contains("newer SolidCraft") && !error.contains("unknown variant"), "{error}");
     }
 
     #[test]
@@ -1175,7 +1202,7 @@ mod tests {
         assert!(read(&v.to_string()).is_ok(), "a file without a format is format 1");
         v["format"] = Value::from(format_string(FORMAT + 1));
         let e = read(&v.to_string()).unwrap_err().to_string();
-        assert!(e.contains("newer SolveCraft"), "{e}");
+        assert!(e.contains("newer SolidCraft"), "{e}");
         for bad in ["solvecraft/0", "acad/3", "solvecraft/-1", "solvecraft/99999999999999999999"] {
             v["format"] = Value::from(bad);
             assert!(read(&v.to_string()).is_err(), "{bad}");
@@ -1198,5 +1225,36 @@ mod tests {
         v["huge"] = Value::from(1e300);
         assert!(read(&v.to_string()).is_err(), "out-of-range numbers anywhere");
         assert!(read("{\"format\": 2}").is_err());
+    }
+
+    /// Every sketch in the timeline is solved when the design opens, and the solver sizes its
+    /// dense matrices by the sketch. The caps interactive editing enforces have to hold for a
+    /// file too, before the arrays are deserialised.
+    #[test]
+    fn oversized_sketches_are_refused_before_typed_decoding() {
+        use solvecraft_sketch::{MAX_CONSTRAINTS, MAX_CURVES, MAX_POINTS, Sketch};
+
+        // A sketch right at the point cap, chained by coincident constraints.
+        let mut sketch = Sketch::new();
+        let mut previous = 0;
+        while sketch.points.len() < MAX_POINTS {
+            let i = sketch.add_point(solvecraft_geom::Vec2::new(0.001 * sketch.points.len() as f64, 0.0), None).unwrap();
+            sketch.add_constraint(solvecraft_sketch::ConstraintKind::Coincident { p: previous, q: i }, None).unwrap();
+            previous = i;
+        }
+        let mut doc = Document::new("big sketch");
+        doc.add_feature(crate::FeatureKind::Sketch { plane: crate::PlaneRef::Origin { name: "XY".into() }, sketch }, None).unwrap();
+        let at_cap: Value = serde_json::from_str(&doc.to_json()).unwrap();
+        assert!(read(&at_cap.to_string()).is_ok(), "a sketch at the caps must still load");
+
+        // One past each cap, grown at the JSON level: no typed array is ever built.
+        for (key, cap) in [("points", MAX_POINTS), ("constraints", MAX_CONSTRAINTS), ("curves", MAX_CURVES)] {
+            let mut value = at_cap.clone();
+            let slot = &mut value["features"][0]["sketch"][key];
+            let first = slot.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null);
+            *slot = Value::Array(vec![first; cap + 1]);
+            let error = read(&value.to_string()).unwrap_err().to_string();
+            assert!(error.contains("sketch too large"), "{key}: {error}");
+        }
     }
 }

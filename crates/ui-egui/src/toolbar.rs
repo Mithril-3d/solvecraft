@@ -36,6 +36,13 @@ pub fn promoted(tab: &str, panel: &str) -> usize {
     }
 }
 
+fn report_rect(bar: Rect, captions: f32, tabs_start: f32) -> (Rect, bool) {
+    let right = bar.right() - captions - 90.0;
+    let labeled = right - tabs_start >= 340.0;
+    let width = if labeled { 124.0 } else { 28.0 };
+    (Rect::from_min_size(pos2(right - width, bar.top() + 4.0), vec2(width, 26.0)), labeled)
+}
+
 pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     egui::Panel::top("sc_appbar").exact_size(34.0).show_separator_line(false).frame(egui::Frame::NONE.fill(t.app_bar)).show(ui, |ui| {
@@ -45,14 +52,62 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::titlebar::drag_area(ui, r);
         }
         let left = r.left() + if app.integrated_titlebar { crate::titlebar::TRAFFIC_LIGHTS } else { 0.0 };
-        // Brand mark: a small solid block drawn in code.
-        let logo = Rect::from_center_size(pos2(left + 20.0, r.center().y), vec2(20.0, 20.0));
-        icons::paint(ui.painter(), logo, "box", Color32::from_rgb(220, 226, 236), Color32::from_rgb(90, 160, 240), Color32::WHITE);
-        ui.painter().text(pos2(left + 36.0, r.center().y), Align2::LEFT_CENTER, "SolveCraft", FontId::proportional(14.0), t.app_bar_text);
-        let mut x = left + 128.0;
+        // Keep the current header controls and product name when merging the new mark.
+        let compact_actions = r.right() - left < 640.0;
+        // Brand mark: the SolidCraft logo, drawn in code from the SVG's own coordinates
+        // (viewBox 357 x 412). Same 20 px height and centre as the old block.
+        {
+            let c = pos2(left + 20.0, r.center().y);
+            let s = 20.0 / 412.217;
+            let m =
+                |pts: &[(f32, f32)]| -> Vec<egui::Pos2> { pts.iter().map(|&(x, y)| pos2(c.x + (x - 178.5) * s, c.y + (y - 206.1) * s)).collect() };
+            let p = ui.painter();
+            // egui only fills convex shapes, so each face is a few overlapping convex pieces.
+            let face = |col: Color32, pts: &[(f32, f32)]| {
+                p.add(egui::Shape::convex_polygon(m(pts), col, Stroke::NONE));
+            };
+            let (light, mid, dark) = (Color32::from_rgb(96, 158, 236), Color32::from_rgb(58, 136, 238), Color32::from_rgb(55, 108, 197));
+            face(light, &[(3.5, 105.9), (177.0, 5.8), (263.4, 55.6), (263.8, 156.0), (177.0, 406.4)]);
+            face(light, &[(177.0, 206.1), (263.8, 156.0), (350.5, 206.2), (350.5, 306.3), (177.0, 406.4)]);
+            face(mid, &[(3.5, 105.9), (177.0, 206.1), (177.0, 406.4)]);
+            face(mid, &[(3.5, 105.9), (3.5, 205.7), (90.3, 256.2), (177.0, 206.1)]);
+            face(mid, &[(177.0, 206.1), (90.3, 256.2), (90.0, 356.2), (177.0, 406.4)]);
+            face(dark, &[(264.1, 155.8), (177.0, 206.1), (177.0, 406.4), (263.8, 256.2)]);
+            face(dark, &[(263.8, 256.2), (350.5, 206.2), (350.5, 306.3), (177.0, 406.4)]);
+            face(dark, &[(177.0, 206.1), (177.0, 406.4), (350.5, 306.3)]);
+            face(dark, &[(263.8, 55.9), (263.8, 156.0), (177.1, 105.9)]);
+            // White edge lines.
+            let edge = Stroke::new(10.0 * s, Color32::WHITE);
+            let line = |pts: &[(f32, f32)]| {
+                p.add(egui::Shape::line(m(pts), edge));
+            };
+            line(&[(263.8, 55.9), (177.1, 105.9), (263.8, 156.0), (263.8, 256.2), (350.6, 206.1)]);
+            line(&[(5.0, 105.9), (178.5, 206.1), (178.5, 406.4)]);
+            line(&[(177.0, 206.1), (263.8, 156.0)]);
+            p.add(egui::Shape::closed_line(
+                m(&[
+                    (178.5, 5.8),
+                    (5.0, 105.9),
+                    (5.0, 206.1),
+                    (91.7, 256.2),
+                    (91.7, 356.4),
+                    (178.5, 406.4),
+                    (352.0, 306.3),
+                    (352.0, 206.1),
+                    (265.2, 156.0),
+                    (265.2, 55.9),
+                ]),
+                edge,
+            ));
+        }
+        if !compact_actions {
+            ui.painter().text(pos2(left + 36.0, r.center().y), Align2::LEFT_CENTER, "SolidCraft", FontId::proportional(14.0), t.app_bar_text);
+        }
+        let mut x = left + if compact_actions { 60.0 } else { 128.0 };
         let mut click = |ui: &mut egui::Ui, icon: &str, tip: &str| -> bool {
-            let br = Rect::from_center_size(pos2(x, r.center().y), vec2(26.0, 26.0));
-            x += 30.0;
+            let width = if compact_actions { 22.0 } else { 26.0 };
+            let br = Rect::from_center_size(pos2(x, r.center().y), vec2(width, 26.0));
+            x += if compact_actions { 22.0 } else { 30.0 };
             let resp = ui.interact(br, ui.id().with(("ab", icon)), Sense::click());
             crate::scenario::publish_handle(&format!("appbar:{icon}"), br.center());
             if resp.hovered() {
@@ -83,7 +138,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
             app.home.show(rev);
         }
         let theme_tip = if app.ui.dark { app.tr("ui.light") } else { app.tr("ui.dark") };
-        if click(ui, if app.ui.dark { "sun" } else { "moon" }, theme_tip) {
+        if !compact_actions && click(ui, if app.ui.dark { "sun" } else { "moon" }, theme_tip) {
             app.ui.dark = !app.ui.dark;
             app.preferences.theme = if app.ui.dark { "dark" } else { "light" }.into();
         }
@@ -109,7 +164,34 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
         // Document tabs.
         let captions = if app.custom_titlebar { crate::titlebar::WIDTH } else { 0.0 };
-        crate::documents::tabs(app, ui, r, x + 16.0, r.right() - captions - 90.0);
+        let tabs_start = x + 16.0;
+        let (report, report_label) = report_rect(r, captions, tabs_start);
+        let tabs_end = report.left() - 8.0;
+        // Narrow title bars can fit only part of the tab strip. Its hit regions must not
+        // extend into the persistent report and window controls.
+        let tabs_rect = Rect::from_min_max(pos2(tabs_start.min(tabs_end), r.top()), pos2(tabs_end, r.bottom()));
+        let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(tabs_rect));
+        tabs_ui.set_clip_rect(tabs_rect.intersect(ui.clip_rect()));
+        crate::documents::tabs(app, &mut tabs_ui, r, tabs_start, tabs_end);
+        let response = ui.interact(report, ui.id().with("sc_report_button"), Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Report a bug"));
+        crate::scenario::publish_handle("titlebar:report", report.center());
+        ui.painter().rect_filled(report, 4.0, if response.hovered() || response.has_focus() { t.hover } else { t.app_bar });
+        ui.painter().rect_stroke(report, 4.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+        let icon = Rect::from_center_size(pos2(report.left() + 14.0, report.center().y), vec2(18.0, 18.0));
+        icons::paint(ui.painter(), icon, "bug_report", t.app_bar_text, t.app_bar_text, t.app_bar);
+        if report_label {
+            ui.painter().text(
+                pos2(report.left() + 29.0, report.center().y),
+                Align2::LEFT_CENTER,
+                "Report a bug",
+                FontId::proportional(13.0),
+                t.app_bar_text,
+            );
+        }
+        if response.on_hover_text("Report a bug — review a screenshot and open a GitHub draft").clicked() {
+            crate::help::run(app, &ui.ctx().clone(), "report");
+        }
         // Preferences, at the top right like Fusion's profile menu (also Ctrl+,).
         let gear = Rect::from_center_size(pos2(r.right() - captions - 70.0, r.center().y), vec2(24.0, 24.0));
         let gresp = ui.interact(gear, ui.id().with("sc_prefs_button"), Sense::click());
@@ -332,6 +414,14 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
         // Panels.
         let tab = app.ui.tab.clone();
+        // The command whose tool or dialog is open right now, shown pressed in the toolbar.
+        let running: Option<String> = match (&app.tool, &app.dialog) {
+            (Some(tool), _) => Some(tool.cmd.to_string()),
+            // Create Sketch never lands in last_command (it is not repeatable).
+            (None, Some(d)) if matches!(d.kind, crate::dialogs::Kind::Sketch) => Some("sketch.create".to_string()),
+            (None, Some(_)) => app.last_command.as_ref().map(|(id, _)| id.clone()),
+            _ => None,
+        };
         let mut px = r.left() + 112.0;
         let top = r.top() + 26.0;
         let mut drop: Option<(&'static str, &'static str, Option<&'static str>)> = None;
@@ -381,7 +471,9 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 if resp.secondary_clicked() {
                     menu = Some((resp.interact_pointer_pos().unwrap_or(br.left_bottom()), c.id));
                 }
-                if resp.hovered() && info.enabled {
+                if running.as_deref() == Some(c.id) {
+                    painter.rect_filled(br, 4.0, t.border.gamma_multiply(0.7));
+                } else if resp.hovered() && info.enabled {
                     painter.rect_filled(br, 4.0, t.hover);
                 }
                 let (ink, fill, acc) = if info.enabled {
@@ -389,9 +481,19 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 } else {
                     (t.border, t.panel_header, t.border)
                 };
-                let icon = if c.id == "sketch.finish" { "finish" } else { c.icon };
+                let icon = match c.id {
+                    "sketch.finish" => "finish",
+                    "config.table" => "configuration_table",
+                    _ => c.icon,
+                };
                 icons::paint(&painter, br.shrink(6.0), icon, ink, fill, acc);
-                let tr_label = app.tr_label(c.label);
+                let label = match c.id {
+                    "parameters.change" if *panel == "CONFIGURE" => "Parameters",
+                    "config.table" if *panel == "CONFIGURE" => "Configurations",
+                    _ => c.label,
+                };
+                let tr_label = app.tr_label(label);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled() && info.enabled, tr_label));
                 let tip = match &info.disabled_reason {
                     Some(why) => format!("{}\n{why}", tr_label),
                     None => format!("{}{}", tr_label, c.shortcut.map(|k| format!("  ({k})")).unwrap_or_default()),
@@ -610,5 +712,101 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod header_report_tests {
+    use super::*;
+
+    fn captured_frame(h: &mut crate::scenario::Harness) {
+        let token = h.app.shot_token;
+        crate::issue_report::receive(&mut h.app, token, std::sync::Arc::new(egui::ColorImage::new([2, 2], vec![Color32::GREEN; 4])));
+        h.frames(3);
+    }
+
+    #[test]
+    fn header_report_reserves_controls_at_normal_and_double_scale_widths() {
+        for physical_width in [900.0, 1400.0] {
+            for scale in [1.0, 2.0] {
+                let width = physical_width / scale;
+                let bar = Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 34.0));
+                for captions in [0.0, crate::titlebar::WIDTH] {
+                    let (report, labeled) = report_rect(bar, captions, 354.0);
+                    assert!(bar.contains_rect(report));
+                    let prefs = Rect::from_center_size(pos2(width - captions - 70.0, 17.0), vec2(24.0, 24.0));
+                    assert!(!report.intersects(prefs));
+                    assert!(report.right() < width - captions - 82.0);
+                    assert_eq!(labeled, width - captions - 90.0 - 354.0 >= 340.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_report_actual_click_opens_capture_without_changing_healthy_design() {
+        for width in [450.0, 700.0, 900.0, 1400.0] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.home.open = false;
+            h.app.custom_titlebar = true;
+            h.app.run("solid.box", json!({"length":35,"width":12,"height":4})).unwrap();
+            h.call("ui.resize", json!({"width":width,"height":720}));
+            h.frames(3);
+            let before = (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.revision);
+            let point = h.widget("Report a bug").expect("compact and full buttons retain an accessible name");
+            h.step(&json!({"click":point})).unwrap();
+            assert!(h.app.issue_report.draft.is_some(), "width {width}: header click must reach the report");
+            assert!(crate::issue_report::pending(&h.app));
+            assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.revision));
+            captured_frame(&mut h);
+            // Existing review content scrolls vertically when the window is narrow.
+            if width < 700.0 {
+                let [x, y] = h.widget("Close draft").unwrap();
+                h.call("ui.scroll", json!({"x":x,"y":y - 60.0,"delta":-1200}));
+                // Let the scroll animation finish before locating the click target.
+                h.frames(60);
+            }
+            h.step(&json!({"widget":"Close draft"})).unwrap();
+            assert!(h.app.issue_report.draft.is_none(), "width {width}: review closes through its actual button");
+            h.step(&json!({"click":{"handle":"appbar:home"}})).unwrap();
+            assert!(h.app.home.open, "width {width}: Home remains reachable beside Report");
+            assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.revision));
+        }
+    }
+
+    #[test]
+    fn header_report_preserves_new_dimension_draft_and_single_commit() {
+        crate::dim_view::cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[0,0],[20,0]]})).unwrap();
+        h.call("ui.view", json!({"view":"top"}));
+        h.app.cam.distance = 80.0;
+        h.app.cam.target = solvecraft_engine::geom::Vec3::new(10.0, 0.0, 0.0);
+        h.settle();
+        h.step(&json!({"start":"sketch.dimension"})).unwrap();
+        for point in [[0, 0, 0], [20, 0, 0], [10, 5, 0]] {
+            h.step(&json!({"click":{"world":point}})).unwrap();
+        }
+        h.step(&json!({"text":"30 mm"})).unwrap();
+        let before = (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.revision);
+        h.step(&json!({"widget":"Report a bug"})).unwrap();
+        h.frames(3);
+        assert!(h.app.issue_report.draft.is_some() && crate::dim_view::editing());
+        captured_frame(&mut h);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::new("issue_report_body")));
+        h.step(&json!({"text":"Describe this dimension problem."})).unwrap();
+        h.step(&json!({"key":"Enter"})).unwrap();
+        assert_eq!(before, (h.app.session.doc.to_json(), h.app.session.undo.len(), h.app.session.revision));
+        h.step(&json!({"widget":"Close draft"})).unwrap();
+        h.frames(2);
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(egui::Id::new("sc_dim_edit")));
+        h.step(&json!({"key":"Enter"})).unwrap();
+        assert!(!crate::dim_view::editing());
+        assert_eq!(h.app.session.undo.len(), before.1 + 1);
+        assert_eq!(h.app.session.doc.param("d1").unwrap().expr, "30 mm");
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.to_json(), before.0);
     }
 }

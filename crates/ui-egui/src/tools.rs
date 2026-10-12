@@ -323,6 +323,43 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
     Ok(result["curves"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect())
 }
 
+/// Only consume a complete, unambiguous selection; command validation owns geometry.
+pub(crate) fn constraint_preselection(command: &str, selection: &[solvecraft_engine::Sel]) -> Option<Value> {
+    use solvecraft_engine::Sel::{SketchCurve, SketchPoint};
+    match (command, selection) {
+        ("sketch.constraint.horizontal_vertical", [SketchCurve { id }]) => Some(json!({"line":id})),
+        ("sketch.constraint.horizontal_vertical", [SketchPoint { id: a }, SketchPoint { id: b }]) if a != b => Some(json!({"points":[a,b]})),
+        ("sketch.constraint.coincident", [a, b]) => {
+            let entity = |s: &solvecraft_engine::Sel| match s {
+                SketchPoint { id } | SketchCurve { id } => Some(id.clone()),
+                _ => None,
+            };
+            let (a, b) = (entity(a)?, entity(b)?);
+            (a != b).then(|| json!({"a":a,"b":b}))
+        }
+        (
+            "sketch.constraint.midpoint",
+            [SketchPoint { id: point }, SketchCurve { id: line }] | [SketchCurve { id: line }, SketchPoint { id: point }],
+        ) => Some(json!({"point":point,"line":line})),
+        ("sketch.constraint.symmetry", [a, b, c]) => {
+            let mut points = Vec::new();
+            let mut lines = Vec::new();
+            for entity in [a, b, c] {
+                match entity {
+                    SketchPoint { id } => points.push(id),
+                    SketchCurve { id } => lines.push(id),
+                    _ => return None,
+                }
+            }
+            match (points.as_slice(), lines.as_slice()) {
+                ([a, b], [line]) if a != b => Some(json!({"a":a,"b":b,"line":line})),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn run_pick(app: &mut SolveApp, t: &Tool) {
     let k = &t.picks;
     let params = match t.cmd {

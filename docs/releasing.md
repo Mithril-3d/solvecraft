@@ -1,10 +1,22 @@
-# Releasing SolveCraft
+# Releasing SolidCraft
 
 Releases are deliberate operations that an agent can complete end to end. Development lands
 on `main`; pushing the selected commit to `release` builds all packages and creates a **draft**
 GitHub Release. Publishing that verified draft is a separate operation. Pushing to `main` or
 pushing a tag does not start the release workflow. There is no automatic commit-message-based
 version bump and no patch release for every merge.
+
+## Compatibility names and deployment
+
+SolidCraft is the product display name. Keep existing release asset filenames, including
+`SolveCraft-{version}-windows-x64.exe`, `SolveCraft.app` and `solvecraft-cli` archives, together
+with installed package IDs and settings paths. Do not rewrite published 0.2.0 or 0.2.1 assets,
+checksums, tags or historical release notes.
+
+Project Pages publishes the documentation, browser app and published-release Flatpak
+repository under `/solidcraft/`. Do not add a separate owner-site publisher or permanent
+old-name Pages/Flatpak aliases. GitHub repository redirects are separate from Pages hosting;
+verify the new project URLs after deployment.
 
 ## Nightly prereleases
 
@@ -42,7 +54,7 @@ deployment. The stable Flatpak repository is not automatically updated with nigh
 2. Update `[workspace.package] version` in root `Cargo.toml`. Then run
    `cargo metadata --format-version 1 --no-deps > /dev/null` to refresh workspace package
    versions in `Cargo.lock`. Inspect the diff and keep unrelated dependency changes out.
-   SolveCraft does not currently implement the siblings' `cargo xtask version set` command.
+   SolidCraft does not currently implement `cargo xtask version set`.
 3. Run `cargo xtask ci` and the packaging checks in `.github/workflows/packaging-lint.yml`.
    Commit the version files through the normal review flow and land them on `main`.
    Do not use `[skip ci]`. Record the exact commit SHA to release. If it changes, revalidate it.
@@ -68,7 +80,7 @@ fast-forward fails, inspect and resolve the divergence through the normal review
 Find the `release.yml` Actions run for the recorded SHA and `release` branch, and monitor that
 specific run. The workflow builds Linux (both architectures, including Flatpak), macOS,
 Windows, FreeBSD, and web packages. Once every required job succeeds it creates a draft
-`SolveCraft v<version>` with the artifacts, `SHA256SUMS.txt`, install notes, and generated changes.
+`SolidCraft v<version>` with the artifacts, `SHA256SUMS.txt`, install notes, and generated changes.
 
 A second push with the same untagged version can rebuild and replace that draft's complete
 asset set. Existing release notes are preserved on rebuild; refresh their changes section if

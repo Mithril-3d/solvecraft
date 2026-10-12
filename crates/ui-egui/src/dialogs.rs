@@ -1273,7 +1273,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     update_fill_cells(app, &mut d);
     let t = Tokens::get();
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());
-    let anchor = egui::pos2(vp.right(), vp.top() + crate::viewport::AXIS_VIEW_CLEARANCE);
+    let top = (vp.top() + crate::viewport::AXIS_VIEW_CLEARANCE).min((vp.bottom() - 360.0).max(vp.top()));
+    let anchor = egui::pos2(vp.right(), top);
     let mut keep = true;
     let mut ok = false;
     let mut applied = false;
@@ -1303,7 +1304,6 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         width,
     )
     .frame(frame)
-    .scroll([false, true])
     .open(&mut keep)
     .show(ctx, |ui| {
         ui.spacing_mut().text_edit_width = FIELD_W;
@@ -1332,596 +1332,604 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             return;
         }
         ui.add_space(2.0);
-        // Configuration tables own their column widths and scrolling; the two-column form
-        // grid would squeeze their row names and action buttons into a label-sized cell.
-        if let Kind::Motion(k @ crate::dialogs_motion::Mo::Configurations { .. }) = &mut d.kind {
-            enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs);
-        }
-        egui::Grid::new("sc_dialog_grid").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-            if matches!(&d.kind, Kind::Motion(crate::dialogs_motion::Mo::Configurations { .. })) {
-                return;
+        // A sizing pass initially offers almost no height to an auto-sized window.
+        // Give only the fields a viewport-derived scroll budget; header and actions
+        // stay visible, while short forms still shrink to their natural height.
+        let vertical_frame = frame.inner_margin.topf() + frame.inner_margin.bottomf() + 2.0 * frame.stroke.width;
+        let footer_height = ui.spacing().interact_size.y.max(24.0) + 6.0 + ui.spacing().item_spacing.y;
+        let fields_height = (vp.bottom() - anchor.y - 8.0 - vertical_frame - ui.min_rect().height() - footer_height).max(1.0);
+        egui::ScrollArea::vertical().id_salt("feature_fields").min_scrolled_height(fields_height).max_height(fields_height).show(ui, |ui| {
+            // Configuration tables own their column widths and scrolling; the two-column form
+            // grid would squeeze their row names and action buttons into a label-sized cell.
+            if let Kind::Motion(k @ crate::dialogs_motion::Mo::Configurations { .. }) = &mut d.kind {
+                enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs);
             }
-            placement_row(&mut d, ui);
-            input_rows(&mut d, ui);
-            match &mut d.kind {
-                Kind::Sketch => {
-                    if d.error.is_some()
-                        && let Some(selection @ Sel::Face { .. }) = d.inputs.first().and_then(|i| i.items.first())
-                    {
-                        row_label(ui, "Attachment");
-                        ui.label("This face cannot provide a durable attachment. Choose another face or explicitly use a fixed plane.");
-                        ui.end_row();
-                        row_label(ui, "");
-                        if ui.button("Use fixed plane").clicked()
-                            && let Some(mut plane) = crate::sketch_attachment_ui::face_plane(app, selection)
+            egui::Grid::new("sc_dialog_grid").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+                if matches!(&d.kind, Kind::Motion(crate::dialogs_motion::Mo::Configurations { .. })) {
+                    return;
+                }
+                placement_row(&mut d, ui);
+                input_rows(&mut d, ui);
+                match &mut d.kind {
+                    Kind::Sketch => {
+                        if d.error.is_some()
+                            && let Some(selection @ Sel::Face { .. }) = d.inputs.first().and_then(|i| i.items.first())
                         {
-                            plane["fixed"] = json!(true);
-                            match app.run("sketch.create", json!({"plane":plane})) {
-                                Ok(_) => {
-                                    app.pre_sketch_cam = Some(app.cam);
-                                    look_at_sketch(app);
-                                    cancel = true;
+                            row_label(ui, "Attachment");
+                            ui.label("This face cannot provide a durable attachment. Choose another face or explicitly use a fixed plane.");
+                            ui.end_row();
+                            row_label(ui, "");
+                            if ui.button("Use fixed plane").clicked()
+                                && let Some(mut plane) = crate::sketch_attachment_ui::face_plane(app, selection)
+                            {
+                                plane["fixed"] = json!(true);
+                                match app.run("sketch.create", json!({"plane":plane})) {
+                                    Ok(_) => {
+                                        app.pre_sketch_cam = Some(app.cam);
+                                        look_at_sketch(app);
+                                        cancel = true;
+                                    }
+                                    Err(error) => d.error = Some(error),
                                 }
-                                Err(error) => d.error = Some(error),
+                            }
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Extrude { distance, direction, operation, auto_op, distance2, taper, taper_present, to_offset, start, all } => {
+                        row_label(ui, "Start");
+                        let old = if object_on(&d.inputs, FROM_OBJECT) { 2 } else { usize::from(!start.is_empty()) };
+                        let mut st = old;
+                        combo(ui, "ex_start", &["Profile Plane", "Offset", "From Object"], &mut st);
+                        if st != old {
+                            set_object(&mut d.inputs, &mut d.active, FROM_OBJECT, st == 2);
+                            if st == 1 && start.is_empty() {
+                                *start = "5 mm".into();
+                            }
+                            if st == 0 {
+                                start.clear();
                             }
                         }
                         ui.end_row();
-                    }
-                }
-                Kind::Extrude { distance, direction, operation, auto_op, distance2, taper, taper_present, to_offset, start, all } => {
-                    row_label(ui, "Start");
-                    let old = if object_on(&d.inputs, FROM_OBJECT) { 2 } else { usize::from(!start.is_empty()) };
-                    let mut st = old;
-                    combo(ui, "ex_start", &["Profile Plane", "Offset", "From Object"], &mut st);
-                    if st != old {
-                        set_object(&mut d.inputs, &mut d.active, FROM_OBJECT, st == 2);
-                        if st == 1 && start.is_empty() {
-                            *start = "5 mm".into();
+                        if st != 0 {
+                            row_label(ui, "Offset");
+                            enter |= field(ui, start);
+                            ui.end_row();
                         }
-                        if st == 0 {
-                            start.clear();
-                        }
-                    }
-                    ui.end_row();
-                    if st != 0 {
-                        row_label(ui, "Offset");
-                        enter |= field(ui, start);
-                        ui.end_row();
-                    }
-                    row_label(ui, "Direction");
-                    // One Side, Two Sides, Symmetric (a flip is a negative distance).
-                    let order = [0usize, TWO_SIDES, 2];
-                    let mut pos = order.iter().position(|o| o == direction).unwrap_or(0);
-                    combo(ui, "ex_dir", &["One Side", "Two Sides", "Symmetric"], &mut pos);
-                    if pos != order.iter().position(|o| o == direction).unwrap_or(0) {
-                        *direction = order.get(pos).copied().unwrap_or(0);
-                    }
-                    ui.end_row();
-                    if *direction < 2 {
-                        row_label(ui, "Reverse");
-                        let mut reverse = *direction == 1;
-                        if ui.checkbox(&mut reverse, "Reverse Direction").changed() {
-                            *direction = usize::from(reverse);
+                        row_label(ui, "Direction");
+                        // One Side, Two Sides, Symmetric (a flip is a negative distance).
+                        let order = [0usize, TWO_SIDES, 2];
+                        let mut pos = order.iter().position(|o| o == direction).unwrap_or(0);
+                        combo(ui, "ex_dir", &["One Side", "Two Sides", "Symmetric"], &mut pos);
+                        if pos != order.iter().position(|o| o == direction).unwrap_or(0) {
+                            *direction = order.get(pos).copied().unwrap_or(0);
                         }
                         ui.end_row();
-                    }
-                    row_label(ui, "Extent Type");
-                    let cur = if to_object_on(&d.inputs) { 1 } else { usize::from(*all) * 2 };
-                    let mut ext = cur;
-                    combo(ui, "ex_ext", &["Distance", "To Object", "All"], &mut ext);
-                    *all = ext == 2;
-                    set_to_object(&mut d.inputs, &mut d.active, ext == 1);
-                    ui.end_row();
-                    if ext == 0 {
-                        row_label(ui, "Distance");
-                        enter |= field(ui, distance);
+                        if *direction < 2 {
+                            row_label(ui, "Reverse");
+                            let mut reverse = *direction == 1;
+                            if ui.checkbox(&mut reverse, "Reverse Direction").changed() {
+                                *direction = usize::from(reverse);
+                            }
+                            ui.end_row();
+                        }
+                        row_label(ui, "Extent Type");
+                        let cur = if to_object_on(&d.inputs) { 1 } else { usize::from(*all) * 2 };
+                        let mut ext = cur;
+                        combo(ui, "ex_ext", &["Distance", "To Object", "All"], &mut ext);
+                        *all = ext == 2;
+                        set_to_object(&mut d.inputs, &mut d.active, ext == 1);
                         ui.end_row();
-                        if *direction == TWO_SIDES {
+                        if ext == 0 {
+                            row_label(ui, "Distance");
+                            enter |= field(ui, distance);
+                            ui.end_row();
+                            if *direction == TWO_SIDES {
+                                row_label(ui, "Distance 2");
+                                enter |= field(ui, distance2);
+                                ui.end_row();
+                            }
+                        }
+                        if ext == 1 {
+                            row_label(ui, "To Offset");
+                            enter |= field(ui, to_offset);
+                            ui.end_row();
+                        }
+                        if *direction < 2 {
+                            row_label(ui, "Taper Angle");
+                            let before = taper.clone();
+                            enter |= field(ui, taper);
+                            if *taper != before {
+                                *taper_present = !taper.trim().is_empty();
+                            }
+                            ui.end_row();
+                        }
+                        row_label(ui, "Operation");
+                        let before = *operation;
+                        combo(ui, "ex_op", &OP_LABELS, operation);
+                        // A choice made by hand sticks.
+                        if *operation != before {
+                            *auto_op = false;
+                        }
+                        ui.end_row();
+                    }
+                    Kind::Revolve { angle, operation, .. } => {
+                        row_label(ui, "Type");
+                        let cur = usize::from(to_object_on(&d.inputs));
+                        let mut ty = cur;
+                        combo(ui, "rv_type", &["Angle", "To Object"], &mut ty);
+                        set_to_object(&mut d.inputs, &mut d.active, ty == 1);
+                        ui.end_row();
+                        if ty == 0 {
+                            // One Side, Two Sides (a second angle), Symmetric (the angle split).
+                            row_label(ui, "Direction");
+                            let cur = if d.extra.contains_key("angle2") {
+                                1
+                            } else if d.extra.get("direction").is_some() {
+                                2
+                            } else {
+                                0
+                            };
+                            let mut dir = cur;
+                            combo(ui, "rv_dir", &["One Side", "Two Sides", "Symmetric"], &mut dir);
+                            if dir != cur {
+                                d.extra.remove("angle2");
+                                d.extra.remove("direction");
+                                match dir {
+                                    1 => {
+                                        d.extra.insert("angle2".into(), json!("90 deg"));
+                                    }
+                                    2 => {
+                                        d.extra.insert("direction".into(), json!("symmetric"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            ui.end_row();
+                            row_label(ui, "Angle");
+                            enter |= field(ui, angle);
+                            ui.end_row();
+                            if dir == 1 {
+                                row_label(ui, "Angle 2");
+                                enter |= extra_field(ui, &mut d.extra, "angle2", "90 deg");
+                                ui.end_row();
+                            }
+                        }
+                        row_label(ui, "Operation");
+                        combo(ui, "rv_op", &OP_LABELS, operation);
+                        ui.end_row();
+                    }
+                    Kind::Fillet { radius, chamfer, chain, ctype, distance2, angle, flip } => {
+                        if *chamfer {
+                            row_label(ui, "Chamfer Type");
+                            combo(ui, "ch_type", &CHAMFER_TYPES, ctype);
+                            ui.end_row();
+                        }
+                        let mut rtype = 0;
+                        if !*chamfer {
+                            row_label(ui, "Radius Type");
+                            rtype = extra_choice(
+                                ui,
+                                &mut d.extra,
+                                "fi_type",
+                                "type",
+                                &[("Constant", "constant"), ("Chord Length", "chord"), ("Variable", "variable")],
+                            );
+                            ui.end_row();
+                        }
+                        row_label(
+                            ui,
+                            if !*chamfer {
+                                match rtype {
+                                    1 => "Chord Length",
+                                    2 => "Start Radius",
+                                    _ => "Radius",
+                                }
+                            } else if *ctype == 0 {
+                                "Distance"
+                            } else {
+                                "Distance 1"
+                            },
+                        );
+                        enter |= field(ui, radius);
+                        ui.end_row();
+                        if *chamfer && *ctype == 1 {
                             row_label(ui, "Distance 2");
                             enter |= field(ui, distance2);
                             ui.end_row();
                         }
-                    }
-                    if ext == 1 {
-                        row_label(ui, "To Offset");
-                        enter |= field(ui, to_offset);
-                        ui.end_row();
-                    }
-                    if *direction < 2 {
-                        row_label(ui, "Taper Angle");
-                        let before = taper.clone();
-                        enter |= field(ui, taper);
-                        if *taper != before {
-                            *taper_present = !taper.trim().is_empty();
-                        }
-                        ui.end_row();
-                    }
-                    row_label(ui, "Operation");
-                    let before = *operation;
-                    combo(ui, "ex_op", &OP_LABELS, operation);
-                    // A choice made by hand sticks.
-                    if *operation != before {
-                        *auto_op = false;
-                    }
-                    ui.end_row();
-                }
-                Kind::Revolve { angle, operation, .. } => {
-                    row_label(ui, "Type");
-                    let cur = usize::from(to_object_on(&d.inputs));
-                    let mut ty = cur;
-                    combo(ui, "rv_type", &["Angle", "To Object"], &mut ty);
-                    set_to_object(&mut d.inputs, &mut d.active, ty == 1);
-                    ui.end_row();
-                    if ty == 0 {
-                        // One Side, Two Sides (a second angle), Symmetric (the angle split).
-                        row_label(ui, "Direction");
-                        let cur = if d.extra.contains_key("angle2") {
-                            1
-                        } else if d.extra.get("direction").is_some() {
-                            2
-                        } else {
-                            0
-                        };
-                        let mut dir = cur;
-                        combo(ui, "rv_dir", &["One Side", "Two Sides", "Symmetric"], &mut dir);
-                        if dir != cur {
-                            d.extra.remove("angle2");
-                            d.extra.remove("direction");
-                            match dir {
-                                1 => {
-                                    d.extra.insert("angle2".into(), json!("90 deg"));
-                                }
-                                2 => {
-                                    d.extra.insert("direction".into(), json!("symmetric"));
-                                }
-                                _ => {}
-                            }
-                        }
-                        ui.end_row();
-                        row_label(ui, "Angle");
-                        enter |= field(ui, angle);
-                        ui.end_row();
-                        if dir == 1 {
-                            row_label(ui, "Angle 2");
-                            enter |= extra_field(ui, &mut d.extra, "angle2", "90 deg");
+                        if *chamfer && *ctype == 2 {
+                            row_label(ui, "Angle");
+                            enter |= field(ui, angle);
                             ui.end_row();
                         }
-                    }
-                    row_label(ui, "Operation");
-                    combo(ui, "rv_op", &OP_LABELS, operation);
-                    ui.end_row();
-                }
-                Kind::Fillet { radius, chamfer, chain, ctype, distance2, angle, flip } => {
-                    if *chamfer {
-                        row_label(ui, "Chamfer Type");
-                        combo(ui, "ch_type", &CHAMFER_TYPES, ctype);
-                        ui.end_row();
-                    }
-                    let mut rtype = 0;
-                    if !*chamfer {
-                        row_label(ui, "Radius Type");
-                        rtype = extra_choice(
-                            ui,
-                            &mut d.extra,
-                            "fi_type",
-                            "type",
-                            &[("Constant", "constant"), ("Chord Length", "chord"), ("Variable", "variable")],
-                        );
-                        ui.end_row();
-                    }
-                    row_label(
-                        ui,
-                        if !*chamfer {
-                            match rtype {
-                                1 => "Chord Length",
-                                2 => "Start Radius",
-                                _ => "Radius",
+                        if *chamfer && *ctype > 0 {
+                            row_label(ui, "Flip");
+                            ui.checkbox(flip, "");
+                            ui.end_row();
+                        }
+                        if !*chamfer && rtype == 2 {
+                            row_label(ui, "End Radius");
+                            enter |= extra_field(ui, &mut d.extra, "radius2", "1 mm");
+                            ui.end_row();
+                            // Which end of the first edge takes the start radius.
+                            row_label(ui, "Swap Ends");
+                            extra_check(ui, &mut d.extra, "swap_ends");
+                            ui.end_row();
+                            // Radii between the ends: position along the edge (from the start end)
+                            // and radius.
+                            let mut mids = mid_points(&d.extra);
+                            let mut remove = None;
+                            for (k, (t, r)) in mids.iter_mut().enumerate() {
+                                row_label(ui, "Mid Radius");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::DragValue::new(t).speed(0.01).range(0.01..=0.99).fixed_decimals(2))
+                                        .on_hover_text("Position along the edge, 0 at the start end, 1 at the other");
+                                    enter |= field(ui, r);
+                                    if ui.small_button("×").on_hover_text("Remove this point").clicked() {
+                                        remove = Some(k);
+                                    }
+                                });
+                                ui.end_row();
                             }
-                        } else if *ctype == 0 {
-                            "Distance"
-                        } else {
-                            "Distance 1"
-                        },
-                    );
-                    enter |= field(ui, radius);
-                    ui.end_row();
-                    if *chamfer && *ctype == 1 {
-                        row_label(ui, "Distance 2");
-                        enter |= field(ui, distance2);
+                            if let Some(k) = remove {
+                                mids.remove(k);
+                            }
+                            row_label(ui, "");
+                            if ui.button("Add Mid Radius").clicked() && mids.len() < 20 {
+                                let t = if mids.is_empty() { 0.5 } else { (mids.iter().map(|m| m.0).fold(0.0, f64::max) + 1.0) * 0.5 };
+                                mids.push((t.min(0.99), radius.clone()));
+                            }
+                            ui.end_row();
+                            d.extra.insert("mid".into(), json!(mids.iter().map(|(t, r)| json!([t, r])).collect::<Vec<_>>()));
+                            if !mids.is_empty() {
+                                row_label(ui, "Smooth");
+                                extra_check(ui, &mut d.extra, "smooth");
+                                ui.end_row();
+                            }
+                        }
+                        row_label(ui, "Tangent Chain");
+                        ui.checkbox(chain, "");
                         ui.end_row();
                     }
-                    if *chamfer && *ctype == 2 {
+                    Kind::Shell { thickness } => {
+                        row_label(ui, "Tangent Chain");
+                        extra_check(ui, &mut d.extra, "tangent_chain");
+                        ui.end_row();
+                        let dir = d.extra.get("direction").and_then(Value::as_str).unwrap_or("inside").to_string();
+                        row_label(
+                            ui,
+                            match dir.as_str() {
+                                "outside" => "Outside Thickness",
+                                "both" => "Thickness",
+                                _ => "Inside Thickness",
+                            },
+                        );
+                        enter |= field(ui, thickness);
+                        ui.end_row();
+                        row_label(ui, "Direction");
+                        extra_choice(ui, &mut d.extra, "sh_dir", "direction", &[("Inside", "inside"), ("Outside", "outside"), ("Both", "both")]);
+                        ui.end_row();
+                    }
+                    Kind::Draft { angle } => {
                         row_label(ui, "Angle");
                         enter |= field(ui, angle);
                         ui.end_row();
                     }
-                    if *chamfer && *ctype > 0 {
+                    Kind::Mirror => {
+                        row_label(ui, "Operation");
+                        let mut op = usize::from(d.extra.get("combine").and_then(Value::as_bool).unwrap_or(false));
+                        combo(ui, "mi_op", &["New Body", "Join"], &mut op);
+                        d.extra.insert("combine".into(), json!(op == 1));
+                        ui.end_row();
+                    }
+                    Kind::Measure { result, .. } => measure_rows(ui, result.as_ref()),
+                    Kind::OffsetPlane { offset } => {
+                        row_label(ui, "Distance");
+                        enter |= field(ui, offset);
+                        ui.end_row();
+                    }
+                    Kind::AnglePlane { angle } => {
+                        row_label(ui, "Angle");
+                        enter |= field(ui, angle);
+                        ui.end_row();
+                    }
+                    Kind::Split | Kind::ReplaceFace | Kind::Remove => {}
+                    Kind::Rib { thickness, depth, flip, .. } => {
+                        row_label(ui, "Thickness");
+                        enter |= field(ui, thickness);
+                        ui.end_row();
+                        row_label(ui, "Depth");
+                        let r = ui.add(egui::TextEdit::singleline(depth).hint_text("to the next face"));
+                        crate::params_dialog::complete(ui, &r, depth);
+                        enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
                         row_label(ui, "Flip");
                         ui.checkbox(flip, "");
                         ui.end_row();
                     }
-                    if !*chamfer && rtype == 2 {
-                        row_label(ui, "End Radius");
-                        enter |= extra_field(ui, &mut d.extra, "radius2", "1 mm");
-                        ui.end_row();
-                        // Which end of the first edge takes the start radius.
-                        row_label(ui, "Swap Ends");
-                        extra_check(ui, &mut d.extra, "swap_ends");
-                        ui.end_row();
-                        // Radii between the ends: position along the edge (from the start end)
-                        // and radius.
-                        let mut mids = mid_points(&d.extra);
-                        let mut remove = None;
-                        for (k, (t, r)) in mids.iter_mut().enumerate() {
-                            row_label(ui, "Mid Radius");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(t).speed(0.01).range(0.01..=0.99).fixed_decimals(2))
-                                    .on_hover_text("Position along the edge, 0 at the start end, 1 at the other");
-                                enter |= field(ui, r);
-                                if ui.small_button("×").on_hover_text("Remove this point").clicked() {
-                                    remove = Some(k);
-                                }
-                            });
-                            ui.end_row();
-                        }
-                        if let Some(k) = remove {
-                            mids.remove(k);
-                        }
-                        row_label(ui, "");
-                        if ui.button("Add Mid Radius").clicked() && mids.len() < 20 {
-                            let t = if mids.is_empty() { 0.5 } else { (mids.iter().map(|m| m.0).fold(0.0, f64::max) + 1.0) * 0.5 };
-                            mids.push((t.min(0.99), radius.clone()));
-                        }
-                        ui.end_row();
-                        d.extra.insert("mid".into(), json!(mids.iter().map(|(t, r)| json!([t, r])).collect::<Vec<_>>()));
-                        if !mids.is_empty() {
-                            row_label(ui, "Smooth");
-                            extra_check(ui, &mut d.extra, "smooth");
-                            ui.end_row();
-                        }
-                    }
-                    row_label(ui, "Tangent Chain");
-                    ui.checkbox(chain, "");
-                    ui.end_row();
-                }
-                Kind::Shell { thickness } => {
-                    row_label(ui, "Tangent Chain");
-                    extra_check(ui, &mut d.extra, "tangent_chain");
-                    ui.end_row();
-                    let dir = d.extra.get("direction").and_then(Value::as_str).unwrap_or("inside").to_string();
-                    row_label(
-                        ui,
-                        match dir.as_str() {
-                            "outside" => "Outside Thickness",
-                            "both" => "Thickness",
-                            _ => "Inside Thickness",
-                        },
-                    );
-                    enter |= field(ui, thickness);
-                    ui.end_row();
-                    row_label(ui, "Direction");
-                    extra_choice(ui, &mut d.extra, "sh_dir", "direction", &[("Inside", "inside"), ("Outside", "outside"), ("Both", "both")]);
-                    ui.end_row();
-                }
-                Kind::Draft { angle } => {
-                    row_label(ui, "Angle");
-                    enter |= field(ui, angle);
-                    ui.end_row();
-                }
-                Kind::Mirror => {
-                    row_label(ui, "Operation");
-                    let mut op = usize::from(d.extra.get("combine").and_then(Value::as_bool).unwrap_or(false));
-                    combo(ui, "mi_op", &["New Body", "Join"], &mut op);
-                    d.extra.insert("combine".into(), json!(op == 1));
-                    ui.end_row();
-                }
-                Kind::Measure { result, .. } => measure_rows(ui, result.as_ref()),
-                Kind::OffsetPlane { offset } => {
-                    row_label(ui, "Distance");
-                    enter |= field(ui, offset);
-                    ui.end_row();
-                }
-                Kind::AnglePlane { angle } => {
-                    row_label(ui, "Angle");
-                    enter |= field(ui, angle);
-                    ui.end_row();
-                }
-                Kind::Split | Kind::ReplaceFace | Kind::Remove => {}
-                Kind::Rib { thickness, depth, flip, .. } => {
-                    row_label(ui, "Thickness");
-                    enter |= field(ui, thickness);
-                    ui.end_row();
-                    row_label(ui, "Depth");
-                    let r = ui.add(egui::TextEdit::singleline(depth).hint_text("to the next face"));
-                    crate::params_dialog::complete(ui, &r, depth);
-                    enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.end_row();
-                    row_label(ui, "Flip");
-                    ui.checkbox(flip, "");
-                    ui.end_row();
-                }
-                Kind::Emboss { depth, deboss } => {
-                    row_label(ui, "Depth");
-                    enter |= field(ui, depth);
-                    ui.end_row();
-                    row_label(ui, "Type");
-                    let mut i = usize::from(*deboss);
-                    combo(ui, "emb_mode", &["Emboss", "Deboss"], &mut i);
-                    *deboss = i == 1;
-                    ui.end_row();
-                    ui.label("");
-                    ui.add(
-                        egui::Label::new(
-                            "Orthogonal line profiles tangent to one supported cylinder wrap automatically. Pick a wall to choose a target.",
-                        )
-                        .wrap(),
-                    );
-                    ui.end_row();
-                }
-                Kind::Align { flip } => {
-                    // Where on the picked face or edge to snap: as picked (a face turns to meet
-                    // the other, an edge at its middle), its centre, or a round one's centre.
-                    for (label, key) in [("From Snap", "from_snap"), ("To Snap", "to_snap")] {
-                        row_label(ui, label);
-                        extra_choice(ui, &mut d.extra, key, key, &[("As Picked", "picked"), ("Centre", "center"), ("Circle Centre", "circle")]);
-                        ui.end_row();
-                    }
-                    row_label(ui, "Flip");
-                    ui.checkbox(flip, "");
-                    ui.end_row();
-                }
-                Kind::BoundaryFill { operation, cells, .. } => {
-                    row_label(ui, "Cells");
-                    if cells.is_empty() {
-                        ui.label(RichText::new("Pick the tool bodies").color(Tokens::get().text_dim));
-                    }
-                    ui.end_row();
-                    for (i, (_, label, on)) in cells.iter_mut().enumerate() {
-                        row_label(ui, &format!("Cell {}", i + 1));
-                        ui.checkbox(on, label.as_str());
-                        ui.end_row();
-                    }
-                    row_label(ui, "Operation");
-                    combo(ui, "bf_op", &OP_LABELS, operation);
-                    ui.end_row();
-                    row_label(ui, "Remove Tools");
-                    extra_check(ui, &mut d.extra, "remove_tools");
-                    ui.end_row();
-                }
-                Kind::PathPattern { count, spacing } => {
-                    for (l, v) in [("Quantity", count), ("Spacing", spacing)] {
-                        row_label(ui, l);
-                        enter |= field(ui, v);
-                        ui.end_row();
-                    }
-                }
-                Kind::Pipe { diameter, wall } => {
-                    row_label(ui, "Diameter");
-                    enter |= field(ui, diameter);
-                    ui.end_row();
-                    row_label(ui, "Wall");
-                    let r = ui.add(egui::TextEdit::singleline(wall).hint_text("solid"));
-                    crate::params_dialog::complete(ui, &r, wall);
-                    enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.end_row();
-                }
-                Kind::Stock { margin } => {
-                    row_label(ui, "Margin");
-                    enter |= field(ui, margin);
-                    ui.end_row();
-                }
-                Kind::Scale { factor } => {
-                    row_label(ui, "Scale factor");
-                    enter |= field(ui, factor);
-                    ui.end_row();
-                }
-                Kind::OffsetFaces { distance } => {
-                    row_label(ui, "Distance");
-                    enter |= field(ui, distance);
-                    ui.end_row();
-                }
-                Kind::Thread { designation, length } => {
-                    // Fusion's order: Modeled, Full Length, then the size; a length only when not
-                    // full.
-                    row_label(ui, "Modeled");
-                    extra_check(ui, &mut d.extra, "modeled");
-                    ui.end_row();
-                    row_label(ui, "Full Length");
-                    let mut full = length.trim().is_empty();
-                    if ui.checkbox(&mut full, "").changed() {
-                        *length = if full { String::new() } else { "10 mm".into() };
-                    }
-                    ui.end_row();
-                    row_label(ui, "Size");
-                    let r = ui.add(egui::TextEdit::singleline(designation).hint_text("fits the face, e.g. M8"));
-                    enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.end_row();
-                    if !full {
-                        row_label(ui, "Length");
-                        enter |= field(ui, length);
-                        ui.end_row();
-                    }
-                }
-                Kind::Material { index } => {
-                    let names: Vec<&str> = solvecraft_engine::doc::MATERIALS.iter().map(|(n, _)| *n).collect();
-                    row_label(ui, "Material");
-                    combo(ui, "mat", &names, index);
-                    ui.end_row();
-                }
-                Kind::Section { offset, flip } => {
-                    row_label(ui, "Distance");
-                    enter |= field(ui, offset);
-                    ui.end_row();
-                    row_label(ui, "Flip");
-                    ui.checkbox(flip, "");
-                    ui.end_row();
-                }
-                Kind::PatternRect { count, spacing, count2, spacing2 } => {
-                    for (l, v) in [("Quantity", count), ("Spacing", spacing), ("Quantity 2", count2), ("Spacing 2", spacing2)] {
-                        row_label(ui, l);
-                        enter |= field(ui, v);
-                        ui.end_row();
-                    }
-                }
-                Kind::PatternCirc { count, angle } => {
-                    for (l, v) in [("Quantity", count), ("Total angle", angle)] {
-                        row_label(ui, l);
-                        enter |= field(ui, v);
-                        ui.end_row();
-                    }
-                }
-                Kind::Loft { operation } => {
-                    row_label(ui, "Operation");
-                    combo(ui, "lf_op", &OP_LABELS, operation);
-                    ui.end_row();
-                }
-                Kind::Sweep { operation } => {
-                    row_label(ui, "Operation");
-                    combo(ui, "sw_op", &OP_LABELS, operation);
-                    ui.end_row();
-                }
-                k @ Kind::Move { .. } => enter |= crate::dialogs_move::rows(ui, k),
-                Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } => {
-                    row_label(ui, "Extents");
-                    let cur = if to_object_on(&d.inputs) { 1 } else { usize::from(opts.all) * 2 };
-                    let mut ext = cur;
-                    combo(ui, "hole_ext", &["Distance", "To Object", "All"], &mut ext);
-                    opts.all = ext == 2;
-                    set_to_object(&mut d.inputs, &mut d.active, ext == 1);
-                    ui.end_row();
-                    if opts.multiple {
-                        // Every point of the picked points' sketches (standalone points and
-                        // circle centres), not just the picked ones.
-                        row_label(ui, "All Sketch Points");
-                        extra_check(ui, &mut d.extra, "all_points");
-                        ui.end_row();
-                    }
-                    row_label(ui, "Hole Type");
-                    combo(ui, "hole_kind", &HOLE_LABELS, kind);
-                    ui.end_row();
-                    row_label(ui, "Hole Tap Type");
-                    let mut tap = usize::from(opts.tapped);
-                    combo(ui, "hole_tap", &["Simple", "Tapped"], &mut tap);
-                    opts.tapped = tap == 1;
-                    ui.end_row();
-                    if opts.tapped {
-                        row_label(ui, "Size");
-                        let r = ui.add(egui::TextEdit::singleline(&mut opts.thread).hint_text("M5"));
-                        enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.end_row();
-                    }
-                    if *kind == 0 {
-                        row_label(ui, "Drill Point");
-                        let mut tip = usize::from(opts.angled);
-                        combo(ui, "hole_tip", &["Flat", "Angle"], &mut tip);
-                        opts.angled = tip == 1;
-                        ui.end_row();
-                    }
-                    if !opts.all {
+                    Kind::Emboss { depth, deboss } => {
                         row_label(ui, "Depth");
                         enter |= field(ui, depth);
                         ui.end_row();
-                    }
-                    if *kind == 0 && opts.angled {
-                        row_label(ui, "Tip Angle");
-                        enter |= field(ui, &mut opts.tip_angle);
+                        row_label(ui, "Type");
+                        let mut i = usize::from(*deboss);
+                        combo(ui, "emb_mode", &["Emboss", "Deboss"], &mut i);
+                        *deboss = i == 1;
+                        ui.end_row();
+                        ui.label("");
+                        ui.add(
+                            egui::Label::new(
+                                "Orthogonal line profiles tangent to one supported cylinder wrap automatically. Pick a wall to choose a target.",
+                            )
+                            .wrap(),
+                        );
                         ui.end_row();
                     }
-                    row_label(ui, "Diameter");
-                    enter |= field(ui, diameter);
-                    ui.end_row();
-                    if *kind == 1 {
-                        row_label(ui, "Counterbore Ø");
-                        enter |= field(ui, cb_diameter);
-                        ui.end_row();
-                        row_label(ui, "Counterbore depth");
-                        enter |= field(ui, cb_depth);
+                    Kind::Align { flip } => {
+                        // Where on the picked face or edge to snap: as picked (a face turns to meet
+                        // the other, an edge at its middle), its centre, or a round one's centre.
+                        for (label, key) in [("From Snap", "from_snap"), ("To Snap", "to_snap")] {
+                            row_label(ui, label);
+                            extra_choice(ui, &mut d.extra, key, key, &[("As Picked", "picked"), ("Centre", "center"), ("Circle Centre", "circle")]);
+                            ui.end_row();
+                        }
+                        row_label(ui, "Flip");
+                        ui.checkbox(flip, "");
                         ui.end_row();
                     }
-                    if *kind == 2 {
-                        row_label(ui, "Countersink Ø");
-                        enter |= field(ui, cs_diameter);
+                    Kind::BoundaryFill { operation, cells, .. } => {
+                        row_label(ui, "Cells");
+                        if cells.is_empty() {
+                            ui.label(RichText::new("Pick the tool bodies").color(Tokens::get().text_dim));
+                        }
                         ui.end_row();
-                        row_label(ui, "Countersink angle");
-                        enter |= field(ui, cs_angle);
+                        for (i, (_, label, on)) in cells.iter_mut().enumerate() {
+                            row_label(ui, &format!("Cell {}", i + 1));
+                            ui.checkbox(on, label.as_str());
+                            ui.end_row();
+                        }
+                        row_label(ui, "Operation");
+                        combo(ui, "bf_op", &OP_LABELS, operation);
                         ui.end_row();
+                        row_label(ui, "Remove Tools");
+                        extra_check(ui, &mut d.extra, "remove_tools");
+                        ui.end_row();
+                    }
+                    Kind::PathPattern { count, spacing } => {
+                        for (l, v) in [("Quantity", count), ("Spacing", spacing)] {
+                            row_label(ui, l);
+                            enter |= field(ui, v);
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Pipe { diameter, wall } => {
+                        row_label(ui, "Diameter");
+                        enter |= field(ui, diameter);
+                        ui.end_row();
+                        row_label(ui, "Wall");
+                        let r = ui.add(egui::TextEdit::singleline(wall).hint_text("solid"));
+                        crate::params_dialog::complete(ui, &r, wall);
+                        enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
+                    }
+                    Kind::Stock { margin } => {
+                        row_label(ui, "Margin");
+                        enter |= field(ui, margin);
+                        ui.end_row();
+                    }
+                    Kind::Scale { factor } => {
+                        row_label(ui, "Scale factor");
+                        enter |= field(ui, factor);
+                        ui.end_row();
+                    }
+                    Kind::OffsetFaces { distance } => {
+                        row_label(ui, "Distance");
+                        enter |= field(ui, distance);
+                        ui.end_row();
+                    }
+                    Kind::Thread { designation, length } => {
+                        // Fusion's order: Modeled, Full Length, then the size; a length only when not
+                        // full.
+                        row_label(ui, "Modeled");
+                        extra_check(ui, &mut d.extra, "modeled");
+                        ui.end_row();
+                        row_label(ui, "Full Length");
+                        let mut full = length.trim().is_empty();
+                        if ui.checkbox(&mut full, "").changed() {
+                            *length = if full { String::new() } else { "10 mm".into() };
+                        }
+                        ui.end_row();
+                        row_label(ui, "Size");
+                        let r = ui.add(egui::TextEdit::singleline(designation).hint_text("fits the face, e.g. M8"));
+                        enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
+                        if !full {
+                            row_label(ui, "Length");
+                            enter |= field(ui, length);
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Material { index } => {
+                        let names: Vec<&str> = solvecraft_engine::doc::MATERIALS.iter().map(|(n, _)| *n).collect();
+                        row_label(ui, "Material");
+                        combo(ui, "mat", &names, index);
+                        ui.end_row();
+                    }
+                    Kind::Section { offset, flip } => {
+                        row_label(ui, "Distance");
+                        enter |= field(ui, offset);
+                        ui.end_row();
+                        row_label(ui, "Flip");
+                        ui.checkbox(flip, "");
+                        ui.end_row();
+                    }
+                    Kind::PatternRect { count, spacing, count2, spacing2 } => {
+                        for (l, v) in [("Quantity", count), ("Spacing", spacing), ("Quantity 2", count2), ("Spacing 2", spacing2)] {
+                            row_label(ui, l);
+                            enter |= field(ui, v);
+                            ui.end_row();
+                        }
+                    }
+                    Kind::PatternCirc { count, angle } => {
+                        for (l, v) in [("Quantity", count), ("Total angle", angle)] {
+                            row_label(ui, l);
+                            enter |= field(ui, v);
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Loft { operation } => {
+                        row_label(ui, "Operation");
+                        combo(ui, "lf_op", &OP_LABELS, operation);
+                        ui.end_row();
+                    }
+                    Kind::Sweep { operation } => {
+                        row_label(ui, "Operation");
+                        combo(ui, "sw_op", &OP_LABELS, operation);
+                        ui.end_row();
+                    }
+                    k @ Kind::Move { .. } => enter |= crate::dialogs_move::rows(ui, k),
+                    Kind::Hole { diameter, depth, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } => {
+                        row_label(ui, "Extents");
+                        let cur = if to_object_on(&d.inputs) { 1 } else { usize::from(opts.all) * 2 };
+                        let mut ext = cur;
+                        combo(ui, "hole_ext", &["Distance", "To Object", "All"], &mut ext);
+                        opts.all = ext == 2;
+                        set_to_object(&mut d.inputs, &mut d.active, ext == 1);
+                        ui.end_row();
+                        if opts.multiple {
+                            // Every point of the picked points' sketches (standalone points and
+                            // circle centres), not just the picked ones.
+                            row_label(ui, "All Sketch Points");
+                            extra_check(ui, &mut d.extra, "all_points");
+                            ui.end_row();
+                        }
+                        row_label(ui, "Hole Type");
+                        combo(ui, "hole_kind", &HOLE_LABELS, kind);
+                        ui.end_row();
+                        row_label(ui, "Hole Tap Type");
+                        let mut tap = usize::from(opts.tapped);
+                        combo(ui, "hole_tap", &["Simple", "Tapped"], &mut tap);
+                        opts.tapped = tap == 1;
+                        ui.end_row();
+                        if opts.tapped {
+                            row_label(ui, "Size");
+                            let r = ui.add(egui::TextEdit::singleline(&mut opts.thread).hint_text("M5"));
+                            enter |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            ui.end_row();
+                        }
+                        if *kind == 0 {
+                            row_label(ui, "Drill Point");
+                            let mut tip = usize::from(opts.angled);
+                            combo(ui, "hole_tip", &["Flat", "Angle"], &mut tip);
+                            opts.angled = tip == 1;
+                            ui.end_row();
+                        }
+                        if !opts.all {
+                            row_label(ui, "Depth");
+                            enter |= field(ui, depth);
+                            ui.end_row();
+                        }
+                        if *kind == 0 && opts.angled {
+                            row_label(ui, "Tip Angle");
+                            enter |= field(ui, &mut opts.tip_angle);
+                            ui.end_row();
+                        }
+                        row_label(ui, "Diameter");
+                        enter |= field(ui, diameter);
+                        ui.end_row();
+                        if *kind == 1 {
+                            row_label(ui, "Counterbore Ø");
+                            enter |= field(ui, cb_diameter);
+                            ui.end_row();
+                            row_label(ui, "Counterbore depth");
+                            enter |= field(ui, cb_depth);
+                            ui.end_row();
+                        }
+                        if *kind == 2 {
+                            row_label(ui, "Countersink Ø");
+                            enter |= field(ui, cs_diameter);
+                            ui.end_row();
+                            row_label(ui, "Countersink angle");
+                            enter |= field(ui, cs_angle);
+                            ui.end_row();
+                        }
+                    }
+                    Kind::Primitive { fields, operation, .. } => {
+                        for (k, v) in fields.iter_mut() {
+                            row_label(ui, k);
+                            enter |= field(ui, v);
+                            ui.end_row();
+                        }
+                        row_label(ui, "Operation");
+                        combo(ui, "pr_op", &OP_LABELS, operation);
+                        ui.end_row();
+                    }
+                    Kind::Combine { operation, keep_tools } => {
+                        row_label(ui, "Operation");
+                        let mut op = operation.saturating_sub(1);
+                        combo(ui, "cb_op", &OP_LABELS[1..], &mut op);
+                        *operation = op + 1;
+                        ui.end_row();
+                        row_label(ui, "New Component");
+                        extra_check(ui, &mut d.extra, "new_component");
+                        ui.end_row();
+                        row_label(ui, "Keep Tools");
+                        ui.checkbox(keep_tools, "");
+                        ui.end_row();
+                    }
+                    Kind::Params { new_name, new_expr } => params_table(app, ui, new_name, new_expr),
+                    Kind::EditParam { name, expr } => {
+                        ui.label(name.as_str());
+                        let r = ui.text_edit_singleline(expr);
+                        crate::params_dialog::complete(ui, &r, expr);
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            ok = true;
+                        }
+                        r.request_focus();
+                        ui.end_row();
+                    }
+                    Kind::Rename { name, .. } => {
+                        row_label(ui, "Name");
+                        let r = ui.text_edit_singleline(name);
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            ok = true;
+                        }
+                        r.request_focus();
+                        ui.end_row();
+                    }
+                    Kind::Assembly(k) => enter |= crate::dialogs_assembly::rows(app, ui, k, &mut d.inputs, &mut d.active),
+                    Kind::Sheet(k) => enter |= crate::dialogs_sheet::rows(app, ui, k, &mut d.inputs),
+                    Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k),
+                    Kind::Plastic(k) => enter |= crate::dialogs_plastic::rows(app, ui, k, &d.inputs),
+                    Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
+                    Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
+                    Kind::Part(k) => enter |= crate::dialogs_parts::rows(app, ui, k, &d.inputs),
+                    Kind::ConfirmDelete { with, fail, .. } => {
+                        if !with.is_empty() {
+                            row_label(ui, "Also deletes");
+                            ui.label(with.join(", "));
+                            ui.end_row();
+                        }
+                        if !fail.is_empty() {
+                            row_label(ui, "Will fail");
+                            ui.label(RichText::new(fail.join(", ")).color(t.warning));
+                            ui.end_row();
+                        }
                     }
                 }
-                Kind::Primitive { fields, operation, .. } => {
-                    for (k, v) in fields.iter_mut() {
-                        row_label(ui, k);
-                        enter |= field(ui, v);
-                        ui.end_row();
-                    }
-                    row_label(ui, "Operation");
-                    combo(ui, "pr_op", &OP_LABELS, operation);
+                if let Some(e) = d.error.as_ref().or(app.preview.error.as_ref()).cloned() {
+                    row_label(ui, "");
+                    ui.vertical(|ui| {
+                        ui.add(egui::Label::new(RichText::new(e.as_str()).color(t.error)).wrap());
+                        let response = ui.button("Create Issue…");
+                        crate::scenario::publish_handle("dialog:create_issue", response.rect.center());
+                        if response.clicked() {
+                            crate::issue_report::begin(app, ctx, Some(&d), Some(&e));
+                        }
+                    });
                     ui.end_row();
                 }
-                Kind::Combine { operation, keep_tools } => {
-                    row_label(ui, "Operation");
-                    let mut op = operation.saturating_sub(1);
-                    combo(ui, "cb_op", &OP_LABELS[1..], &mut op);
-                    *operation = op + 1;
-                    ui.end_row();
-                    row_label(ui, "New Component");
-                    extra_check(ui, &mut d.extra, "new_component");
-                    ui.end_row();
-                    row_label(ui, "Keep Tools");
-                    ui.checkbox(keep_tools, "");
-                    ui.end_row();
-                }
-                Kind::Params { new_name, new_expr } => params_table(app, ui, new_name, new_expr),
-                Kind::EditParam { name, expr } => {
-                    ui.label(name.as_str());
-                    let r = ui.text_edit_singleline(expr);
-                    crate::params_dialog::complete(ui, &r, expr);
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        ok = true;
-                    }
-                    r.request_focus();
-                    ui.end_row();
-                }
-                Kind::Rename { name, .. } => {
-                    row_label(ui, "Name");
-                    let r = ui.text_edit_singleline(name);
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        ok = true;
-                    }
-                    r.request_focus();
-                    ui.end_row();
-                }
-                Kind::Assembly(k) => enter |= crate::dialogs_assembly::rows(app, ui, k, &mut d.inputs, &mut d.active),
-                Kind::Sheet(k) => enter |= crate::dialogs_sheet::rows(app, ui, k, &mut d.inputs),
-                Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k),
-                Kind::Plastic(k) => enter |= crate::dialogs_plastic::rows(app, ui, k, &d.inputs),
-                Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
-                Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
-                Kind::Part(k) => enter |= crate::dialogs_parts::rows(app, ui, k, &d.inputs),
-                Kind::ConfirmDelete { with, fail, .. } => {
-                    if !with.is_empty() {
-                        row_label(ui, "Also deletes");
-                        ui.label(with.join(", "));
-                        ui.end_row();
-                    }
-                    if !fail.is_empty() {
-                        row_label(ui, "Will fail");
-                        ui.label(RichText::new(fail.join(", ")).color(t.warning));
-                        ui.end_row();
-                    }
-                }
-            }
-            if let Some(e) = d.error.as_ref().or(app.preview.error.as_ref()).cloned() {
-                row_label(ui, "");
-                ui.vertical(|ui| {
-                    ui.add(egui::Label::new(RichText::new(e.as_str()).color(t.error)).wrap());
-                    let response = ui.button("Create Issue…");
-                    crate::scenario::publish_handle("dialog:create_issue", response.rect.center());
-                    if response.clicked() {
-                        crate::issue_report::begin(app, ctx, Some(&d), Some(&e));
-                    }
-                });
-                ui.end_row();
-            }
+            });
         });
         ui.add_space(6.0);
         // Footer: an info glyph at the left, OK and Cancel at the right.

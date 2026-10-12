@@ -87,7 +87,7 @@ pub fn command_for(app: &SolveApp, key: &str) -> Option<&'static str> {
 pub fn bind(app: &mut SolveApp, id: &str, key: &str, replace: bool) -> Result<(), String> {
     let spec = solvecraft_engine::find_command(id).ok_or_else(|| format!("no command `{id}`"))?;
     if RESERVED.contains(&key) {
-        return Err(format!("{key} is used by SolveCraft itself"));
+        return Err(format!("{key} is used by SolidCraft itself"));
     }
     if !key.is_empty() {
         let others: Vec<&'static str> = commands_for(app, key).into_iter().filter(|o| *o != id).collect();
@@ -224,7 +224,7 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
         Some((_, "reset_all")) => reset(app, None),
         Some((_, "export")) => {
             let text = crate::toolbar_custom::export(app).to_string();
-            if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("SolveCraft shortcuts.json", &["json"])) {
+            if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("SolidCraft shortcuts.json", &["json"])) {
                 app.keymap.message = std::fs::write(&path, text).err().map(|e| format!("export: {e}"));
             }
         }

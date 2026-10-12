@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use egui::{Color32, RichText};
+use egui::RichText;
 use serde_json::{Value, json};
 
 use crate::SolveApp;
@@ -275,7 +275,9 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             if bad {
                 te = te.text_color(t.error);
             }
-            let resp = ui.add_sized([170.0, 20.0], te);
+            let id = ui.make_persistent_id(("pexpr", &r.name));
+            let focused = ui.memory(|m| m.has_focus(id));
+            let resp = ui.add_sized([170.0, 20.0], te.id(id));
             crate::scenario::publish_handle(&format!("param:{}", r.name), resp.rect.center());
             let completed = complete(ui, &resp, &mut e);
             if resp.changed() || completed {
@@ -284,10 +286,10 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             if resp.has_focus() && matches!(live, Some(Ok(_))) {
                 d.preview = Some((r.name.clone(), e.clone()));
             }
-            if resp.lost_focus() {
+            if !completed && (resp.lost_focus() || enter_for(ui, focused)) {
                 d.preview = None;
                 if e != r.expression {
-                    let res = app.run("parameters.change", json!({"name": r.name, "expression": e}));
+                    let res = check(app, &e, &r.unit).and_then(|_| app.run("parameters.change", json!({"name": r.name, "expression": e})));
                     d.error = res.err();
                     if d.error.is_none() {
                         d.editing.remove(&r.name);
@@ -336,41 +338,79 @@ fn unit_label(u: &str) -> &str {
     if u.is_empty() { "none" } else { u }
 }
 
+/// Only a fresh Enter in this field submits; held keys and unrelated focus do not.
+fn enter_for(ui: &mut egui::Ui, focused: bool) -> bool {
+    focused
+        && ui.input_mut(|i| {
+            let fresh = i.raw.events.iter().any(|event| {
+                matches!(event,
+            egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. } if *modifiers == egui::Modifiers::NONE)
+            });
+            if fresh {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            }
+            fresh
+        })
+}
+
 fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog) {
     let t = Tokens::get();
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut d.new_name).hint_text("new parameter").desired_width(120.0));
-        egui::ComboBox::from_id_salt("pnew_unit").width(56.0).selected_text(unit_label(UNITS.get(d.new_unit).copied().unwrap_or("mm"))).show_ui(
-            ui,
-            |ui| {
+        let name_id = ui.make_persistent_id("pnew_name");
+        let expr_id = ui.make_persistent_id("pnew_expr");
+        let comment_id = ui.make_persistent_id("pnew_comment");
+        let focused_id = ui.memory(|m| [name_id, expr_id, comment_id].into_iter().find(|id| m.has_focus(*id)));
+        let name = ui.add(egui::TextEdit::singleline(&mut d.new_name).id(name_id).hint_text("new parameter").desired_width(120.0));
+        crate::scenario::publish_handle("param:new:name", name.rect.center());
+        let unit_response = egui::ComboBox::from_id_salt("pnew_unit")
+            .width(56.0)
+            .selected_text(unit_label(UNITS.get(d.new_unit).copied().unwrap_or("mm")))
+            .show_ui(ui, |ui| {
                 for (i, u) in UNITS.iter().enumerate() {
                     ui.selectable_value(&mut d.new_unit, i, unit_label(u));
                 }
-            },
-        );
+            });
+        crate::scenario::publish_handle("param:new:unit", unit_response.response.rect.center());
         let unit = UNITS.get(d.new_unit).copied().unwrap_or("mm");
-        let live = check(app, &d.new_expr, unit);
-        let mut te = egui::TextEdit::singleline(&mut d.new_expr).desired_width(170.0);
-        if live.is_err() {
+        let bad = check(app, &d.new_expr, unit).is_err();
+        let mut te = egui::TextEdit::singleline(&mut d.new_expr).id(expr_id).desired_width(170.0);
+        if bad {
             te = te.text_color(t.error);
         }
         let resp = ui.add(te);
-        complete(ui, &resp, &mut d.new_expr);
+        crate::scenario::publish_handle("param:new:expression", resp.rect.center());
+        let completed = complete(ui, &resp, &mut d.new_expr);
+        let live = check(app, &d.new_expr, unit);
         match &live {
             Ok(v) => ui.label(RichText::new(v).color(t.text_dim)),
             Err(m) => ui.label(RichText::new(m).color(t.error)),
         };
-        ui.add(egui::TextEdit::singleline(&mut d.new_comment).hint_text("comment").desired_width(120.0));
+        let comment = ui.add(egui::TextEdit::singleline(&mut d.new_comment).id(comment_id).hint_text("comment").desired_width(120.0));
+        crate::scenario::publish_handle("param:new:comment", comment.rect.center());
+        let submit = !completed && enter_for(ui, focused_id.is_some());
         let ok = !d.new_name.trim().is_empty() && live.is_ok();
-        if ui.add_enabled(ok, egui::Button::new("Add")).clicked() {
+        if ui.add_enabled(ok, egui::Button::new("Add")).clicked() || submit {
+            if let Err(error) = &live {
+                d.error = Some(error.clone());
+                if let Some(id) = focused_id {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+                return;
+            }
             let p = json!({"name": d.new_name.trim(), "expression": d.new_expr, "unit": unit, "comment": d.new_comment});
             match app.run("parameters.add", p) {
                 Ok(_) => {
                     d.new_name.clear();
                     d.new_comment.clear();
                     d.error = None;
+                    name.request_focus();
                 }
-                Err(e) => d.error = Some(e),
+                Err(e) => {
+                    d.error = Some(e);
+                    if let Some(id) = focused_id {
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
+                }
             }
         }
     });
@@ -421,7 +461,7 @@ pub fn publish(app: &mut SolveApp, ctx: &egui::Context) {
 }
 
 /// The identifier being typed before `cursor` (chars) and where it starts.
-fn word_before(text: &str, cursor: usize) -> (usize, String) {
+pub(crate) fn word_before(text: &str, cursor: usize) -> (usize, String) {
     let chars: Vec<char> = text.chars().collect();
     let end = cursor.min(chars.len());
     let mut start = end;
@@ -437,67 +477,18 @@ pub fn suggestions(ctx: &egui::Context, word: &str) -> Vec<Suggestion> {
         return Vec::new();
     }
     let all = ctx.data(|d| d.get_temp::<Cache>(cache_id())).map(|c| c.all).unwrap_or_default();
+    // A complete token is ready to submit, even when longer names share its prefix.
+    if all.iter().any(|s| s.text == word) {
+        return Vec::new();
+    }
     let w = word.to_ascii_lowercase();
     all.iter().filter(|s| s.text.to_ascii_lowercase().starts_with(&w) && s.text.trim_end_matches('(') != word).take(8).cloned().collect()
 }
 
-/// Offer completions under an expression box while it has focus; Tab or a click takes the first
-/// (or the clicked) one. Returns true when the text changed.
+/// Offer keyboard and pointer completions under a focused expression box.
+/// Returns true when a suggestion was accepted; callers must not submit that frame.
 pub fn complete(ui: &mut egui::Ui, resp: &egui::Response, text: &mut String) -> bool {
-    let ctx = ui.ctx().clone();
-    let state = egui::TextEdit::load_state(&ctx, resp.id);
-    let cursor = state.as_ref().and_then(|s| s.cursor.char_range()).map(|r| r.primary.index.0).unwrap_or_else(|| text.chars().count());
-    let (start, word) = word_before(text, cursor);
-    // Raw events: egui's focus navigation consumes Tab before widgets see it.
-    let tab = ui.input(|i| i.raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, pressed: true, .. })));
-    // Tab moves focus away before we see it: accept on that frame and take focus back.
-    // Keyboard focus in egui's memory (not `has_focus`, which also needs the OS window focused).
-    let focused = ctx.memory(|m| m.has_focus(resp.id));
-    let active = focused || (resp.lost_focus() && tab);
-    if !active {
-        return false;
-    }
-    let list = suggestions(&ctx, &word);
-    if list.is_empty() {
-        return false;
-    }
-    let mut pick: Option<String> = if tab { list.first().map(|s| s.text.clone()) } else { None };
-    let t = Tokens::get();
-    crate::frame::area(resp.id.with("completions")).order(egui::Order::Tooltip).fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 2.0)).show(
-        &ctx,
-        |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(resp.rect.width().max(180.0));
-                for (i, s) in list.iter().enumerate() {
-                    let colour = match s.kind.as_str() {
-                        "parameter" => t.text,
-                        "function" => t.accent,
-                        _ => t.text_dim,
-                    };
-                    let label = RichText::new(&s.text).color(colour);
-                    let r = ui.add(egui::Button::new(label).frame(false).fill(Color32::TRANSPARENT)).on_hover_text(&s.detail);
-                    if i == 0 {
-                        ui.label(RichText::new(&s.detail).small().color(t.text_dim));
-                    }
-                    if r.clicked() {
-                        pick = Some(s.text.clone());
-                    }
-                }
-                ui.label(RichText::new("Tab to complete").small().color(t.text_dim));
-            });
-        },
-    );
-    let Some(p) = pick else { return false };
-    let chars: Vec<char> = text.chars().collect();
-    let before: String = chars.get(..start).map(|s| s.iter().collect()).unwrap_or_default();
-    let after: String = chars.get(cursor.min(chars.len())..).map(|s| s.iter().collect()).unwrap_or_default();
-    *text = format!("{before}{p}{after}");
-    let at = start + p.chars().count();
-    let mut st = state.unwrap_or_default();
-    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
-    st.store(&ctx, resp.id);
-    resp.request_focus();
-    true
+    crate::expression_complete::complete(ui, resp, text)
 }
 
 #[cfg(test)]

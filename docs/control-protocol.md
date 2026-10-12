@@ -6,6 +6,14 @@ line `{"id": …, "ok": true, "result": …}` or `{"id": …, "ok": false, "erro
 handled on the UI thread between frames; pointer and keyboard input is injected as real egui
 events, one pointer event per frame.
 
+The channel is untrusted input. A request line may be at most 16 MiB; a longer one is answered
+with `{"ok": false, "error": "request too large"}` and the connection is closed, as are
+connections that send eight lines that are not JSON. At most 16 connections are served at once
+(further ones get `{"ok": false, "error": "too many connections"}`), at most 64 queued requests
+run per frame so a flood cannot starve drawing, and a request that the UI thread has not
+answered within 60 seconds is replied to with `{"ok": false, "error": "timeout"}`. The same
+16 MiB line limit applies to the MCP server.
+
 ## Engine
 
 | Method | Params | Result |
@@ -62,7 +70,7 @@ rolls the numbering back with the design), so they can go straight into later co
 | `ui.home` | `open?`: bool; `sample?`: index | the start page: show or hide it, open a built-in sample (once built); returns `open` and the recent designs |
 | `ui.shortcut` | `command`, `key?`, `replace?` | a command's key, or rebinds it (`""` clears; a key another command uses is refused unless `replace`) |
 | `ui.help` | `item?`: `about`, `shortcuts` (read only), `report` (copies diagnostics) | the version, commit, build date and diagnostic text |
-| `ui.prefs` | any of `default_units`, `nav` (`fusion`, `solidworks`, `inventor`, `alias`, `tinkercad`), `zoom_reverse`, `zoom_to_cursor`, `orbit_cursor`, `look_at_anim`, `look_at_speed`, `msaa`, `length_decimals`, `angle_decimals`, `theme` (`dark`, `light`, `system`), `language` (`en`, `ja`; see [localization](localization.md)), `ui_scale`, `up_axis` (`z`, `y`), `offer_stand_up`; `open` (a page: General, Navigation, Keyboard Shortcuts, Design, Graphics, Sketch, Selection) opens the Preferences dialog there; `button`: `ok`, `cancel`, `apply`, `defaults`; `stand_up: true` stands up a just-opened Y-up file | sets preferences (kept between runs), returns them all plus `dialog` (the open page or null), `dark` and `stand_up_offer` |
+| `ui.prefs` | any of `default_units`, `nav` (`fusion`, `solidworks`, `inventor`, `alias`, `tinkercad`), `zoom_reverse`, `zoom_to_cursor`, `smooth_wheel_zoom` (default true), `orbit_cursor`, `look_at_anim`, `look_at_speed`, `msaa`, `length_decimals`, `angle_decimals`, `theme` (`dark`, `light`, `system`), `language` (`en`, `ja`; see [localization](localization.md)), `ui_scale`, `up_axis` (`z`, `y`), `offer_stand_up`; `open` (a page: General, Navigation, Keyboard Shortcuts, Design, Graphics, Sketch, Selection) opens the Preferences dialog there; `button`: `ok`, `cancel`, `apply`, `defaults`; `stand_up: true` stands up a just-opened Y-up file | sets preferences (kept between runs), returns them all plus `dialog` (the open page or null), `dark` and `stand_up_offer` |
 | `ui.capture` | `action?`: `capture`, `revert`, `cancel` | answers the Capture Position question (asked when a command starts or the design is saved while components were moved without capturing); without `action`, what waits |
 | `ui.window` | `action`: minimize, maximize, restore, toggle, close | what the title bar's caption buttons do (on Windows and Linux the application bar is the title bar); close asks about unsaved designs first |
 | `ui.agent_cursor` | `show` (bool), `speed`: a number from 1 to 5 (times the normal speed) or `"instant"` (no animation: the command runs at once and the pointer jumps to where it acted), `follow_camera` (bool); all optional | the settings. While the cursor is shown, `engine.execute` first glides to the command's toolbar button and to each pick, then runs and replies; later requests wait their turn. `"animate": false` on a call skips it |

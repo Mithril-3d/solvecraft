@@ -1,5 +1,5 @@
-# The documentation site on GitHub Pages: the book (docs/book) at /solvecraft/ and the web app
-# at /solvecraft/app/. Needs Settings → Pages → Source = GitHub Actions; skipped while the
+# The documentation site on GitHub Pages: the book (docs/book) at /solidcraft/ and the web app
+# at /solidcraft/app/. Needs Settings → Pages → Source = GitHub Actions; skipped while the
 # repository is private.
 name: Pages
 
@@ -49,7 +49,7 @@ jobs:
         run: cargo xtask book
       - name: Build the web app
         working-directory: apps/solvecraft-web
-        run: trunk build --release --public-url /solvecraft/app/
+        run: trunk build --release --public-url /solidcraft/app/
       - name: Assemble the site
         run: |
           mkdir -p site

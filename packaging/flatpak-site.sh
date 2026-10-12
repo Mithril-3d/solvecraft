@@ -49,20 +49,22 @@ for arch in x86_64 aarch64; do
   ostree --repo="$validation_repo" refs | grep -Fxq "app/$app_id/$arch/stable"
   flatpak build-import-bundle "$repo_dir" "$bundles/$asset"
 done
-flatpak build-update-repo --title="SolveCraft" --comment='Official SolveCraft releases' \
-  --description='Official Flatpak repository for SolveCraft' \
+flatpak build-update-repo --title="SolidCraft" --comment='Official SolidCraft releases' \
+  --description='Official Flatpak repository for SolidCraft' \
   --homepage="https://github.com/$GITHUB_REPOSITORY" --default-branch=stable "$repo_dir"
 test -s "$repo_dir/summary"
 cat >"$site/flatpak/solvecraft.flatpakrepo" <<META
 [Flatpak Repo]
-Title=SolveCraft
-Comment=Official SolveCraft releases
-Description=Official Flatpak repository for SolveCraft
+Title=SolidCraft
+Comment=Official SolidCraft releases
+Description=Official Flatpak repository for SolidCraft
 Url=$base_url/flatpak/repo/
 Homepage=https://github.com/$GITHUB_REPOSITORY
 META
 cat >"$site/flatpak/index.html" <<HTML
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SolveCraft Flatpak repository</title></head><body><main><h1>SolveCraft Flatpak repository</h1><p>Latest published release: <strong>$tag</strong></p><p><a href="solvecraft.flatpakrepo">Add the SolveCraft repository</a></p><pre>flatpak remote-add --if-not-exists solvecraft $base_url/flatpak/solvecraft.flatpakrepo
-flatpak install solvecraft $app_id</pre></main></body></html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SolidCraft Flatpak repository</title></head><body><main><h1>SolidCraft Flatpak repository</h1><p>Latest published release: <strong>$tag</strong></p><p><a href="solvecraft.flatpakrepo">Add the SolidCraft repository</a></p><p>Flathub provides the required Freedesktop runtime. Add both remotes to the same user installation:</p><pre>flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --user --if-not-exists solvecraft $base_url/flatpak/solvecraft.flatpakrepo
+flatpak install --user solvecraft $app_id
+flatpak run $app_id</pre></main></body></html>
 HTML
 touch "$site/.nojekyll"

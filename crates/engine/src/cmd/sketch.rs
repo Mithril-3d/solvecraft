@@ -114,7 +114,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_coincident")
         .enabled(in_sketch)
-        .params("a: point, b: point or curve"),
+        .params("a, b: points, a point and a curve, or two distinct lines (joins their closest endpoints)"),
     CommandSpec::new("sketch.constraint.tangent", "Tangent", c_tangent)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_tangent")
@@ -1235,13 +1235,17 @@ fn c_coincident(s: &mut Session, p: &Value) -> Result<Value> {
     // Already tied (e.g. connected when it was drawn there): nothing to add.
     let sk = s.doc.sketch(target_sketch(s, p, cmd)?)?;
     let pt = |k: &str| p.get(k).and_then(Value::as_str).and_then(|r| sk.resolve_point(r));
-    if let (Some(a), Some(b)) = (pt("a"), pt("b"))
+    let line_points = coincident_line_points(sk, p, cmd)?;
+    if let Some((a, b)) = line_points.or_else(|| pt("a").zip(pt("b")))
         && let Some(c) = sk.constraints.iter().find(|c| matches!(c.kind, ConstraintKind::Coincident { p, q } if (p, q) == (a, b) || (p, q) == (b, a)))
     {
         let rep = solve(&mut sk.clone());
         return Ok(json!({"constraint": c.id, "existing": true, "sketch": {"solved": rep.ok(), "dof": rep.dof}}));
     }
     constrain(s, p, cmd, |sk| {
+        if let Some((a, b)) = line_points {
+            return Ok(ConstraintKind::Coincident { p: a, q: b });
+        }
         let aref = p.get("a").and_then(Value::as_str).unwrap_or_default();
         let bref = p.get("b").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`b` must be a point or curve"))?;
         // A curve picked first and a point second: the point goes onto the curve.
@@ -1255,6 +1259,37 @@ fn c_coincident(s: &mut Session, p: &Value) -> Result<Value> {
         let c = sk.curve_index(bref).ok_or_else(|| bad(cmd, format!("unknown entity `{bref}`")))?;
         Ok(ConstraintKind::PointOnCurve { p: a, c })
     })
+}
+
+/// Four endpoint pairs, ordered independently of pick order when distances tie.
+fn coincident_line_points(sk: &Sketch, p: &Value, cmd: &str) -> Result<Option<(usize, usize)>> {
+    let curve = |key: &str| p.get(key).and_then(Value::as_str).and_then(|id| sk.curve_index(id));
+    let (Some(a), Some(b)) = (curve("a"), curve("b")) else { return Ok(None) };
+    if a == b {
+        return Err(bad(cmd, "choose two distinct lines"));
+    }
+    let ends = |i: usize| match sk.curves.get(i).map(|curve| &curve.kind) {
+        Some(CurveKind::Line { a, b }) => Some([*a, *b]),
+        _ => None,
+    };
+    let (Some(first), Some(second)) = (ends(a), ends(b)) else {
+        return Err(bad(cmd, "two curves must both be straight lines; otherwise choose a point and a curve"));
+    };
+    let mut best: Option<(f64, usize, usize)> = None;
+    for a in first {
+        for b in second {
+            let (Some(pa), Some(pb)) = (sk.point(a), sk.point(b)) else { return Err(bad(cmd, "line endpoint is missing")) };
+            let candidate = (pa.dist(pb), a.min(b), a.max(b));
+            if best.is_none_or(|old| candidate < old) {
+                best = Some(candidate);
+            }
+        }
+    }
+    let (_, a, b) = best.ok_or_else(|| bad(cmd, "line endpoints are missing"))?;
+    if a == b {
+        return Err(bad(cmd, "the lines already share an endpoint"));
+    }
+    Ok(Some((a, b)))
 }
 
 fn two_curves(sk: &Sketch, p: &Value, cmd: &str) -> Result<(usize, usize)> {
@@ -1703,14 +1738,18 @@ fn construction(s: &mut Session, p: &Value) -> Result<Value> {
         let cs: Vec<usize> =
             ids.iter().map(|id| sk.curve_index(id).ok_or_else(|| bad(cmd, format!("unknown curve `{id}`")))).collect::<Result<_>>()?;
         // The selection switches together (a slot or polygon as a whole): to construction
-        // unless all of it already is. Projected curves may switch too.
+        // unless all of it already is. Projected curves may switch too. A centerline that
+        // becomes construction stops being a centerline (one line type at a time).
         let to = want.unwrap_or_else(|| !cs.iter().all(|c| sk.curves.get(*c).is_some_and(|c| c.construction)));
         let mut n = 0;
         for c in cs {
             if let Some(cu) = sk.curves.get_mut(c)
-                && cu.construction != to
+                && (cu.construction != to || to && cu.centerline)
             {
                 cu.construction = to;
+                if to {
+                    cu.centerline = false;
+                }
                 n += 1;
             }
         }

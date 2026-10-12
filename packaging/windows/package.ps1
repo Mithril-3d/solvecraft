@@ -53,7 +53,7 @@ $Dist = if ($env:DIST) { $env:DIST } else { Join-Path $Root 'dist\release' }
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
-Write-Output "SolveCraft $Version for Windows $Arch ($Target)"
+Write-Output "SolidCraft $Version for Windows $Arch ($Target)"
 
 if (-not $SkipBuild) {
   # Static CRT: no VC++ redistributable needed. Scoped to the target so host build scripts and
@@ -79,6 +79,7 @@ foreach ($check in @(@('solvecraft.exe', 2), @('solvecraft-cli.exe', 3))) {
   Write-Output "ok $($check[0]): $Arch, PE subsystem $($h.Subsystem)"
 }
 $Stage = Join-Path $TargetDir "windows-package\$Arch"
+& (Join-Path $PSScriptRoot 'check-icon.ps1') -Path (Join-Path $Bin 'solvecraft.exe')
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 Copy-Item (Join-Path $Bin 'solvecraft.exe'), (Join-Path $Bin 'solvecraft-cli.exe') $Stage

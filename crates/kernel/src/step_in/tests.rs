@@ -622,3 +622,56 @@ fn glued_halves_export_as_whole_faces() {
     // Box sides and caps (6) and two holes.
     assert_eq!(imp.bodies[0].file_faces, 8);
 }
+
+/// Knot multiplicities are expanded into one value each before the knot count is compared with
+/// the control points, so the sum has to be checked first: 1,000,000 knots of multiplicity 64
+/// against two control points asked for a 500 MB vector (20,000,000 for 10 GB) only to reject
+/// it afterwards, and an allocation failure aborts the process where an error does not.
+#[test]
+fn knot_multiplicities_are_checked_before_they_are_expanded() {
+    let curve = |n: usize, mult: usize| {
+        let knots: Vec<String> = (0..n).map(|i| format!("{i}.")).collect();
+        let mults: Vec<String> = std::iter::repeat_n(mult.to_string(), n).collect();
+        format!(
+            "{HEAD}#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=CARTESIAN_POINT('',(1.,0.,0.));\n\
+             #3=B_SPLINE_CURVE_WITH_KNOTS('',1,(#1,#2),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);\n{TAIL}",
+            mults.join(","),
+            knots.join(",")
+        )
+    };
+    let read = |text: &str| {
+        let ex = p21::parse(text).unwrap();
+        let cx = Ctx { ex: &ex, len: 1.0, ang: 1.0, tol: 1e-6 };
+        geom::curve(&cx, 3, 0)
+    };
+    let error = read(&curve(1_000_000, 64)).unwrap_err();
+    // This diagnostic comes from the check before expansion; wall-clock time depends on CI load.
+    assert!(error.contains("knot multiplicities do not match"), "{error}");
+    // A degree-1 curve with two control points needs exactly four knot values.
+    assert!(read(&curve(2, 2)).is_ok());
+    assert!(read(&curve(4, 1)).is_ok());
+    assert!(read(&curve(2, 3)).is_err());
+}
+
+/// One `ADVANCED_FACE` may list any number of bounds, and each one clones its edge handles into
+/// a new wire that the face extent then samples. A face naming the same loop a million times
+/// held 1e11 handles.
+#[test]
+fn faces_with_too_many_bounds_are_refused() {
+    let good = step_export(&[&box_solid(Vec3::ZERO, Vec3::new(5.0, 5.0, 5.0)).unwrap()], "t").unwrap();
+    // One extra face on the cube's shell, listing its outer bound 100,000 times.
+    let bounds = std::iter::repeat_n("#900001", 100_000).collect::<Vec<_>>().join(",");
+    let mut extra = format!("#900000=ADVANCED_FACE('',({bounds}),#900010,.T.);\n");
+    extra += "#900001=FACE_OUTER_BOUND('',#900002,.T.);\n#900002=EDGE_LOOP('',(#900003));\n";
+    extra += "#900003=ORIENTED_EDGE('',*,*,#900004,.T.);\n#900004=EDGE_CURVE('',#900005,#900005,#900007,.T.);\n";
+    extra += "#900005=VERTEX_POINT('',#900006);\n#900006=CARTESIAN_POINT('',(0.,0.,0.));\n";
+    extra += "#900007=LINE('',#900006,#900008);\n#900008=VECTOR('',#900009,1.);\n#900009=DIRECTION('',(1.,0.,0.));\n";
+    extra += "#900010=PLANE('',#900011);\n#900011=AXIS2_PLACEMENT_3D('',#900006,#900012,#900009);\n#900012=DIRECTION('',(0.,0.,1.));\n";
+    let text =
+        good.replacen("CLOSED_SHELL('',(", "CLOSED_SHELL('',(#900000,", 1).replacen("ENDSEC;\nEND-ISO", &format!("{extra}ENDSEC;\nEND-ISO"), 1);
+
+    let start = std::time::Instant::now();
+    let imp = step_import(&text).unwrap();
+    assert!(imp.warnings.iter().any(|w| w.contains("boundary loops")), "{:?}", imp.warnings);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10), "took {:?}", start.elapsed());
+}

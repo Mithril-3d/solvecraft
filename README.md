@@ -1,25 +1,39 @@
-# SolveCraft
+# SolidCraft
 
-**Parametric 3D CAD; an open-source, [clean-room](CLAUDE.md) reimplementation of Autodesk
-Fusion 360, built in pure Rust.**
+**An open-source parametric 3D CAD application built in pure Rust.**
 
 Sketch, constrain, and build solids with a parametric feature timeline. Change a dimension
 and watch your model rebuild. Run it on your desktop, in your browser, or let AI agents
-model through the built-in MCP server. Part of the storytold "craft" family.
+model through the built-in MCP server.
 
-![SolveCraft 0.2.0: dimension a line, extrude a plate with an elliptical hole, and change its width while preserving the hole](docs/screenshots/demo.gif)
+![SolidCraft: draw a rounded electronics enclosure, sketch its USB port directly on a face, add four mounting bosses and resize it through Parameters](docs/screenshots/enclosure-demo-0.2.1.gif)
 
-*The actual 0.2.0 desktop UI: dimension a line from its endpoints, build a plate with an elliptical hole, then change its width from 25 → 35 mm and watch it rebuild. Includes the new axis navigation. 2× GIF preview; [full video at real-time speed](https://github.com/bherbruck/solvecraft/releases/download/v0.2.0/solvecraft-0.2.0-demo.mp4).*
+*Start with an empty design and draw the original parametric electronics enclosure in the English desktop UI: rounded corners, a shell, a USB port sketched directly on the wall and a four-boss pattern. Change width from 80 → 100 mm and wall thickness from 2 → 3 mm in Parameters and watch it rebuild. Original animated pointer and click cues; 4× playback. [Full video](https://github.com/bherbruck/solidcraft/raw/refs/heads/main/docs/screenshots/enclosure-demo-0.2.1.mp4), generated with the [demo script](examples/demo/record_ui.sh).*
 
-**Documentation:** the [SolveCraft book](https://bherbruck.github.io/solvecraft/) (user guide,
+**Documentation:** the [SolidCraft book](https://bherbruck.github.io/solidcraft/) (user guide,
 developer guide and command reference; sources in [docs/book](docs/book)), and the
-[web app](https://bherbruck.github.io/solvecraft/app/) to try it in the browser.
+[web app](https://bherbruck.github.io/solidcraft/app/) to try it in the browser.
 
-**Status: early but usable for simple parts.** 76 of 76 reference parts built in Fusion
-rebuild in SolveCraft with the same volume, area and topology ([docs/oracle.md](docs/oracle.md));
-command parity with Fusion's Design workspace is tracked in [docs/parity.md](docs/parity.md).
-Open work and known bugs are in [GitHub issues](https://github.com/bherbruck/solvecraft/issues),
+Linux Flatpak installation needs the Freedesktop runtime from Flathub as well as the
+SolidCraft application feed. See [install and launch commands](https://bherbruck.github.io/solidcraft/guide/getting-started.html#linux-flatpak).
+
+**Status: early but usable for simple parts.** The historical benchmark report records
+76 of 76 reference parts matching volume, area and topology ([docs/oracle.md](docs/oracle.md)).
+These checks do not establish complete geometric or workflow equivalence. Feature coverage
+is tracked in [docs/parity.md](docs/parity.md) and [ROADMAP.md](ROADMAP.md).
+Open work and known bugs are in [GitHub issues](https://github.com/bherbruck/solidcraft/issues),
 and help is welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Name and compatibility
+
+SolidCraft was previously called SolveCraft. The product display name and repository are
+changing; existing identifiers remain compatible: `.solvecraft` designs, `solvecraft-cli`,
+Cargo package names, settings/recovery locations and package IDs keep their existing names.
+Published 0.2.0 and 0.2.1 packages and demo recordings retain their original SolveCraft branding
+and filenames.
+
+Use the SolidCraft documentation and web-app URLs above. GitHub redirects links to the
+renamed repository; old-name Pages and Flatpak URLs are not maintained as permanent aliases.
 
 ## What works
 
@@ -74,7 +88,7 @@ and help is welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
   Feature errors and Help can open an editable **Create Issue** draft with relevant context
   and an optional reviewed screenshot; opening GitHub does not submit the report.
 - **Headless CLI** `solvecraft-cli`: run command scripts, measure (volume, area, centre of mass,
-  face/edge/vertex counts), export, render PNG snapshots, replay Fusion oracle recipes.
+  face/edge/vertex counts), export, render PNG snapshots and replay reference recipes.
 - **MCP server** `solvecraft-cli mcp`: AI agents model, measure and look at parts headless or
   in the running app (see below).
 
@@ -91,6 +105,11 @@ cargo xtask ci                                          # fmt, clippy, tests, as
 ```
 
 Windows builds: `cargo xwin build --release --target x86_64-pc-windows-msvc -p solvecraft`.
+
+On Windows, SolidCraft detects a connected 3Dconnexion SpaceNavigator or SpaceMouse through its
+multi-axis HID interface. Move the cap to pan and zoom, and tilt or twist it to rotate the 3D view.
+While editing a sketch, the cap pans and zooms without changing the sketch view. The Navigation
+page in Preferences has an on/off switch and a speed control for the 3D mouse.
 
 In the browser: `cd apps/solvecraft-web && trunk build --release --public-url ./` (WebGPU, or
 WebGL2 with `?webgl`; `?sample` opens the sample part).
@@ -134,10 +153,19 @@ configuration and an example session: [docs/mcp.md](docs/mcp.md).
 
 ## Contributing
 
+Coming from Autodesk Fusion? SolidCraft uses familiar parametric CAD workflows: constrained
+sketches, solid features, an editable timeline, parameters and assemblies. See the
+[roadmap](ROADMAP.md) for supported operations and current limitations.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md): how to build and test, the code map, the clean-room
 and licence rules, and where help is wanted most.
 
 ## Licence
 
-MIT OR Apache-2.0, at your option. SolveCraft is not affiliated with Autodesk; Fusion is a
-trademark of Autodesk, Inc.
+MIT OR Apache-2.0, at your option. Developed under the
+[clean-room contribution rules](CLAUDE.md); third-party code and assets retain their
+documented licences and attribution.
+
+References to other products describe workflow comparisons and benchmark provenance.
+SolidCraft is not affiliated with, sponsored by or endorsed by Autodesk. Autodesk and
+Fusion are trademarks of Autodesk, Inc.

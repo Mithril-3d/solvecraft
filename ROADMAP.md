@@ -1,6 +1,6 @@
-# SolveCraft roadmap
+# SolidCraft roadmap
 
-Status as of **2026-10-11**. SolveCraft targets Fusion-style parametric modelling (sketch →
+Status as of **2026-10-11**. SolidCraft supports parametric modelling (sketch →
 features → parametric timeline) as an open, pure-Rust, agent-drivable application.
 
 ## At a glance
@@ -54,7 +54,7 @@ headline counts in-scope tabs only and lists the deferred ones separately.
 | M6 | UI depth: selection feedback and origin (done), timeline editing (done: hover and selection highlight modifier faces, including fillets and chamfers; edit feature, history marker drag, reorder with dependency checks, suppress, rename, delete with dependents, re-resolved references; redefining selections refreshes persistent edge/face references while retaining feature identity and dimension names), right-docked dialogs (done), live previews for every feature dialog (done), keyboard-first commands with on-canvas value boxes and sketch inline dimensions (done), drag manipulators with automatic join/cut (done: extrude incl. two sides, fillet, shell, hole depth, move, pattern spacing, revolve rotator; taper handle open), dark theme (done), right-click menu with Repeat (done), measure tool (done), section analysis (done), selection filter (done), drag-solve of sketch points (done); appearance controls now preserve body/face/component targeting, named transparent looks, reuse/search and override removal; preferences | in progress | 6 |
 | M7 | Sweep, loft (incl. to a point), rib and web (to next / depth), emboss (planar faces and exact radial emboss/deboss of bounded orthogonal profiles on complete exterior cylinders/sleeves), thread (cosmetic, and modelled M3–M20 outside and inside: the ISO profile screwed in as a faceted cut), coil (smooth B-spline helical walls), pipe, pattern on path, patterns of bodies and components, replace face (parallel), align, remove, feature copy/paste: done. Unique eligible cylindrical targets are inferred for new Emboss features. Left: general curved-face emboss and exact (unfaceted) modelled threads | in progress | 12 |
 | M8 | Surface workspace | deferred | — |
-| M9 | Components and assemblies (Fusion-style): New Component / Create Components from Bodies, active component, per-component origin/bodies/sketches/timeline entries, occurrences with transforms, Copy/Paste vs Paste New, nested Browser tree with visibility and isolate; Ground, Move/Copy of occurrences, joints (rigid, revolute, slider, cylindrical, pin-slot, planar, ball) by joint origins with limits and Drive Joints, As-built Joint, Rigid Group, Contact Sets (driving and motion studies stop where bodies in a set would pass through each other), Motion Study (joint values keyed along a timeline, playback, export of occurrence positions as JSON/CSV), Exploded views (automatic or by hand, shown without changing placements); interference, per-component physical properties; STEP with assembly structure. Physical properties now measure material-aware component/occurrence placements, descendants and repeated instances, including pending moves and body reassignment offsets; contact geometry and automatic exploded centres respect those offsets. Groundwork done: component tree, occurrences with transforms (instances, Paste New), world placement, active component as authoring frame, ground, Capture/Revert Position, moving bodies and sketches. UI: ASSEMBLE panel dialogs for New Component, Joint (snaps on faces, edges, circles and vertices; animated motion preview; offsets, flip, limits), As-built Joint, Joint Origin, Rigid Group, Drive Joints (live slider), Motion Link and Interference (overlaps shown red); joints in the timeline and the Browser | in progress | 32 |
+| M9 | Components and assemblies: New Component / Create Components from Bodies, active component, per-component origin/bodies/sketches/timeline entries, occurrences with transforms, Copy/Paste vs Paste New, nested Browser tree with visibility and isolate; Ground, Move/Copy of occurrences, joints (rigid, revolute, slider, cylindrical, pin-slot, planar, ball) by joint origins with limits and Drive Joints, As-built Joint, Rigid Group, Contact Sets (driving and motion studies stop where bodies in a set would pass through each other), Motion Study (joint values keyed along a timeline, playback, export of occurrence positions as JSON/CSV), Exploded views (automatic or by hand, shown without changing placements); interference, per-component physical properties; STEP with assembly structure. Physical properties now measure material-aware component/occurrence placements, descendants and repeated instances, including pending moves and body reassignment offsets; contact geometry and automatic exploded centres respect those offsets. Groundwork done: component tree, occurrences with transforms (instances, Paste New), world placement, active component as authoring frame, ground, Capture/Revert Position, moving bodies and sketches. UI: ASSEMBLE panel dialogs for New Component, Joint (snaps on faces, edges, circles and vertices; animated motion preview; offsets, flip, limits), As-built Joint, Joint Origin, Rigid Group, Drive Joints (live slider), Motion Link and Interference (overlaps shown red); joints in the timeline and the Browser | in progress | 32 |
 | M10 | Sheet metal: flange (base, edge, contour), hem, unfold/refold, convert, flat pattern + DXF, rules: done (oracle 67-76). PLASTIC enclosure subset: Boss, Rib, Web, Lip/Groove, Snap Fit, Rest, Plastic Rules (library, edit, assign; rule draft and clearance as feature defaults): done, no Fusion oracle (licence), tested against hand-computed geometry. UI: SHEET METAL and PLASTIC tabs in Fusion's layout with dialogs (live preview, Edit Feature, pre-selection) for Flange, Hem, Unfold/Refold, Convert, Sheet Metal Rules, Create Flat Pattern (flat view with bend lines, bend table CSV/JSON and DXF export with exact circle/arc/line cutouts), Boss, Lip/Groove, Snap Fit, Rest, Manage and Assign Plastic Rules; Fold (bend along a sketch line) | in progress | 36 |
 | M11 | 2D drawings | deferred | — |
 | M12 | Release: cross-platform packages, verification and deliberate publication implemented; original current-UI demo refreshed. Trusted distribution signing and broader performance work remain | in progress | 16 |
@@ -72,6 +72,9 @@ headline counts in-scope tabs only and lists the deferred ones separately.
   useful reproduction context. The draft is editable, with optional capture of the actual
   viewport and copy/save controls. Opening GitHub does not submit the issue. Help also exposes
   reporting for unexpected results that did not produce an error.
+- The header exposes **Report a bug**, including an accessible compact control on
+  narrow windows. It opens the same editable report and screenshot review without
+  changing the active model or a pending dimension.
 
 ## 0.2.0 release batch
 
@@ -85,9 +88,31 @@ headline counts in-scope tabs only and lists the deferred ones separately.
   preventing the reproduced thin-web loss. Unknown additional trims refuse; inherited
   common-cylinder trims retain their existing policy, so this is not a general Boolean proof.
 - Exact full-path assembly joint editing remains separate work and is not part of this batch.
-- The replacement README demo records the actual English 0.2.0 UI, with a 2× preview and
-  a full video at real-time speed. Package verification and publication follow
-  [the release workflow](docs/releasing.md); development pushes are not application releases.
+- Stable 0.2.0 is published: all release payload checksums, native cold reopening, deployed
+  web app and both Flatpak architectures were verified. The replacement README demo uses
+  the original electronics enclosure story and animated pointer in the actual English
+  0.2.0 UI, at 4× playback. Publication follows [the release workflow](docs/releasing.md).
+
+## 0.2.1 critical fixes
+
+- Axis view and navigation controls stay anchored to the viewport when feature dialogs or
+  the command palette open, at normal and enlarged display scales. Fit still accounts for
+  dialog coverage; covered controls do not receive clicks through dialogs.
+- Eligible planar faces survive fillet, chamfer and shell operations with exact source
+  certificates. Sketches placed directly on the enclosure wall and inner floor follow
+  width and wall changes, including after the USB cut and cold reopening.
+- Remove artificial straight-wall and rounded-corner subdivisions left by shell and
+  extrusion cuts. Identical generated wall segments span adjacent slabs as one physical
+  face, with exact full-height supports and boundary stitching. Preserve authored face
+  splits and face appearances. Permanent regressions cover material, STEP, reopening and
+  unaffected bodies across the extrusion end plane.
+- Feature dialogs use the available screen height for their fields, with OK and Cancel
+  outside the scrolling region, including enlarged display scales.
+- Design format 13 records shell-face attachments. Older designs remain readable;
+  newly saved designs require 0.2.1 or later. Ambiguous or unsupported faces still refuse
+  attachment rather than guessing a plane.
+- Saved projections from a removed strip retain their geometry and report the lost
+  reference. Explicitly reselect the wall to repair that projection.
 
 ## View navigation
 
@@ -98,6 +123,8 @@ headline counts in-scope tabs only and lists the deferred ones separately.
 
 ## Known limitations
 
+- Associative shell-face sketches require a unique certified planar source. Nested shell
+  attachments and ambiguous coincident sources remain unsupported.
 - Fillets and chamfers: constant, variable-radius and chord-length fillets; a radius per edge,
   rounds next to earlier rounds of another radius, and smooth corner patches where three rounds
   meet (a sphere for equal radii); straight edges (convex or concave) between planar faces with perpendicular
@@ -223,6 +250,21 @@ headline counts in-scope tabs only and lists the deferred ones separately.
   record their coordinate frame; legacy wires migrate from known provenance without changing
   coordinates. Broken legacy links with missing provenance can require explicit refresh or relink.
   See [occurrence workflows](docs/occurrence-workflows.md).
+- Parameters and Configurations have distinct actions in the SOLID toolbar's CONFIGURE panel.
+  Parameters opens the user/model variable editor; Configurations opens the configuration table.
+  Configure remains available in the panel dropdown.
+- Parameter creation supports Enter with validation and continued keyboard entry. Shared
+  expression autocomplete supports Up/Down selection, Enter/Tab acceptance and Escape dismissal;
+  accepting a suggestion does not submit a parameter or trigger viewport shortcuts.
+- Movable window title bars follow the app's dark/light header palette. Radial right-click
+  menus are opt-in in Preferences > Navigation; ordinary context menus remain the default.
+- Desktop distribution: running Windows windows and executable resources use the app icon;
+  packaging validates icon resources. Nix installs launchers, MIME data and generated icons,
+  with explicit launch apps and Vulkan-loader/driver discovery. Flatpak feed instructions
+  register the required runtime source; release checks exercise desktop modelling on X11/Wayland.
+- OpenGL rendering clamps effective anti-aliasing to 1x across UI pipelines, textures and CAD
+  callbacks to prevent black frames. Other backends retain the requested sample count, and
+  stored preferences remain unchanged.
 - Configuration rules: ordered typed conditions can drive parameters and suppressions or
   restrict values. Preview explains effective values without modifying the document; applying
   rules validates rows atomically. Length expressions retain their authoring units across
@@ -247,7 +289,29 @@ headline counts in-scope tabs only and lists the deferred ones separately.
   continuous collision detection; local thin walls and small details remain limitations.
   See [contact-set limits and recovery](docs/contact-sets.md).
 
+## Document-opening performance
+
+- Cold rebuild profiling separates parsing, geometry, placement, display meshing and
+  thumbnails. Straight-line closest-point projection and exact curved-surface evaluation
+  reuse reduce repeated work without relaxing geometry checks. Three alternating optimized
+  benchmark runs reduce median rebuild time by 26% on the public sensor enclosure and 22%
+  on a local case assembly; shape measurements and topology match the original build.
+  See [performance measurements](docs/perf.md). Further cold Boolean and import costs remain.
+- Prepared assembly geometry survives selection and view changes while real geometry and
+  placement changes invalidate it. A Pi assembly edge-selection probe drops from 9.24 s to
+  0.57 s; initial opening is unchanged. Actual Windows desktop profiling measures 15.87 s
+  median opening, with 82% spent rebuilding geometry; halving full opening remains open.
+
 ## Kernel
+
+- Boolean intersection-curve construction refuses point-only, collapsed and non-finite
+  polylines without panicking. Direct constructor regressions retain valid open endpoints
+  and closed spherical intersections; the original interactive trigger remains unidentified.
+- Shell of a stepped, joined planar body no longer creates horizontal subdivisions across
+  continuous walls. Fresh axis-aligned Cut walls are stitched using their exact construction
+  support and shared topology, preserving real steps and intentional boundaries. The local
+  reported case returns from 86 to 49 faces with unchanged material and bounds; regressions
+  cover stepped stock, STEP round trips and saved projections from removed pieces.
 
 truck (Apache-2.0) behind our own `kernel` crate, with our own blend operation and boolean
 retry/validation; see `plan/adr/0001-geometry-kernel.md` (local) — summary in README.

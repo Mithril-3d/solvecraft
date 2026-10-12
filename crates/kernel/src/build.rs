@@ -179,7 +179,7 @@ pub fn extrude(plane: &Plane, regions: &[Region2], start: f64, end: f64) -> Resu
                             }
                             _ => None,
                         };
-                        Some(crate::FaceSource::ExtrudeSide { segment: **segment, plane: basis })
+                        Some(crate::FaceSource::ExtrudeSide { segment: **segment, plane: basis, coalesced: false })
                     } else {
                         None
                     };

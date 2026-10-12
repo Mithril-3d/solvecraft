@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and package SolveCraft for macOS:
+# Build and package SolidCraft for macOS:
 #
 #   $DIST/solvecraft-<version>-macos-<arch>.dmg        SolveCraft.app on a drag-to-Applications DMG
 #   $DIST/solvecraft-cli-<version>-macos-<arch>.zip    the headless CLI with the licence files
@@ -38,7 +38,7 @@ APP="$WORK/SolveCraft.app"
 DMG="$DIST/solvecraft-$VERSION-macos-$ARCH.dmg"
 CLI_ZIP="$DIST/solvecraft-cli-$VERSION-macos-$ARCH.zip"
 
-echo "==> SolveCraft $VERSION for macOS ($ARCH)"
+echo "==> SolidCraft $VERSION for macOS ($ARCH)"
 if [ "$SKIP_BUILD" = 0 ]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
@@ -84,7 +84,7 @@ ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG" "$WORK/raw.dmg"
 # makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
 # which is flaky on CI runners ("Resource busy").
-hdiutil makehybrid -hfs -hfs-volume-name "SolveCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
+hdiutil makehybrid -hfs -hfs-volume-name "SolidCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
 hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
 rm -f "$WORK/raw.dmg"
 

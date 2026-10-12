@@ -2132,7 +2132,7 @@ impl Document {
             | PlaneRef::AlongPath { .. }
             | PlaneRef::Perpendicular { .. } => {
                 let st = st.ok_or_else(|| DocError::Invalid("this plane is built from the model: evaluate first".into()))?;
-                crate::construct::resolve_geo_plane(&crate::construct::Ctx { doc: self, vals, st }, p)
+                crate::construct::resolve_geo_plane(&crate::construct::Ctx { doc: self, vals, st, depth }, p)
             }
         }
     }

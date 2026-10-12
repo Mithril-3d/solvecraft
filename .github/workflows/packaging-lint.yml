@@ -37,6 +37,10 @@ jobs:
         run: shellcheck packaging/*.sh packaging/*/*.sh packaging/linux/AppRun
       - name: Nightly release selection regression
         run: python3 packaging/tests/nightly_test.py
+      - name: Windows executable icon validation regression
+        run: python3 packaging/tests/windows_icon_test.py
+      - name: Flatpak desktop smoke validation regression
+        run: python3 packaging/tests/flatpak_test.py
       - name: PowerShell
         shell: pwsh
         run: |

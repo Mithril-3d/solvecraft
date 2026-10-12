@@ -62,6 +62,8 @@ pub struct ViewportState {
     pub orbit_pivot: Option<Vec3>,
     /// Continuous orbit: the view turns about the vertical until the next click or key.
     pub spin: bool,
+    /// After immediate zoom, ignore egui's outstanding smoothing until the gesture ends.
+    wheel_zoom_raw_until_idle: bool,
     /// A primary press on the axis gizmo: the pointer position used by its last orbit step.
     pub axis_drag: Option<Pos2>,
     /// Unsnapped camera while Shift-orbit previews a standard or diagonal view.
@@ -671,7 +673,7 @@ fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     pos.x.to_bits().hash(&mut h);
     pos.y.to_bits().hash(&mut h);
-    for v in [app.cam.yaw, app.cam.pitch, app.cam.distance, app.cam.target.x, app.cam.target.y, app.cam.target.z] {
+    for v in [app.cam.yaw, app.cam.pitch, app.cam.roll, app.cam.distance, app.cam.target.x, app.cam.target.y, app.cam.target.z] {
         v.to_bits().hash(&mut h);
     }
     app.session.revision.hash(&mut h);
@@ -1471,6 +1473,34 @@ pub fn delete_selection(app: &mut SolveApp) {
     crate::delete::delete_selection(app);
 }
 
+/// Match egui's wheel units and modifier routing, without its temporal smoothing.
+fn immediate_wheel_delta(input: &egui::InputState, options: egui::InputOptions, page_height: f32) -> f32 {
+    input
+        .events
+        .iter()
+        .filter_map(|event| {
+            let egui::Event::MouseWheel { unit, delta, modifiers, phase: egui::TouchPhase::Move } = event else { return None };
+            if modifiers.matches_any(options.zoom_modifier) {
+                return None;
+            }
+            let delta = match unit {
+                egui::MouseWheelUnit::Point => *delta,
+                egui::MouseWheelUnit::Line => *delta * options.line_scroll_speed,
+                egui::MouseWheelUnit::Page => *delta * page_height,
+            };
+            let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+            let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+            Some(if horizontal && !vertical {
+                0.0
+            } else if vertical && !horizontal {
+                delta.x + delta.y
+            } else {
+                delta.y
+            })
+        })
+        .sum()
+}
+
 pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     let rect = ui.max_rect();
@@ -1499,6 +1529,18 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::drag_snap::set_suppressed(mods.ctrl || mods.alt || mods.command);
 
     // ---- navigation ----
+    if !app.preferences.smooth_wheel_zoom {
+        app.viewport.wheel_zoom_raw_until_idle = true;
+    } else if !ui.input(|i| i.is_scrolling()) {
+        app.viewport.wheel_zoom_raw_until_idle = false;
+    }
+    let scroll = if app.viewport.wheel_zoom_raw_until_idle {
+        let options = ui.ctx().options(|o| o.input_options);
+        let page_height = ui.ctx().viewport_rect().height();
+        ui.input(|i| immediate_wheel_delta(i, options, page_height))
+    } else {
+        scroll
+    };
     let h = rect.height().max(1.0) as f64;
     if inside && scroll != 0.0 {
         app.viewport.orbit_snap = None;
@@ -1534,7 +1576,11 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     if mode == Some(NavMode::Orbit) {
         let press = ui.input(|i| i.pointer.press_origin());
         app.cancel_view_animation();
-        orbit_drag(app, rect, f64::from(delta.x), f64::from(delta.y), press, mods.shift, true);
+        // Shift can be required to enter orbit (Fusion/Inventor middle drag), rather
+        // than an additional request for snapping. Only an extra modifier snaps.
+        let without_shift = egui::Modifiers { shift: false, ..mods };
+        let snap = mods.shift && (!middle || crate::prefs::nav_mode(app, middle, secondary_down, without_shift) == Some(NavMode::Orbit));
+        orbit_drag(app, rect, f64::from(delta.x), f64::from(delta.y), press, snap, true);
     } else {
         if matches!(mode, Some(NavMode::Pan | NavMode::Zoom)) {
             app.viewport.orbit_snap = None;
@@ -2241,7 +2287,7 @@ fn cpu_render(app: &mut SolveApp, ctx: &egui::Context, painter: &egui::Painter, 
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sketch_scene_key(app, proj).hash(&mut h);
-    for v in [proj.cam.yaw, proj.cam.pitch, proj.cam.distance, proj.cam.target.x, proj.cam.target.y, proj.cam.target.z] {
+    for v in [proj.cam.yaw, proj.cam.pitch, proj.cam.roll, proj.cam.distance, proj.cam.target.x, proj.cam.target.y, proj.cam.target.z] {
         v.to_bits().hash(&mut h);
     }
     (rect.width() as u32, rect.height() as u32).hash(&mut h);
@@ -3110,71 +3156,143 @@ mod tests {
     }
 
     #[test]
+    fn immediate_wheel_zoom_applies_normalized_input_once() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.smooth_wheel_zoom = false;
+        h.app.preferences.zoom_to_cursor = false;
+        h.call("ui.move", json!({"x":800,"y":500}));
+        let before = h.app.cam;
+        let line = h.ctx.options(|o| o.input_options.line_scroll_speed);
+        for (unit, amount, points) in
+            [(egui::MouseWheelUnit::Point, 120.0, 120.0), (egui::MouseWheelUnit::Line, 1.0, line), (egui::MouseWheelUnit::Page, 0.1, 100.0)]
+        {
+            let height = h.app.cam.half_height();
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                unit,
+                delta: vec2(0.0, amount),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            h.frame();
+            let expected = height * (-f64::from(points) * 0.0015).exp();
+            assert!((h.app.cam.half_height() - expected).abs() < 1e-6);
+            let after = h.app.cam;
+            h.frames(30);
+            assert_eq!(h.app.cam, after, "idle frames must not replay wheel input");
+        }
+        assert_eq!(h.app.cam.target, before.target);
+        h.app.preferences.zoom_reverse = true;
+        let height = h.app.cam.half_height();
+        h.call("ui.scroll", json!({"x":800,"y":500,"delta":120}));
+        assert!((h.app.cam.half_height() - height * 0.18_f64.exp()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wheel_zoom_setting_changes_do_not_replay_smoothing() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.zoom_to_cursor = false;
+        h.call("ui.move", json!({"x":800,"y":500}));
+        h.app.synthetic.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 120.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.frame();
+        assert!(h.ctx.input(|i| i.is_scrolling()));
+        h.app.preferences.smooth_wheel_zoom = false;
+        let stopped = h.app.cam;
+        h.frame();
+        assert_eq!(h.app.cam, stopped);
+        h.app.preferences.smooth_wheel_zoom = true;
+        h.frames(90);
+        assert_eq!(h.app.cam, stopped, "re-enabling must not replay the old smoothing tail");
+        assert!(!h.app.viewport.wheel_zoom_raw_until_idle);
+        h.app.preferences.smooth_wheel_zoom = false;
+        for _ in 0..3 {
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            h.frame();
+        }
+        assert!((h.app.cam.half_height() - stopped.half_height() * (-0.54_f64).exp()).abs() < 1e-6);
+        let after = h.app.cam;
+        h.frames(90);
+        assert_eq!(h.app.cam, after);
+    }
+
+    #[test]
     fn shortcuts_window_wheel_does_not_zoom_the_viewport() {
-        let ctx = egui::Context::default();
-        let mut app = SolveApp::new(solvecraft_engine::Session::default(), crate::Services::default());
-        app.viewport.no_pixels = true;
-        crate::help::run(&mut app, &ctx, "shortcuts");
-        let mut time = 0.0;
-        let mut frame = |app: &mut SolveApp, pointer: Option<Pos2>, wheel: f32| {
-            time += 1.0 / 60.0;
-            let mut events = Vec::new();
-            if let Some(p) = pointer {
-                events.push(egui::Event::PointerMoved(p));
+        for smooth in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = SolveApp::new(solvecraft_engine::Session::default(), crate::Services::default());
+            app.preferences.smooth_wheel_zoom = smooth;
+            app.viewport.no_pixels = true;
+            crate::help::run(&mut app, &ctx, "shortcuts");
+            let mut time = 0.0;
+            let mut frame = |app: &mut SolveApp, pointer: Option<Pos2>, wheel: f32| {
+                time += 1.0 / 60.0;
+                let mut events = Vec::new();
+                if let Some(p) = pointer {
+                    events.push(egui::Event::PointerMoved(p));
+                }
+                if wheel != 0.0 {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, wheel),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    });
+                }
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 800.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| show(app, ui));
+                        crate::prefs::show(app, ui.ctx());
+                    },
+                );
+                output.textures_delta.clear();
+            };
+            // Let egui establish the floating window's size and hit-test widgets.
+            for _ in 0..4 {
+                frame(&mut app, None, 0.0);
             }
-            if wheel != 0.0 {
-                events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: vec2(0.0, wheel),
-                    modifiers: egui::Modifiers::NONE,
-                    phase: egui::TouchPhase::Move,
-                });
-            }
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 800.0))),
-                    time: Some(time),
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    egui::CentralPanel::default().show(ui, |ui| show(app, ui));
-                    crate::prefs::show(app, ui.ctx());
-                },
-            );
-            output.textures_delta.clear();
-        };
-        // Let egui establish the floating window's size and hit-test widgets.
-        for _ in 0..4 {
-            frame(&mut app, None, 0.0);
-        }
-        let window = ctx.memory(|m| m.area_rect(egui::Id::new("sc_prefs"))).unwrap();
-        let list = window.center() + vec2(140.0, 0.0);
-        let height = app.cam.half_height();
-        let target = app.cam.target;
-        frame(&mut app, Some(list), 0.0);
-        for n in 0..12 {
-            frame(&mut app, Some(list), if n == 0 { -120.0 } else { 0.0 });
-            assert_eq!(app.cam.half_height(), height, "wheel input over shortcuts must stay in the popup");
-            assert_eq!(app.cam.target, target);
-        }
-        // The window's non-scrolling sidebar must also shield the model.
-        frame(&mut app, Some(window.left_center() + vec2(30.0, 0.0)), -120.0);
-        assert_eq!(app.cam.half_height(), height);
-        // An exposed part of the viewport still accepts wheel navigation with the popup open.
-        let exposed = pos2(40.0, 700.0);
-        assert!(!window.contains(exposed));
-        frame(&mut app, Some(exposed), 0.0);
-        frame(&mut app, Some(exposed), -120.0);
-        assert_ne!(app.cam.half_height(), height);
-        // Closing the popup returns its former area to the viewport.
-        app.prefs_window.open = false;
-        for _ in 0..12 {
+            let window = ctx.memory(|m| m.area_rect(egui::Id::new("sc_prefs"))).unwrap();
+            let list = window.center() + vec2(140.0, 0.0);
+            let height = app.cam.half_height();
+            let target = app.cam.target;
             frame(&mut app, Some(list), 0.0);
+            for n in 0..12 {
+                frame(&mut app, Some(list), if n == 0 { -120.0 } else { 0.0 });
+                assert_eq!(app.cam.half_height(), height, "wheel input over shortcuts must stay in the popup");
+                assert_eq!(app.cam.target, target);
+            }
+            // The window's non-scrolling sidebar must also shield the model.
+            frame(&mut app, Some(window.left_center() + vec2(30.0, 0.0)), -120.0);
+            assert_eq!(app.cam.half_height(), height);
+            // An exposed part of the viewport still accepts wheel navigation with the popup open.
+            let exposed = pos2(40.0, 700.0);
+            assert!(!window.contains(exposed));
+            frame(&mut app, Some(exposed), 0.0);
+            frame(&mut app, Some(exposed), -120.0);
+            assert_ne!(app.cam.half_height(), height);
+            // Closing the popup returns its former area to the viewport.
+            app.prefs_window.open = false;
+            for _ in 0..12 {
+                frame(&mut app, Some(list), 0.0);
+            }
+            let height = app.cam.half_height();
+            frame(&mut app, Some(list), -120.0);
+            assert_ne!(app.cam.half_height(), height);
         }
-        let height = app.cam.half_height();
-        frame(&mut app, Some(list), -120.0);
-        assert_ne!(app.cam.half_height(), height);
     }
 
     #[test]
@@ -3408,12 +3526,34 @@ mod tests {
         h.call("ui.view", json!({"view":"front"}));
         let before = h.app.cam;
         h.call("ui.drag", json!({"x0":800,"y0":500,"x1":1020,"y1":500,"button":"middle","shift":true,"steps":40}));
-        assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "before={before:?}, after={:?}", h.app.cam);
+        assert!((h.app.cam.yaw - 1.76).abs() < 1e-6, "before={before:?}, after={:?}", h.app.cam);
+        assert!(h.app.viewport.orbit_snap.is_none());
         h.call("ui.view", json!({"view":"front"}));
         h.call("ui.drag", json!({"x0":800,"y0":500,"x1":850,"y1":520,"button":"middle"}));
         assert_eq!(h.app.cam.yaw, before.yaw);
         assert_eq!(h.app.cam.pitch, before.pitch);
         assert_ne!(h.app.cam.target, before.target);
+    }
+
+    #[test]
+    fn preset_shift_middle_orbit_is_free_but_shift_right_orbit_snaps() {
+        for preset in ["fusion", "inventor"] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.preferences.nav = preset.into();
+            h.call("ui.view", json!({"view":"front"}));
+            let before = h.app.cam;
+            h.call("ui.drag", json!({"x0":800,"y0":500,"x1":850,"y1":520,"button":"middle","shift":true,"steps":20}));
+            let mut expected = before;
+            expected.orbit(50.0, 20.0);
+            assert!((h.app.cam.yaw - expected.yaw).abs() < 1e-6, "{preset}: {:?}", h.app.cam);
+            assert!((h.app.cam.pitch - expected.pitch).abs() < 1e-6, "{preset}: {:?}", h.app.cam);
+            assert_eq!(h.app.cam.target, before.target);
+            assert_eq!(h.app.cam.distance, before.distance);
+            assert!(h.app.viewport.orbit_snap.is_none());
+            h.call("ui.view", json!({"view":"front"}));
+            h.call("ui.drag", json!({"x0":800,"y0":500,"x1":1020,"y1":500,"button":"right","shift":true,"steps":40}));
+            assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "{preset}: {:?}", h.app.cam);
+        }
     }
 
     #[test]

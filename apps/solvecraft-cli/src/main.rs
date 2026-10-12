@@ -25,6 +25,9 @@ mod seams;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
+#[path = "../../app_icon.rs"]
+mod app_icon;
+
 use solvecraft_engine::Session;
 use solvecraft_engine::render::{StandardView, render_png};
 
@@ -53,8 +56,17 @@ fn main() -> ExitCode {
         Some("snapshot") => cmd_snapshot(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
         Some("commands") => {
+            use std::io::Write as _;
             let mut s = Session::default();
-            s.execute("engine.commands", &json!({})).map(|v| println!("{}", pretty(&v))).map_err(|e| e.to_string())
+            s.execute("engine.commands", &json!({})).map_err(|e| e.to_string()).and_then(|v| {
+                // A pipeline consumer may stop early (e.g. `commands | head`).
+                // Unlike println!, writing explicitly lets us handle that without a panic.
+                match writeln!(std::io::stdout().lock(), "{}", pretty(&v)) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(e) => Err(format!("stdout: {e}")),
+                }
+            })
         }
         Some("recipe") => args.get(1).ok_or_else(|| USAGE.to_string()).and_then(|p| {
             let v = read_json(p)?;
@@ -97,7 +109,9 @@ fn pretty(v: &Value) -> String {
 }
 
 pub fn read_json(path: &str) -> Result<Value, String> {
-    let s = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    // Through the engine's file access, which refuses anything that is not a regular file and
+    // reads no more than the cap: a character device or a FIFO would otherwise never end.
+    let s = solvecraft_engine::io::vfs::read_to_string(path, solvecraft_engine::io::MAX_DESIGN_BYTES).map_err(|e| format!("{path}: {e}"))?;
     serde_json::from_str(&s).map_err(|e| format!("{path}: {e}"))
 }
 
@@ -152,28 +166,31 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         Some(b) => load(b)?,
         None => Session::default(),
     };
-    if args.iter().any(|a| a == "--results") {
-        // Print every command's result (scripts only).
+    let results = if args.iter().any(|a| a == "--results") {
+        // Collect every command's result (scripts only), then process requested files too.
         let v = read_json(path.ok_or("--results needs a script")?)?;
         let r = s.run_script(&v).map_err(|e| e.to_string())?;
-        println!("{}", pretty(&Value::Array(r)));
-        return Ok(());
-    }
-    match (base, path) {
-        (Some(_), Some(p)) => {
-            let v = read_json(p)?;
-            s.run_script(&v).map_err(|e| e.to_string())?;
+        Some(Value::Array(r))
+    } else {
+        match (base, path) {
+            (Some(_), Some(p)) => {
+                let v = read_json(p)?;
+                s.run_script(&v).map_err(|e| e.to_string())?;
+            }
+            (None, Some(p)) => s = load(p)?,
+            _ => {}
         }
-        (None, Some(p)) => s = load(p)?,
-        _ => {}
-    }
+        None
+    };
     for out in flags(args, "--out") {
         s.execute("file.export", &json!({"path": out})).map_err(|e| e.to_string())?;
     }
     if let Some(p) = flag(args, "--save") {
         s.execute("file.save_as", &json!({"path": p})).map_err(|e| e.to_string())?;
     }
-    if !args.iter().any(|a| a == "--quiet") {
+    if let Some(results) = results {
+        println!("{}", pretty(&results));
+    } else if !args.iter().any(|a| a == "--quiet") {
         let m = s.execute("inspect.measure", &json!({})).map_err(|e| e.to_string())?;
         println!("{}", pretty(&m));
     }
@@ -214,7 +231,7 @@ fn cmd_snapshot(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The app icon: a blue block with a bore, drawn by the CPU renderer on a transparent background
+/// The app icon: the SolidCraft logo, drawn in code on a transparent background
 /// (so packages need no committed image). `.ico` holds the Windows sizes as PNGs.
 fn cmd_icon(args: &[String]) -> Result<(), String> {
     let out = flag(args, "--out").ok_or("icon needs --out FILE.png or FILE.ico")?;
@@ -232,29 +249,7 @@ fn cmd_icon(args: &[String]) -> Result<(), String> {
 }
 
 fn icon_png(size: usize) -> Result<Vec<u8>, String> {
-    use solvecraft_engine::render::{Rgb, Scene, SceneLine, SceneMesh, png, render_transparent};
-    let mut s = Session::default();
-    for (cmd, p) in [
-        ("solid.box", json!({"length": 20, "width": 20, "height": 20, "center": [0, 0, 0]})),
-        ("solid.cylinder", json!({"diameter": 9, "height": 30, "base": [0, 0, -15], "operation": "cut"})),
-    ] {
-        s.execute(cmd, &p).map_err(|e| format!("icon: {e}"))?;
-    }
-    let mut cam = solvecraft_engine::view::home_camera(&s);
-    cam.distance *= 0.95;
-    let mut scene = Scene { radius: 60.0, ..Default::default() };
-    let px = size as f64 / 256.0;
-    for body in &s.world_state().bodies {
-        let mesh = body.mesh();
-        scene.meshes.push(SceneMesh { mesh: std::sync::Arc::clone(&mesh), color: Rgb(90, 160, 240), face_colors: Vec::new() });
-        for (i, e) in mesh.edges.iter().enumerate() {
-            if mesh.shaded_edge_visible(i) {
-                scene.lines.push(SceneLine { points: e.clone(), color: Rgb(24, 52, 96), width: (3.0 * px).max(0.8), on_top: false });
-            }
-        }
-    }
-    let c = render_transparent(&mut scene, &cam, size, size);
-    png(c.w, c.h, c.rgba).ok_or_else(|| "icon: PNG encoding failed".to_string())
+    solvecraft_engine::render::png(size, size, app_icon::rgba(size)?).ok_or_else(|| "icon: PNG encoding failed".to_string())
 }
 
 /// A Windows icon file holding PNG images (Vista and later read these).
@@ -359,13 +354,9 @@ fn cmd_bench_edit(args: &[String]) -> Result<(), String> {
 fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("usage: solvecraft-cli bench-open <design.solvecraft | part.step> [--parse-only]")?;
     let t = std::time::Instant::now();
-    let len = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
     let step = solvecraft_engine::io::is_step_path(path);
     let limit = if step { solvecraft_engine::io::MAX_STEP_BYTES } else { solvecraft_engine::io::MAX_DESIGN_BYTES };
-    if len > limit as u64 {
-        return Err(format!("{path}: file too large"));
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let bytes = solvecraft_engine::io::vfs::read(path, limit).map_err(|e| format!("{path}: {e}"))?;
     let read_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("{}", json!({"step": "read", "ms": read_ms, "bytes": bytes.len()}));
     let t = std::time::Instant::now();

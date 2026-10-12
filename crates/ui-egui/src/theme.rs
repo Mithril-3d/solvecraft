@@ -263,9 +263,9 @@ pub fn set_dark(dark: bool) {
     DARK.store(dark, Ordering::Relaxed);
 }
 
-pub fn apply(ctx: &egui::Context) {
-    let t = Tokens::get();
-    let mut v = if is_dark() { egui::Visuals::dark() } else { egui::Visuals::light() };
+fn visuals(dark: bool) -> egui::Visuals {
+    let t = if dark { Tokens::dark() } else { Tokens::light() };
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = t.panel;
     v.window_fill = t.panel;
     v.window_stroke = Stroke::new(1.0, t.border);
@@ -282,11 +282,62 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
     v.widgets.hovered.weak_bg_fill = t.hover;
     v.widgets.hovered.bg_fill = t.hover;
+    // egui uses the open-state fill for a movable window's active title bar.
+    v.widgets.open.weak_bg_fill = t.panel_header;
     v.window_corner_radius = egui::CornerRadius::same(6);
-    ctx.set_theme(if is_dark() { egui::Theme::Dark } else { egui::Theme::Light });
-    ctx.set_visuals(v);
+    v
+}
+
+pub fn apply(ctx: &egui::Context) {
+    let dark = is_dark();
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+    ctx.set_visuals(visuals(dark));
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.spacing.button_padding = egui::vec2(6.0, 3.0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn active_movable_window_header_uses_theme_panel_header() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+            ctx.set_visuals(super::visuals(dark));
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                    ..Default::default()
+                };
+                output = ctx.run_ui(raw, |ui| {
+                    crate::frame::window(ui.ctx(), "Parameters", crate::frame::Width::Normal).fade_in(false).show(ui.ctx(), |ui| {
+                        ui.label("Parameter values");
+                    });
+                });
+                output.textures_delta.clear();
+            }
+            let title = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Parameters" => Some(text.pos + text.galley.rect.center().to_vec2()),
+                    _ => None,
+                })
+                .expect("window title must be drawn");
+            let header = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill.a() > 0 && rect.rect.contains(title) => Some(rect),
+                    _ => None,
+                })
+                .min_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
+                .expect("window header must be drawn behind its title");
+            let expected = if dark { super::Tokens::dark() } else { super::Tokens::light() };
+            assert_eq!(header.fill, expected.panel_header, "active title bar should follow the {dark} palette");
+        }
+    }
 }

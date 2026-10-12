@@ -535,7 +535,7 @@ fn approx(got: f64, want: &Value, what: &str) -> Result<(), String> {
 /// Checks: `bodies` (count), `volume` / `area` (total, number or [value, rel tol]), `faces`,
 /// `features` (count), `errors` (timeline features in error, default 0), `dialog` (null: none
 /// open, or a word its kind must contain), `tool` (null or command id), `sketching` (bool),
-/// `selection` (count), `glyphs` ({constraint id: count}, none overlapping), `param` ({name: value}), `sketch_status` (solved|…), `dof`, `query`
+/// `selection` (count), `glyphs` ({constraint id: count}, none overlapping one another or a dimension value), `param` ({name: value}), `sketch_status` (solved|…), `dof`, `query`
 /// ({command, params?, path, value}: a command's result).
 pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
     let doc = h.call("document.inspect", json!({"measure": true}))["result"].clone();
@@ -694,6 +694,10 @@ pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
                 for (i, (a, p)) in g.iter().enumerate() {
                     if let Some((b, _)) = g.iter().skip(i + 1).find(|(_, q)| q.distance(*p) < 14.0) {
                         return Err(format!("glyphs of {a} and {b} overlap at {p:?}"));
+                    }
+                    let r = egui::Rect::from_center_size(*p, egui::vec2(14.0, 14.0));
+                    if let Some((d, _)) = crate::dim_view::text_rects().into_iter().find(|(_, t)| t.intersects(r)) {
+                        return Err(format!("glyph of {a} at {p:?} overlaps the value of dimension {d}"));
                     }
                 }
             }

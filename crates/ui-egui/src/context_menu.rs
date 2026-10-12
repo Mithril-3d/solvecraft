@@ -1,9 +1,10 @@
 //! Context menus, one look everywhere.
 //!
-//! The viewport's right-click opens a radial marking menu (eight commands around the cursor,
-//! Repeat at the top) with a list underneath of what fits the selection or the thing under the
-//! cursor: faces, edges, bodies, sketch entities or empty space. Holding the right button opens
-//! it too; releasing over a direction picks that command (a flick). The browser's right-click
+//! The viewport's right-click opens a list of commands for the selection or the thing under the
+//! cursor: faces, edges, bodies, sketch entities or empty space. The optional radial marking
+//! menu adds eight commands around the cursor, with Repeat at the top. With that preference on,
+//! holding the right button opens it too; releasing over a direction picks a command (a flick).
+//! The browser's right-click
 //! opens the same list styling for a body, sketch or component.
 //!
 //! Items are commands (by id, with parameters filled from the target) or `ui.*` actions on view
@@ -1172,7 +1173,7 @@ pub fn open(app: &mut SolveApp, at: Pos2) {
 /// Open a menu for a target (the radial ring only for the viewport).
 pub fn open_for(app: &mut SolveApp, at: Pos2, target: Target) {
     app.menu.key_row = None;
-    app.menu.radial = target == Target::Viewport;
+    app.menu.radial = target == Target::Viewport && app.preferences.radial_context_menu;
     app.menu.target = target;
     app.menu.flick = false;
     app.viewport.context_menu = Some(at);
@@ -1301,6 +1302,12 @@ fn slot_rect(c: Pos2, k: usize, size: Vec2) -> Rect {
 /// Press-and-hold of the right button in the viewport opens the menu; releasing over a
 /// direction picks it.
 fn track_hold(app: &mut SolveApp, ctx: &egui::Context) {
+    if !app.preferences.radial_context_menu {
+        app.menu.press = None;
+        app.menu.flick = false;
+        app.menu.radial = false;
+        return;
+    }
     let (pressed, down, released, pos, time) = ctx.input(|i| {
         (
             i.pointer.button_pressed(egui::PointerButton::Secondary),
@@ -1647,6 +1654,53 @@ fn show_props(app: &mut SolveApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_right_click_keeps_list_menu_and_radial_is_opt_in() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.settle();
+        let point = h.at(&json!({"world":[0,0,0]})).unwrap();
+        h.step(&json!({"click":point,"button":"right"})).unwrap();
+        assert!(h.app.viewport.context_menu.is_some(), "ordinary right click must still open a menu");
+        let list = describe(&h.app);
+        assert!(list["radial"].as_array().unwrap().is_empty());
+        assert!(list["items"].as_array().unwrap().iter().any(|item| item["id"] == "ui.origin" && item["enabled"] == true));
+        h.step(&json!({"click":{"handle":"menu:ui.origin"}})).unwrap();
+        assert!(!h.app.ui.show_origin && h.app.viewport.context_menu.is_none(), "the ordinary menu must execute Hide Origin and close");
+        h.call("ui.prefs", json!({"radial_context_menu":true}));
+        h.step(&json!({"click":point,"button":"right"})).unwrap();
+        assert_eq!(describe(&h.app)["radial"].as_array().unwrap().len(), DIRS);
+        open_for(&mut h.app, pos2(point[0] as f32, point[1] as f32), Target::Origin);
+        assert!(!h.app.menu.radial, "browser menus remain lists when radial menus are enabled");
+    }
+
+    #[test]
+    fn disabled_radial_menu_does_not_capture_right_button_hold() {
+        let mut app = SolveApp::new(solvecraft_engine::Session::default(), Default::default());
+        let ctx = egui::Context::default();
+        let point = pos2(600.0, 400.0);
+        app.viewport.mouse = Some(point);
+        for (time, events) in [
+            (
+                0.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            (1.0, vec![]),
+        ] {
+            let mut output = ctx.run_ui(egui::RawInput { time: Some(time), events, ..Default::default() }, |_| track_hold(&mut app, &ctx));
+            output.textures_delta.clear();
+        }
+        assert!(app.viewport.context_menu.is_none() && app.menu.press.is_none() && !app.menu.flick);
+    }
 
     #[test]
     fn sectors_go_clockwise_from_the_top() {

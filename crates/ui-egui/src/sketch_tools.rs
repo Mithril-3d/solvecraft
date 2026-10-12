@@ -1000,7 +1000,13 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
     let tk = crate::theme::Tokens::get();
     let picked = PICKED.with(|p| p.borrow().clone());
     // Where each glyph goes: beside its entity (to its left, away from the line), every entity
-    // of a two-entity constraint getting one; glyphs that would overlap step along.
+    // of a two-entity constraint getting one; glyphs that would overlap step along. A glyph
+    // that would sit on a dimension's value goes to the other side of its line.
+    let dim_texts: Vec<egui::Rect> = crate::dim_view::text_rects().into_iter().map(|(_, r)| r.expand(2.0)).collect();
+    let on_dim = |p: Pos2| {
+        let r = egui::Rect::from_center_size(p, egui::vec2(GLYPH, GLYPH));
+        dim_texts.iter().any(|d| d.intersects(r))
+    };
     let mut placed: Vec<(String, Pos2, Pos2)> = Vec::new();
     for c in &ss.sketch.constraints {
         if c.kind.is_dimension() {
@@ -1017,13 +1023,22 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
                 None => egui::vec2(0.7, -0.7),
             };
             let step = if dir.is_some() { egui::vec2(side.y, -side.x) } else { egui::vec2(1.0, 0.0) };
-            let mut sp = base + side * (GLYPH * 0.9);
-            for _ in 0..12 {
-                if !placed.iter().any(|(_, q, _)| q.distance(sp) < GLYPH + 1.0) {
-                    break;
+            let free = |sp: Pos2| !placed.iter().any(|(_, q, _)| q.distance(sp) < GLYPH + 1.0);
+            let start = |s: egui::Vec2| base + s * (GLYPH * 0.9);
+            let side = if on_dim(start(side)) && !on_dim(start(-side)) { -side } else { side };
+            // Step along until clear of other glyphs, preferring a spot clear of dimension
+            // values too.
+            let settle = |avoid_dims: bool| {
+                let mut sp = start(side);
+                for _ in 0..12 {
+                    if free(sp) && !(avoid_dims && on_dim(sp)) {
+                        return Some(sp);
+                    }
+                    sp += step * (GLYPH + 2.0);
                 }
-                sp += step * (GLYPH + 2.0);
-            }
+                None
+            };
+            let sp = settle(true).or_else(|| settle(false)).unwrap_or_else(|| start(side) + step * (12.0 * (GLYPH + 2.0)));
             placed.push((c.id.clone(), sp, base));
         }
     }

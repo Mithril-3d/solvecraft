@@ -97,11 +97,19 @@ impl DimensionDraft {
 
 pub fn cancel() {
     EDIT.with(|edit| *edit.borrow_mut() = None);
+    PLACEMENT.with(|preview| *preview.borrow_mut() = None);
 }
 
 /// Infer the measured value through the same command as scripts, without creating a real
 /// parameter or an undo entry. Only accepting the editor executes the command on the design.
 pub fn begin_dimension(app: &SolveApp, entities: Vec<String>, at: Vec2) -> Result<(), String> {
+    let (param, expr, draft) = dimension_draft(app, entities, at)?;
+    EDIT.with(|edit| *edit.borrow_mut() = Some(Edit { param, expr, at: None, fresh: FRESH, wait: 10, draft: Some(draft) }));
+    PLACEMENT.with(|preview| *preview.borrow_mut() = None);
+    Ok(())
+}
+
+fn dimension_draft(app: &SolveApp, entities: Vec<String>, at: Vec2) -> Result<(String, String, DimensionDraft), String> {
     let sketch = app.session.active_sketch.ok_or("Edit a sketch to add a dimension")?;
     if entities.is_empty() || entities.len() > 2 || !at.x.is_finite() || !at.y.is_finite() {
         return Err("Pick one edge or two endpoints, then place the dimension".into());
@@ -126,8 +134,51 @@ pub fn begin_dimension(app: &SolveApp, entities: Vec<String>, at: Vec2) -> Resul
     if !draft.preview.sketch(sketch).is_some_and(|solved| solved.report.ok()) {
         return Err("That dimension conflicts with the sketch constraints".into());
     }
-    EDIT.with(|edit| *edit.borrow_mut() = Some(Edit { param, expr, at: None, fresh: FRESH, wait: 10, draft: Some(draft) }));
-    Ok(())
+    Ok((param, expr, draft))
+}
+
+/// Cache inference at a stationary pointer, including incomplete/unsupported picks.
+#[derive(Clone)]
+struct Placement {
+    baseline: Arc<solvecraft_engine::doc::Document>,
+    sketch: Option<u64>,
+    component: u64,
+    path: Option<Vec<u64>>,
+    pending: std::collections::BTreeMap<u64, solvecraft_engine::doc::Mat>,
+    entities: Vec<String>,
+    at: Vec2,
+    draft: Option<(String, DimensionDraft)>,
+}
+
+fn placement_preview(app: &SolveApp) -> Option<(String, DimensionDraft)> {
+    let tool = app.tool.as_ref().filter(|t| t.kind == crate::tools::Kind::Dimension && !t.picks.is_empty())?;
+    let at = tool.hover.as_ref()?.0;
+    PLACEMENT.with(|preview| {
+        let mut preview = preview.borrow_mut();
+        let current = preview.as_ref().is_some_and(|p| {
+            Arc::ptr_eq(&p.baseline, &app.session.doc)
+                && p.sketch == app.session.active_sketch
+                && p.component == app.session.active_component
+                && p.path == app.session.active_occurrence_path
+                && p.pending == app.session.pending_moves
+                && p.entities == tool.picks
+                && p.at == at
+        });
+        if !current {
+            let draft = dimension_draft(app, tool.picks.clone(), at).ok().map(|(param, _, draft)| (param, draft));
+            *preview = Some(Placement {
+                baseline: app.session.doc.clone(),
+                sketch: app.session.active_sketch,
+                component: app.session.active_component,
+                path: app.session.active_occurrence_path.clone(),
+                pending: app.session.pending_moves.clone(),
+                entities: tool.picks.clone(),
+                at,
+                draft,
+            });
+        }
+        preview.as_ref().and_then(|p| p.draft.clone())
+    })
 }
 
 thread_local! {
@@ -135,6 +186,7 @@ thread_local! {
     /// A text being dragged: dimension id, undo depth at the start, grab offset (sketch).
     static DRAG: RefCell<Option<(String, usize, Vec2)>> = const { RefCell::new(None) };
     static EDIT: RefCell<Option<Edit>> = const { RefCell::new(None) };
+    static PLACEMENT: RefCell<Option<Placement>> = const { RefCell::new(None) };
 }
 
 /// Frames the inline editor holds on to the keyboard after opening.
@@ -258,7 +310,7 @@ pub fn label(k: &ConstraintKind, expr: Option<&str>, driven: bool) -> String {
 /// Draw the active sketch's dimensions and remember where they are for picking.
 pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &Proj) {
     let mut drawn = Vec::new();
-    let draft = EDIT.with(|edit| {
+    let editor_draft = EDIT.with(|edit| {
         let mut edit = edit.borrow_mut();
         if edit.as_ref().and_then(|e| e.draft.as_ref()).is_some_and(|d| !d.valid(app)) {
             *edit = None;
@@ -282,6 +334,8 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
             None
         }
     });
+    let placing = !editing();
+    let draft = editor_draft.or_else(|| placing.then(|| placement_preview(app)).flatten());
     let st = app.session.world_state();
     let Some(ss) = app.session.active_sketch.and_then(|s| st.sketch(s)) else {
         DRAWN.with(|d| d.borrow_mut().clear());
@@ -372,13 +426,13 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
                 .collect();
             painter.add(Shape::line(pts, stroke));
         }
-        if is_draft {
+        if is_draft && !placing {
             EDIT.with(|edit| {
                 if let Some(e) = edit.borrow_mut().as_mut() {
                     e.at = Some(tc);
                 }
             });
-        } else {
+        } else if !is_draft {
             drawn.push(Drawn { id: c.id.clone(), param: c.param.clone(), text: r, segs, at: lay.text });
         }
     }
@@ -501,6 +555,71 @@ pub fn drawn() -> Vec<(String, Pos2)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_previews_radial_and_angular_dimensions_and_invalidates_on_document_change() {
+        cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center":[30,30],"radius":5})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[10,10],[20,10]],"infer":false,"connect":false})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[10,10],[10,20]],"infer":false,"connect":false})).unwrap();
+        h.call("ui.view", json!({"view":"top"}));
+        for (picks, at, angular) in [(vec![[35, 30]], [40, 40], false), (vec![[15, 10], [10, 15]], [18, 18], true)] {
+            h.step(&json!({"start":"sketch.dimension"})).unwrap();
+            for pick in picks {
+                h.step(&json!({"click":{"sketch":pick}})).unwrap();
+            }
+            h.step(&json!({"move":{"sketch":at}})).unwrap();
+            let (param, draft) = placement_preview(&h.app).unwrap();
+            let constraint =
+                draft.preview.sketch(draft.sketch).unwrap().sketch.constraints.iter().find(|c| c.param.as_deref() == Some(&param)).unwrap();
+            assert_eq!(constraint.kind.is_angle(), angular);
+            assert!(!editing());
+            let (_, cached) = placement_preview(&h.app).unwrap();
+            assert!(Arc::ptr_eq(&draft.preview_doc, &cached.preview_doc), "stationary pointer reuses inference");
+            h.app.run("sketch.point", json!({"point":[50,50]})).unwrap();
+            let (_, refreshed) = placement_preview(&h.app).unwrap();
+            assert!(!Arc::ptr_eq(&draft.preview_doc, &refreshed.preview_doc));
+            h.step(&json!({"key":"Escape"})).unwrap();
+        }
+        cancel();
+    }
+
+    #[test]
+    fn placement_follows_real_pointer_without_editing_or_mutating_design() {
+        cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[10,10],[30,10]],"infer":false})).unwrap();
+        h.call("ui.view", json!({"view":"top"}));
+        let baseline = h.app.session.doc.to_json();
+        let undo = h.app.session.undo.len();
+        h.step(&json!({"start":"sketch.dimension"})).unwrap();
+        h.step(&json!({"click":{"sketch":[20,10]}})).unwrap();
+        for at in [[20., 20.], [20., -5.]] {
+            h.step(&json!({"move":{"sketch":at}})).unwrap();
+            h.settle();
+            let (param, draft) = placement_preview(&h.app).expect("a line has a dimension preview");
+            assert!((draft.at - Vec2::new(at[0], at[1])).len() < 1e-5);
+            let sk = &draft.preview.sketch(draft.sketch).unwrap().sketch;
+            let c = sk.constraints.iter().find(|c| c.param.as_deref() == Some(&param)).unwrap();
+            assert!(matches!(c.kind, ConstraintKind::Length {value,..} if (value-20.).abs()<1e-6));
+            assert!(!editing());
+            assert!(drawn().is_empty(), "preview must not become a selectable committed dimension");
+            assert_eq!(h.app.session.doc.to_json(), baseline);
+            assert_eq!(h.app.session.undo.len(), undo);
+        }
+        h.step(&json!({"click":{"sketch":[20,-5]}})).unwrap();
+        assert!(editing());
+        assert_eq!(h.app.session.doc.to_json(), baseline);
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert!(placement_preview(&h.app).is_none());
+        assert_eq!(h.app.session.doc.to_json(), baseline);
+        assert_eq!(h.app.session.undo.len(), undo);
+        cancel();
+    }
 
     #[test]
     fn labels_show_the_value_or_fx() {

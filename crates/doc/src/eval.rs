@@ -2910,6 +2910,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 }
                 o => return Err(DocError::Invalid(format!("unknown shell direction `{o}` (inside, outside or both)"))),
             };
+            let nb = nb.with_shell_certificate(f.id)?;
             if let Some(slot) = st.bodies.get_mut(i) {
                 *slot = ModelBody::new(mb.name, nb, mb.feature);
             }
@@ -2932,7 +2933,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             Ok(())
         }
         FeatureKind::ConstructionAxis { def } => {
-            let (origin, dir) = crate::construct::resolve_axis(&crate::construct::Ctx { doc, vals, st }, def)?;
+            let (origin, dir) = crate::construct::resolve_axis(&crate::construct::Ctx { doc, vals, st, depth: 0 }, def)?;
             st.construct.push(crate::construct::Construct {
                 feature: f.id,
                 name: f.name.clone(),
@@ -2941,7 +2942,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             Ok(())
         }
         FeatureKind::ConstructionPoint { def } => {
-            let p = crate::construct::resolve_point(&crate::construct::Ctx { doc, vals, st }, def)?;
+            let p = crate::construct::resolve_point(&crate::construct::Ctx { doc, vals, st, depth: 0 }, def)?;
             st.construct.push(crate::construct::Construct { feature: f.id, name: f.name.clone(), geom: crate::construct::ConstructGeom::Point(p) });
             Ok(())
         }
@@ -3159,6 +3160,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
                 FeatureKind::Chamfer { distance2, angle, flip, .. } => chamfer_with(vals, &mb.body, &edges, r, distance2, angle, *flip)?,
                 _ => return Err(DocError::Invalid("blend".into())),
             };
+            let nb = nb.with_preserved_planar_sources(&mb.body)?;
             let (name, feat) = (mb.name.clone(), mb.feature);
             if let Some(slot) = st.bodies.get_mut(ti) {
                 *slot = ModelBody::new(name, nb, feat);
@@ -3434,9 +3436,18 @@ pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
             let name = doc.world_body_name(st, &b.name, comp, &path);
             // A body moved in from another component keeps its place (its offset).
             let bm = doc.model_body_offset(b).map(|o| crate::mat_mul(&m, o)).unwrap_or(m);
-            let body =
-                if crate::is_identity(&bm) { b.body.clone() } else { kernel::transform_matrix(&b.body, bm).unwrap_or_else(|_| b.body.clone()) };
-            let mut placed = ModelBody::new(name, body, b.feature);
+            // Identical geometry also shares its display mesh cell with the definition.
+            // A changed placement keeps a distinct mesh, at that placement's coordinates.
+            let mut placed = if crate::is_identity(&bm) {
+                let mut placed = b.clone();
+                placed.name = name;
+                placed
+            } else {
+                let body = kernel::transform_matrix(&b.body, bm).unwrap_or_else(|_| b.body.clone());
+                ModelBody::new(name, body, b.feature)
+            };
+            // World states keep their previous display-only evaluation-key semantics.
+            placed.key = 0;
             placed.source_name = Some(b.definition_name().to_string());
             placed.source_transform = crate::mat_mul(&bm, &b.source_transform);
             placed.component = comp;
@@ -3477,6 +3488,87 @@ pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod world_placement_cache_tests {
+    use super::*;
+
+    #[test]
+    fn placed_real_feature_retains_names_from_its_original_feature_context() {
+        let mut doc = Document::new("authored names");
+        let component = doc.add_component(Some("Part"), 0).unwrap();
+        let feature = doc
+            .add_feature(
+                FeatureKind::Box {
+                    corner: crate::point_expr(Vec3::ZERO),
+                    length: "2 mm".into(),
+                    width: "3 mm".into(),
+                    height: "4 mm".into(),
+                    operation: crate::Operation::NewBody,
+                },
+                Some("AuthoredBox"),
+            )
+            .unwrap();
+        doc.feature_mut(feature).unwrap().component = component;
+        let matrix = crate::rigid(Vec3::new(15., -2., 8.), Vec3::ZERO, Vec3::X, 0.7);
+        doc.occurrences.iter_mut().find(|o| o.component == component).unwrap().transform = matrix;
+        let mut model = Model::default();
+        model.evaluate(&doc);
+        let state = model.state();
+        let source = &state.bodies[0];
+        assert!(source.names.origin.is_some());
+        assert!(source.mesh.get().is_none());
+        let world = world_state(&doc, &state);
+        assert!(source.mesh.get().is_some(), "source naming is prepared before adoption, as before");
+        let names = crate::naming::face_names(&world.bodies[0]);
+        assert!(Arc::ptr_eq(&names, &crate::naming::face_names(source)));
+        assert!(names.iter().all(|name| name.starts_with(&format!("F{feature}:"))));
+        let local = source.mesh();
+        let placed = world.bodies[0].mesh();
+        assert_eq!(local.tri_face, placed.tri_face);
+        let mapped: Vec<_> = local.positions.iter().map(|p| crate::apply_point(&matrix, *p)).collect();
+        assert!(mapped.iter().all(|p| placed.positions.iter().any(|q| p.dist(*q) < 1e-8)));
+        assert!(placed.positions.iter().all(|p| mapped.iter().any(|q| p.dist(*q) < 1e-8)));
+    }
+
+    #[test]
+    fn identity_shares_mesh_but_rotated_instances_keep_distinct_physical_coordinates_and_source_names() {
+        let mut doc = Document::new("placements");
+        let component = doc.add_component(Some("Part"), 0).unwrap();
+        doc.body_components.insert("Block".into(), component);
+        let matrix = crate::rigid(Vec3::new(10., 20., 0.), Vec3::ZERO, Vec3::Z, std::f64::consts::FRAC_PI_2);
+        let second = doc.add_occurrence(component, 0, matrix).unwrap();
+        let mut state = ModelState::default();
+        state.bodies.push(ModelBody::new("Block".into(), kernel::box_solid(Vec3::ZERO, Vec3::new(2., 3., 4.)).unwrap(), 1));
+        state.bodies[0].key = 1234;
+        let source = &state.bodies[0];
+        let world = world_state(&doc, &state);
+        assert_eq!(world.bodies.len(), 2);
+        let first = world.body("Block").unwrap();
+        let second_name = doc.world_body_name(&state, "Block", component, &[second]);
+        let placed = world.body(&second_name).unwrap();
+        assert!(source.mesh.get().is_some(), "persistent source names stay prepared before adoption");
+        assert!(Arc::ptr_eq(&source.mesh, &first.mesh), "unchanged geometry must retain the shared display mesh cell");
+        assert_eq!(first.key, 0);
+        assert_eq!(placed.key, 0);
+        assert!(!Arc::ptr_eq(&source.mesh, &placed.mesh), "a transformed mesh cannot be reused without mapping coordinates");
+        assert_eq!(first.source_name.as_deref(), Some("Block"));
+        assert_eq!(placed.source_name.as_deref(), Some("Block"));
+        assert_eq!(placed.source_transform, matrix);
+        assert_eq!(doc.model_body_component(placed), component);
+        let bounds = placed.mesh().bounds();
+        assert!(bounds.min.dist(Vec3::new(7., 20., 0.)) < 1e-9);
+        assert!(bounds.max.dist(Vec3::new(10., 22., 4.)) < 1e-9);
+        let names = crate::naming::face_names(source);
+        assert!(Arc::ptr_eq(&names, &crate::naming::face_names(first)));
+        assert!(Arc::ptr_eq(&names, &crate::naming::face_names(placed)));
+        let original_mesh = source.mesh();
+        assert!(Arc::ptr_eq(&original_mesh, &first.mesh()));
+        let again = world_state(&doc, &state);
+        assert!(Arc::ptr_eq(&original_mesh, &again.body("Block").unwrap().mesh()));
+        assert!(Arc::ptr_eq(&names, &crate::naming::face_names(again.body(&second_name).unwrap())));
+    }
 }
 
 #[cfg(test)]

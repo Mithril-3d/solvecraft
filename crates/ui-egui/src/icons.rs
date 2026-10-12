@@ -192,6 +192,17 @@ pub fn paint(p: &Painter, r: Rect, name: &str, ink: Color32, fill: Color32, acce
             pen.poly(&[(4.0, 7.5), (12.0, 12.0), (12.0, 21.0), (4.0, 16.5)], a, ink);
             pen.poly(&[(12.0, 12.0), (20.0, 7.5), (20.0, 16.5), (12.0, 21.0)], Color32::TRANSPARENT, ink);
         }
+        // Original bug glyph: rounded body, antennae and three pairs of legs.
+        "bug_report" => {
+            pen.circle(12.0, 13.5, 5.0, Color32::TRANSPARENT, ink);
+            pen.line(&[(12.0, 9.0), (12.0, 18.0)], ink);
+            pen.line(&[(9.5, 8.5), (8.0, 5.0)], ink);
+            pen.line(&[(14.5, 8.5), (16.0, 5.0)], ink);
+            for y in [10.0, 13.5, 17.0] {
+                pen.line(&[(3.0, y), (7.0, y)], ink);
+                pen.line(&[(17.0, y), (21.0, y)], ink);
+            }
+        }
         // Help: a question mark in a ring.
         "help" => {
             pen.circle(12.0, 12.0, 9.0, Color32::TRANSPARENT, ink);
@@ -228,6 +239,12 @@ pub fn paint(p: &Painter, r: Rect, name: &str, ink: Color32, fill: Color32, acce
             for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
                 pen.arrow((12.0, 12.0), (12.0 + 9.0 * dx, 12.0 + 9.0 * dy), a);
             }
+        }
+        "configuration_table" => {
+            pen.poly(&[(3.0, 4.0), (21.0, 4.0), (21.0, 20.0), (3.0, 20.0)], pen.fill, ink);
+            pen.line(&[(3.0, 9.0), (21.0, 9.0)], a);
+            pen.line(&[(3.0, 14.0), (21.0, 14.0)], ink);
+            pen.line(&[(9.0, 4.0), (9.0, 20.0)], ink);
         }
         "params" => {
             pen.line(&[(8.0, 20.0), (9.0, 8.0), (10.0, 5.0), (13.0, 4.0)], ink);

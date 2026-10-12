@@ -367,3 +367,36 @@ fn timeline_clones_share_meshes_even_when_cloned_before_tessellation() {
     assert!(std::sync::Arc::ptr_eq(&a.mesh(), &b.mesh()));
     assert!(!a.mesh().triangles.is_empty());
 }
+
+/// A construction plane that is its own side resolves through the model and back into the
+/// document. The depth count has to survive that hop, or the recursion overflows the stack and
+/// aborts the process, which no panic guard can intercept.
+#[test]
+fn self_referencing_construction_planes_are_errors() {
+    let selfref = |name: &str| Box::new(construct::GeoRef::Plane { plane: PlaneRef::Construction { name: name.into() } });
+    let xz = || Box::new(construct::GeoRef::Plane { plane: PlaneRef::Origin { name: "XZ".into() } });
+
+    // Directly its own first side.
+    let mut doc = Document::new("selfplane");
+    doc.add_feature(FeatureKind::ConstructionPlane { plane: PlaneRef::Midplane { a: selfref("P1"), b: xz() } }, Some("P1")).unwrap();
+    let mut m = Model::new();
+    m.evaluate(&doc);
+    assert!(m.results.iter().any(|r| r.error.is_some()), "a plane that is its own side must report an error: {:?}", m.results);
+
+    // Two planes that are each other's side.
+    let mut doc = Document::new("twoplanes");
+    doc.add_feature(FeatureKind::ConstructionPlane { plane: PlaneRef::Midplane { a: selfref("P2"), b: xz() } }, Some("P1")).unwrap();
+    doc.add_feature(FeatureKind::ConstructionPlane { plane: PlaneRef::Midplane { a: selfref("P1"), b: xz() } }, Some("P2")).unwrap();
+    let mut m = Model::new();
+    m.evaluate(&doc);
+    assert!(m.results.iter().any(|r| r.error.is_some()), "a two-plane cycle must report an error: {:?}", m.results);
+
+    // A perpendicular plane whose base is itself, and a sketch placed on it.
+    let mut doc = Document::new("perpplane");
+    let line = Box::new(construct::GeoRef::World { axis: "X".into() });
+    doc.add_feature(FeatureKind::ConstructionPlane { plane: PlaneRef::Perpendicular { plane: selfref("P1"), line } }, Some("P1")).unwrap();
+    doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Construction { name: "P1".into() }, sketch: Sketch::new() }, Some("Sketch1")).unwrap();
+    let mut m = Model::new();
+    m.evaluate(&doc);
+    assert!(m.results.iter().any(|r| r.error.is_some()), "a cyclic perpendicular plane must report an error: {:?}", m.results);
+}

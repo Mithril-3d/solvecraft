@@ -154,10 +154,19 @@ pub enum FaceCertificate {
     ExtrudeCap { sketch: u64, high: bool, outer: Vec<String>, holes: Vec<Vec<String>> },
     ExtrudeSide { sketch: u64, curve: String },
     Imported { payload_sha256: String, item: u64, face: u64 },
+    ShellPlanar { source_producer: u64, source: Box<FaceCertificate>, inner: bool },
 }
 
 impl FaceCertificate {
     pub fn remap_features(&mut self, features: &std::collections::BTreeMap<u64, u64>) {
+        if let Self::ShellPlanar { source_producer, source, .. } = self {
+            if let Some(mapped) = features.get(source_producer) {
+                *source_producer = *mapped;
+            }
+            if !matches!(source.as_ref(), Self::ShellPlanar { .. }) {
+                source.remap_features(features);
+            }
+        }
         if let Self::ExtrudeSide { sketch, .. } | Self::ExtrudeCap { sketch, .. } = self
             && let Some(mapped) = features.get(sketch)
         {
@@ -174,6 +183,9 @@ impl FaceCertificate {
                     && *face != 0
                     && payload_sha256.len() == 64
                     && payload_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }
+            Self::ShellPlanar { source_producer, source, .. } => {
+                *source_producer != 0 && !matches!(source.as_ref(), Self::ShellPlanar { .. }) && source.validate().is_ok()
             }
         };
         if valid { Ok(()) } else { Err(DocError::Invalid("invalid face source certificate".into())) }
@@ -216,9 +228,81 @@ pub(crate) fn validate_certificate_json(value: &serde_json::Value) -> Result<()>
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
         }
+        Some("shell_planar") => {
+            fields.len() == 4
+                && fields.keys().all(|key| ["kind", "source_producer", "source", "inner"].contains(&key.as_str()))
+                && nonzero("source_producer")
+                && fields.get("inner").and_then(serde_json::Value::as_bool).is_some()
+                && fields.get("source").is_some_and(|source| {
+                    source.as_object().is_some_and(|source| source.get("kind").and_then(serde_json::Value::as_str) != Some("shell_planar"))
+                        && validate_certificate_json(source).is_ok()
+                })
+        }
         _ => false,
     };
     if valid { Ok(()) } else { Err(DocError::Invalid("malformed or oversized face source certificate".into())) }
+}
+
+/// Canonical diagnostic role; producer identity remains in the typed certificate.
+pub(crate) fn shell_certificate_role(source: &FaceCertificate, inner: bool) -> Result<String> {
+    source.validate()?;
+    let role = match source {
+        FaceCertificate::Box { axis, high } => {
+            let axis = ["x", "y", "z"].get(*axis as usize).ok_or_else(|| DocError::Invalid("invalid shell source axis".into()))?;
+            format!("box:{}{axis}", if *high { "+" } else { "-" })
+        }
+        FaceCertificate::ExtrudeSide { curve, .. } => format!("side:{curve}"),
+        FaceCertificate::ExtrudeCap { high, outer, holes, .. } => format!("cap:{}:{}", if *high { "high" } else { "low" }, cap_key(outer, holes)),
+        FaceCertificate::Imported { payload_sha256, item, face } => format!("import:{payload_sha256}:{item}:{face}"),
+        FaceCertificate::ShellPlanar { .. } => return Err(DocError::Invalid("nested shell source certificates are unsupported".into())),
+    };
+    Ok(format!("shell:{}:{role}", if inner { "inner" } else { "outer" }))
+}
+
+pub(crate) fn flat_source_certificate(source: &solvecraft_kernel::FaceSource) -> Option<(u64, FaceCertificate)> {
+    use solvecraft_kernel::FaceSource;
+    match source {
+        FaceSource::Box { producer: Some(producer), axis, high, .. } => Some((*producer, FaceCertificate::Box { axis: *axis, high: *high })),
+        FaceSource::CertifiedExtrudeSide { producer, sketch, curve, .. } => {
+            Some((*producer, FaceCertificate::ExtrudeSide { sketch: *sketch, curve: curve.clone() }))
+        }
+        FaceSource::CertifiedExtrudeCap { producer, sketch, high, outer, holes, .. } => {
+            Some((*producer, FaceCertificate::ExtrudeCap { sketch: *sketch, high: *high, outer: outer.clone(), holes: holes.clone() }))
+        }
+        FaceSource::Imported { producer: Some(producer), payload_sha256: Some(digest), item, face } => {
+            Some((*producer, FaceCertificate::Imported { payload_sha256: digest.clone(), item: *item, face: *face }))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn flat_source_matches(certificate: &FaceCertificate, source: &solvecraft_kernel::FaceSource, producer: u64) -> bool {
+    use solvecraft_kernel::FaceSource;
+    match (certificate, source) {
+        (FaceCertificate::Box { axis, high }, FaceSource::Box { producer: Some(current), axis: current_axis, high: current_high, .. }) => {
+            producer == *current && axis == current_axis && high == current_high
+        }
+        (
+            FaceCertificate::ExtrudeSide { sketch, curve },
+            FaceSource::CertifiedExtrudeSide { producer: current, sketch: current_sketch, curve: current_curve, .. },
+        ) => producer == *current && sketch == current_sketch && curve == current_curve,
+        (
+            FaceCertificate::ExtrudeCap { sketch, high, outer, holes },
+            FaceSource::CertifiedExtrudeCap {
+                producer: current,
+                sketch: current_sketch,
+                high: current_high,
+                outer: current_outer,
+                holes: current_holes,
+                ..
+            },
+        ) => producer == *current && sketch == current_sketch && high == current_high && outer == current_outer && holes == current_holes,
+        (
+            FaceCertificate::Imported { payload_sha256, item, face },
+            FaceSource::Imported { producer: Some(current), payload_sha256: Some(digest), item: current_item, face: current_face },
+        ) => producer == *current && payload_sha256 == digest && item == current_item && face == current_face,
+        _ => false,
+    }
 }
 
 /// Match a generated segment to one exact analytic sketch curve. Coincident
@@ -306,6 +390,7 @@ impl Document {
             Some(solvecraft_kernel::FaceSource::Imported { producer: Some(producer), .. })
             | Some(solvecraft_kernel::FaceSource::CertifiedExtrudeSide { producer, .. })
             | Some(solvecraft_kernel::FaceSource::CertifiedExtrudeCap { producer, .. })
+            | Some(solvecraft_kernel::FaceSource::ShellPlanar { producer: Some(producer), .. })
             | Some(solvecraft_kernel::FaceSource::Box { producer: Some(producer), .. }) => *producer,
             _ => name
                 .strip_prefix('F')
@@ -316,6 +401,8 @@ impl Document {
         let certificate = self.configuration_face_certificate(body, index)?;
         if let Some(FaceCertificate::ExtrudeSide { curve, .. }) = &certificate {
             name = format!("F{origin}:side:{curve}");
+        } else if let Some(FaceCertificate::ShellPlanar { source, inner, .. }) = &certificate {
+            name = format!("F{origin}:{}", shell_certificate_role(source, *inner)?);
         } else if !name.starts_with(&format!("F{origin}:")) {
             name = format!("F{origin}:face:{index}");
         }
@@ -332,6 +419,19 @@ impl Document {
         let Some(source) = body.body.face_sources().and_then(|sources| sources.get(index)).and_then(Option::as_ref) else {
             return Ok(None);
         };
+        if let solvecraft_kernel::FaceSource::ShellPlanar { producer: Some(producer), source, inner, .. } = source {
+            if !self.feature(*producer).is_some_and(|feature| matches!(feature.kind, FeatureKind::Shell { .. })) {
+                return Err(DocError::Invalid("shell source producer missing".into()));
+            }
+            let (source_producer, source) =
+                flat_source_certificate(source).ok_or_else(|| DocError::Invalid("shell has no flat certified source".into()))?;
+            if !self.flat_certificate_producer_matches(source_producer, &source) {
+                return Err(DocError::Invalid("shell original source producer missing".into()));
+            }
+            let certificate = FaceCertificate::ShellPlanar { source_producer, source: Box::new(source), inner: *inner };
+            certificate.validate()?;
+            return Ok(Some(certificate));
+        }
         if let solvecraft_kernel::FaceSource::Imported { item, face, payload_sha256: Some(digest), producer: Some(producer) } = source {
             if !self.feature(*producer).is_some_and(|feature| matches!(feature.kind, FeatureKind::Import { .. })) {
                 return Err(DocError::Invalid("import source producer missing".into()));
@@ -377,6 +477,10 @@ pub(crate) fn payload_digest(payload: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(payload.as_bytes()))
 }
+
+#[cfg(test)]
+#[path = "config_shell_tests.rs"]
+mod shell_tests;
 
 #[cfg(test)]
 mod tests {

@@ -142,7 +142,19 @@ fn measured_axis_view_targets_home_and_drag_work_beside_the_palette_at_hidpi() {
         assert_eq!(outer, layout.axis_view);
         assert!(outer.contains_rect(home));
         assert!(layout.viewport.contains_rect(outer));
-        assert!(!outer.intersect(palette).is_positive());
+        assert_eq!(outer.right_top(), layout.viewport.right_top());
+        if outer.intersect(palette).is_positive() {
+            // Short palettes may cover the fixed anchor; covered controls never steal input.
+            let covered = outer.intersect(palette).center();
+            let camera = h.app.cam;
+            h.call("ui.click", json!({"x":covered.x,"y":covered.y}));
+            assert_eq!(h.app.cam, camera);
+            assert!(h.app.viewport.axis_drag.is_none());
+            assert_eq!(crate::scenario::rect_of("axis_view:outer").unwrap(), outer);
+            assert_eq!(h.app.session.doc.to_json(), baseline);
+            assert_eq!(h.app.session.undo.len(), undo);
+            continue;
+        }
         assert!(!layout.navigation.intersect(outer).is_positive());
         for name in ["x", "-x", "y", "-y", "z", "-z"] {
             let p = crate::scenario::handle_at(&format!("axis_view:{name}")).unwrap();
@@ -193,4 +205,80 @@ fn immediate_standard_view_cancels_fit_before_the_measured_frame() {
     assert_eq!(h.app.cam, front, "the later frame must keep the explicitly requested view");
     assert_eq!(h.app.session.doc.to_json(), baseline);
     assert_eq!(h.app.session.undo.len(), undo);
+}
+
+#[test]
+fn navigation_anchors_ignore_positioned_resized_and_covering_dialogs() {
+    for (width, height, scale) in [(1400.0, 900.0, 1.0), (700.0, 450.0, 2.0), (700.0, 360.0, 2.0)] {
+        let vp = Rect::from_min_max(pos2(250.0, 126.0), pos2(width, height - 30.0));
+        let baseline = Layout::new(vp, &[], scale);
+        assert!(baseline.axis_view.is_positive() && baseline.navigation.is_positive());
+        assert_eq!(baseline.axis_view.right_top(), vp.right_top());
+        assert_eq!(baseline.navigation.center().x, vp.center().x);
+        assert_eq!(baseline.navigation.bottom(), vp.bottom() - 7.0);
+        let cases = [
+            vec![Rect::from_min_max(pos2(width - 220.0, vp.top() + 120.0), vp.max)],
+            vec![Rect::from_min_size(vp.min, vec2(210.0, 170.0))],
+            vec![Rect::from_center_size(vp.center(), vec2(250.0, 180.0)), Rect::from_min_size(vp.min, vec2(70.0, 120.0))],
+            vec![vp],
+        ];
+        for docks in cases {
+            let measured = Layout::new(vp, &docks, scale);
+            assert_eq!(measured.axis_view, baseline.axis_view, "{docks:?}");
+            assert_eq!(measured.navigation, baseline.navigation, "{docks:?}");
+            assert!(vp.contains_rect(measured.axis_view));
+            assert!(vp.contains_rect(measured.navigation));
+        }
+    }
+}
+
+#[test]
+fn opening_different_command_dialogs_keeps_published_navigation_positions() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+    h.settle();
+    let axis = crate::scenario::rect_of("axis_view:outer").unwrap();
+    let nav = crate::scenario::rect_of("nav:outer").unwrap();
+    let camera = h.app.cam;
+    let baseline = h.app.session.doc.to_json();
+    let undo = h.app.session.undo.len();
+    for command in ["solid.extrude", "solid.fillet", "inspect.measure"] {
+        h.app.start(command);
+        h.settle();
+        assert!(h.app.dialog.is_some(), "{command}");
+        assert!(h.app.viewport.dialog_rect.is_some(), "dialog must be measured");
+        assert_eq!(crate::scenario::rect_of("axis_view:outer").unwrap(), axis, "{command}");
+        assert_eq!(crate::scenario::rect_of("nav:outer").unwrap(), nav, "{command}");
+        assert_eq!(h.app.cam, camera);
+        let pan = pos2(nav.left() + 5.0 + 2.0 * 30.0 + 13.0, nav.top() + 15.0);
+        assert!(!h.app.viewport.dialog_rect.unwrap().contains(pan));
+        h.app.viewport.nav = None;
+        h.call("ui.click", json!({"x":pan.x,"y":pan.y}));
+        assert_eq!(h.app.viewport.nav, Some(crate::viewport::NavMode::Pan), "fixed navigation stays usable beside {command}");
+        h.app.dialog = None;
+        h.settle();
+        assert_eq!(crate::scenario::rect_of("axis_view:outer").unwrap(), axis);
+        assert_eq!(crate::scenario::rect_of("nav:outer").unwrap(), nav);
+    }
+    assert_eq!(h.app.session.doc.to_json(), baseline);
+    assert_eq!(h.app.session.undo.len(), undo);
+}
+
+#[test]
+fn tiny_viewports_never_overlap_navigation_and_axis_view() {
+    for width in [39.0, 40.0, 90.0, 120.0, 160.0, 310.0] {
+        for height in [30.0, 80.0, 130.0, 160.0, 240.0] {
+            let vp = Rect::from_min_size(pos2(20.0, 30.0), vec2(width, height));
+            let clear = Layout::new(vp, &[], 1.0);
+            let covered = Layout::new(vp, &[vp], 1.0);
+            assert_eq!(clear.axis_view, covered.axis_view);
+            assert_eq!(clear.navigation, covered.navigation);
+            assert!(!clear.axis_view.intersect(clear.navigation).is_positive());
+            for control in [clear.axis_view, clear.navigation] {
+                if control.is_positive() {
+                    assert!(vp.contains_rect(control), "{clear:?}");
+                }
+            }
+        }
+    }
 }

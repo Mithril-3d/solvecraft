@@ -5,6 +5,10 @@ use truck_modeling as mt;
 
 use crate::{KernelError, Result, guard};
 
+#[path = "planar_regularize.rs"]
+mod planar_regularize;
+#[path = "planar_sources.rs"]
+mod planar_sources;
 #[path = "shell_groups.rs"]
 mod shell_groups;
 
@@ -29,15 +33,18 @@ pub struct Body {
     pub(crate) splits: Option<std::sync::Arc<Vec<Vec<Vec3>>>>,
     /// Exact construction/import source identities, in this body's face order.
     pub(crate) face_sources: Option<std::sync::Arc<Vec<Option<FaceSource>>>>,
+    /// Sticky transient veto: authored face boundaries must survive later rebuilds.
+    pub(crate) regularization_protected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FaceSource {
-    ExtrudeSide { segment: solvecraft_geom::Seg2, plane: Option<solvecraft_geom::Plane> },
+    ExtrudeSide { segment: solvecraft_geom::Seg2, plane: Option<solvecraft_geom::Plane>, coalesced: bool },
     CertifiedExtrudeSide { producer: u64, sketch: u64, curve: String, plane: Option<solvecraft_geom::Plane> },
     ExtrudeCap { high: bool, region: solvecraft_geom::Region2, plane: solvecraft_geom::Plane },
     CertifiedExtrudeCap { producer: u64, sketch: u64, high: bool, outer: Vec<String>, holes: Vec<Vec<String>>, plane: solvecraft_geom::Plane },
     Box { producer: Option<u64>, axis: u8, high: bool, plane: solvecraft_geom::Plane },
+    ShellPlanar { producer: Option<u64>, source: Box<FaceSource>, inner: bool, plane: solvecraft_geom::Plane },
     Imported { item: u64, face: u64, payload_sha256: Option<String>, producer: Option<u64> },
 }
 
@@ -48,7 +55,9 @@ impl FaceSource {
     fn plane_mut(&mut self) -> Option<&mut solvecraft_geom::Plane> {
         match self {
             Self::ExtrudeSide { plane, .. } | Self::CertifiedExtrudeSide { plane, .. } => plane.as_mut(),
-            Self::ExtrudeCap { plane, .. } | Self::CertifiedExtrudeCap { plane, .. } | Self::Box { plane, .. } => Some(plane),
+            Self::ExtrudeCap { plane, .. } | Self::CertifiedExtrudeCap { plane, .. } | Self::Box { plane, .. } | Self::ShellPlanar { plane, .. } => {
+                Some(plane)
+            }
             Self::Imported { .. } => None,
         }
     }
@@ -113,6 +122,11 @@ fn mesh_shells(solid: &Solid, tol: f64) -> Vec<MeshedShell> {
 /// `None` when nothing needs splitting or the parameters don't match the surface.
 #[allow(clippy::type_complexity)]
 fn refined(pm: &PolygonMesh, surf: &mt::Surface, tol: f64) -> Option<Vec<[(Vec3, Vec3); 3]>> {
+    refined_with_cache(pm, surf, tol, true)
+}
+
+#[allow(clippy::type_complexity)]
+fn refined_with_cache(pm: &PolygonMesh, surf: &mt::Surface, tol: f64, memoize: bool) -> Option<Vec<[(Vec3, Vec3); 3]>> {
     use mt::{ParametricSurface, ParametricSurface3D};
     let (pos, uvs, nor) = (pm.positions(), pm.uv_coords(), pm.normals());
     if uvs.is_empty() {
@@ -141,6 +155,15 @@ fn refined(pm: &PolygonMesh, surf: &mt::Surface, tol: f64) -> Option<Vec<[(Vec3,
     // Edges on the face's boundary are shared with the next face: never split them.
     let k = |x: &V| ((x.1.0 * 1e9).round() as i64, (x.1.1 * 1e9).round() as i64);
     let ek = |a: &V, b: &V| if k(a) < k(b) { (k(a), k(b)) } else { (k(b), k(a)) };
+    // Only exact finite values identify reusable evaluations. In particular,
+    // the rounded UV keys used for boundary incidence cannot identify a point
+    // whose derivatives or midpoint may be reused.
+    let vertex_key = |v: &V| {
+        let values = [v.0.x, v.0.y, v.0.z, v.1.0, v.1.1, v.2.x, v.2.y, v.2.z];
+        values.iter().all(|x| x.is_finite()).then(|| values.map(f64::to_bits))
+    };
+    let cache_limit = cap * 3;
+    let mut singular_cache = std::collections::HashMap::<(u64, u64), bool>::new();
     let mut changed = false;
     for _ in 0..4 {
         let mut uses: std::collections::HashMap<((i64, i64), (i64, i64)), u32> = std::collections::HashMap::new();
@@ -149,34 +172,60 @@ fn refined(pm: &PolygonMesh, surf: &mt::Surface, tol: f64) -> Option<Vec<[(Vec3,
                 *uses.entry(e).or_default() += 1;
             }
         }
-        let at = |a: &V, b: &V| -> Option<V> {
-            if uses.get(&ek(a, b)).copied().unwrap_or(0) < 2 {
-                return None;
+        let mut edge_cache = std::collections::HashMap::<([u64; 8], [u64; 8]), Option<V>>::new();
+        let mut at = |a: &V, b: &V| -> Option<V> {
+            let key = if memoize { vertex_key(a).zip(vertex_key(b)).map(|(a, b)| if a < b { (a, b) } else { (b, a) }) } else { None };
+            if let Some(key) = key
+                && let Some(value) = edge_cache.get(&key)
+            {
+                return *value;
             }
-            // Not at a degenerate point (a cone's apex: its parameters there are arbitrary).
-            let singular = |x: &V| {
-                let (du, dv) = (surf.uder(x.1.0, x.1.1), surf.vder(x.1.0, x.1.1));
-                let c = du.cross(dv);
-                c.x * c.x + c.y * c.y + c.z * c.z
-                    <= 1e-12 * (du.x * du.x + du.y * du.y + du.z * du.z + dv.x * dv.x + dv.y * dv.y + dv.z * dv.z).powi(2) + 1e-300
+            let mut calculate = || -> Option<V> {
+                if uses.get(&ek(a, b)).copied().unwrap_or(0) < 2 {
+                    return None;
+                }
+                // Not at a degenerate point (a cone's apex: its parameters there are arbitrary).
+                let mut singular = |x: &V| {
+                    let key = (x.1.0.to_bits(), x.1.1.to_bits());
+                    let cacheable = memoize && x.1.0.is_finite() && x.1.1.is_finite();
+                    if cacheable && let Some(value) = singular_cache.get(&key) {
+                        return *value;
+                    }
+                    let (du, dv) = (surf.uder(x.1.0, x.1.1), surf.vder(x.1.0, x.1.1));
+                    let c = du.cross(dv);
+                    let value = c.x * c.x + c.y * c.y + c.z * c.z
+                        <= 1e-12 * (du.x * du.x + du.y * du.y + du.z * du.z + dv.x * dv.x + dv.y * dv.y + dv.z * dv.z).powi(2) + 1e-300;
+                    if cacheable && singular_cache.len() < cache_limit {
+                        singular_cache.insert(key, value);
+                    }
+                    value
+                };
+                if singular(a) || singular(b) {
+                    return None;
+                }
+                let (u, v) = ((a.1.0 + b.1.0) / 2.0, (a.1.1 + b.1.1) / 2.0);
+                let q = from_p3(surf.subs(u, v));
+                // Within tolerance, or so far off that the parameters wrapped (a seam).
+                let sag = q.dist((a.0 + b.0) * 0.5);
+                if sag <= tol || sag >= 0.5 * a.0.dist(b.0) {
+                    return None;
+                }
+                let n = surf.normal(u, v);
+                let mut n = Vec3::new(n.x, n.y, n.z);
+                // Keep the mesh's normal side.
+                if n.dot(a.2 + b.2) < 0.0 {
+                    n = -n;
+                }
+                Some((q, (u, v), n))
             };
-            if singular(a) || singular(b) {
-                return None;
+            let value = calculate();
+            if let Some(key) = key
+                && edge_cache.len() < cache_limit
+                && value.is_none_or(|v| vertex_key(&v).is_some())
+            {
+                edge_cache.insert(key, value);
             }
-            let (u, v) = ((a.1.0 + b.1.0) / 2.0, (a.1.1 + b.1.1) / 2.0);
-            let q = from_p3(surf.subs(u, v));
-            // Within tolerance, or so far off that the parameters wrapped (a seam).
-            let sag = q.dist((a.0 + b.0) * 0.5);
-            if sag <= tol || sag >= 0.5 * a.0.dist(b.0) {
-                return None;
-            }
-            let n = surf.normal(u, v);
-            let mut n = Vec3::new(n.x, n.y, n.z);
-            // Keep the mesh's normal side.
-            if n.dot(a.2 + b.2) < 0.0 {
-                n = -n;
-            }
-            Some((q, (u, v), n))
+            value
         };
         let mut next = Vec::with_capacity(tris.len());
         let mut any = false;
@@ -313,6 +362,7 @@ impl Body {
             && self.paint == other.paint
             && self.splits == other.splits
             && self.face_sources == other.face_sources
+            && self.regularization_protected == other.regularization_protected
     }
 
     pub(crate) fn new(solid: Solid) -> Result<Body> {
@@ -351,11 +401,23 @@ impl Body {
             paint: None,
             splits: None,
             face_sources: None,
+            regularization_protected: false,
         })
+    }
+
+    pub(crate) fn inherit_regularization_protection(mut self, input: &Body) -> Self {
+        self.regularization_protected |= input.regularization_protected;
+        self
     }
 
     pub fn face_sources(&self) -> Option<&[Option<FaceSource>]> {
         self.face_sources.as_deref().map(Vec::as_slice)
+    }
+
+    /// A current wall reconstructed from an exact contiguous section run.
+    /// This transient witness grants no durable source/producer identity.
+    pub fn face_was_coalesced(&self, index: usize) -> bool {
+        matches!(self.face_sources().and_then(|s| s.get(index)), Some(Some(FaceSource::ExtrudeSide { coalesced: true, .. })))
     }
 
     /// An exact construction/import plane; never inferred from tessellation.
@@ -366,7 +428,10 @@ impl Body {
         let source = self.face_sources()?.get(index)?.as_ref()?;
         match source {
             FaceSource::ExtrudeSide { plane, .. } | FaceSource::CertifiedExtrudeSide { plane, .. } => *plane,
-            FaceSource::ExtrudeCap { plane, .. } | FaceSource::CertifiedExtrudeCap { plane, .. } | FaceSource::Box { plane, .. } => Some(*plane),
+            FaceSource::ExtrudeCap { plane, .. }
+            | FaceSource::CertifiedExtrudeCap { plane, .. }
+            | FaceSource::Box { plane, .. }
+            | FaceSource::ShellPlanar { plane, .. } => Some(*plane),
             FaceSource::Imported { .. } => self.planar_face(index),
         }
     }
@@ -572,6 +637,7 @@ impl Body {
     /// The same body with the lines its faces were split along on purpose.
     pub fn with_split_lines(mut self, s: Option<std::sync::Arc<Vec<Vec<Vec3>>>>) -> Body {
         self.splits = s.filter(|l| !l.is_empty());
+        self.regularization_protected |= self.splits.is_some();
         self
     }
 
@@ -596,6 +662,7 @@ impl Body {
             })
             .filter(|p| p.opacity < 1.0 || !p.faces.is_empty())
             .map(std::sync::Arc::new);
+        self.regularization_protected |= self.paint().is_some_and(|paint| !paint.faces.is_empty());
         self
     }
 
@@ -642,11 +709,15 @@ impl Body {
                 let flip = !face.orientation();
                 let base = u32::try_from(out.positions.len()).unwrap_or(u32::MAX);
                 // Curved faces: split triangles that cut through the surface.
-                if refine
-                    && let Some(sf) = solid_faces.get(fi)
-                    && !matches!(sf.surface(), mt::Surface::Plane(_))
-                    && let Some(tris) = refined(&pm, &sf.surface(), tol)
-                {
+                let refinement = if refine {
+                    solid_faces.get(fi).and_then(|sf| {
+                        let surface = sf.surface();
+                        if matches!(surface, mt::Surface::Plane(_)) { None } else { refined(&pm, &surface, tol) }
+                    })
+                } else {
+                    None
+                };
+                if let Some(tris) = refinement {
                     let fid = u32::try_from(fi).unwrap_or(u32::MAX);
                     for t in tris {
                         let mut idx = [0u32; 3];
@@ -1003,7 +1074,7 @@ impl Body {
                             })
                             .collect()
                     });
-                    Ok(result.with_face_sources(sources.map(std::sync::Arc::new)))
+                    Ok(result.with_face_sources(sources.map(std::sync::Arc::new)).inherit_regularization_protection(self))
                 })
                 .collect()
         })
@@ -1013,3 +1084,11 @@ impl Body {
 #[cfg(test)]
 #[path = "body_lump_tests.rs"]
 mod lump_tests;
+
+#[cfg(test)]
+#[path = "refine_cache_tests.rs"]
+mod refine_cache_tests;
+
+#[cfg(test)]
+#[path = "regularization_protection_tests.rs"]
+mod regularization_protection_tests;

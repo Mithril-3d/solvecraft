@@ -34,4 +34,7 @@ mod healing;
 pub use healing::{RobustSplitClosedEdgesAndFaces, SplitClosedEdgesAndFaces};
 mod transversal;
 pub use transversal::{and, or, ShapeOpsCurve, ShapeOpsSurface};
+// SolveCraft: exercised by kernel regressions in the workspace CI.
+#[doc(hidden)]
+pub use transversal::IntersectionCurveWithParameters;
 mod alternative;

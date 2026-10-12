@@ -221,6 +221,10 @@ pub fn boolean(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
             )),
         };
     }
+    r = r.map(|result| result.map(|body| body.inherit_regularization_protection(a).inherit_regularization_protection(b)));
+    if matches!(op, BoolOp::Cut | BoolOp::Union) {
+        r = r.and_then(|result| result.map(|body| body.with_preserved_boolean_planar_sources(a, b, op == BoolOp::Cut)).transpose());
+    }
     r
 }
 
@@ -535,7 +539,11 @@ pub(crate) fn join_pieces(pieces: Vec<Body>) -> Result<Option<Body>> {
         _ => {
             let shells: Vec<mt::Shell> = pieces.iter().flat_map(|p| p.solid.boundaries().clone()).collect();
             let solid = guard("pieces", || Solid::try_new(shells).map_err(|e| KernelError::Failed(e.to_string())))?;
-            Body::new(solid).map(Some)
+            let protected = pieces.iter().any(|piece| piece.regularization_protected);
+            Body::new(solid).map(|mut body| {
+                body.regularization_protected = protected;
+                Some(body)
+            })
         }
     }
 }
@@ -555,8 +563,9 @@ pub fn transform_matrix(body: &Body, m: [[f64; 4]; 4]) -> Result<Body> {
         );
         // An affine placement retains face order and appearance metadata.
         let sources = body.transformed_sources(m)?;
-        Body::new(placed_topology(&body.solid, mat)?)
-            .map(|placed| placed.with_color(body.color()).with_paint(body.paint().cloned()).with_face_sources(sources))
+        Body::new(placed_topology(&body.solid, mat)?).map(|placed| {
+            placed.with_color(body.color()).with_paint(body.paint().cloned()).with_face_sources(sources).inherit_regularization_protection(body)
+        })
     })
 }
 
