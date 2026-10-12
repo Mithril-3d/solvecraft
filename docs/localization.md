@@ -39,8 +39,8 @@ In the browser, `solvecraft-web` bundles a self-hosted Japanese font (`BIZUDPGot
 under SIL OFL 1.1) within the web distribution artifacts only. The font is loaded asynchronously from the same
 origin (`./fonts/BIZUDPGothic-Regular.ttf`) on-demand when the interface language is set to Japanese, without
 contacting any external CDNs or third-party servers. For users with an English interface, no font download
-occurs. If font loading fails, the web interface gracefully falls back to English to prevent missing glyphs
-(tofu). This bundled font specifically targets Japanese; Korean (Hangul) and Chinese scripts are not covered.
+occurs. If font loading fails, the web interface shows English for that session only to prevent missing
+glyphs (tofu); the saved language preference is kept, so the next visit tries again. This bundled font specifically targets Japanese; Korean (Hangul) and Chinese scripts are not covered.
 
 The current messages support named substitution, not locale-specific plural selection,
 number/date formatting, or right-to-left layout and shaping. Add those capabilities when

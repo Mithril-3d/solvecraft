@@ -48,14 +48,6 @@ mod web {
 
     const JAPANESE_FONT_PATH: &str = "./fonts/BIZUDPGothic-Regular.ttf";
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum FontStatus {
-        Unloaded,
-        Loading,
-        Installed,
-        Failed,
-    }
-
     type FontLoadResult = Rc<std::cell::RefCell<Option<Result<Vec<u8>, String>>>>;
 
     struct Shell {
@@ -70,7 +62,8 @@ mod web {
         rename_focus: bool,
         /// The start page's recent designs were filled from the stored ones.
         recents_synced: bool,
-        font_status: FontStatus,
+        /// On-demand CJK font: fetched only when a CJK language is selected.
+        font: solvecraft_ui_egui::fonts::CjkFontLoader,
         font_result: FontLoadResult,
     }
 
@@ -319,51 +312,34 @@ mod web {
             files::autosave(&self.files, None);
         }
 
-        /// Check language preference and manage on-demand Japanese font loading.
+        /// Fetch and install the CJK font when a CJK language is selected. If that fails, this
+        /// session falls back to English (no tofu); the saved language preference is kept.
         fn tick_font(&mut self, ctx: &egui::Context) {
-            if self.font_status == FontStatus::Loading {
-                if let Some(res) = self.font_result.borrow_mut().take() {
-                    match res {
-                        Ok(bytes) => {
-                            if solvecraft_ui_egui::fonts::install_cjk_font(ctx, bytes) {
-                                log::info!("loaded web Japanese font from {JAPANESE_FONT_PATH}");
-                                self.font_status = FontStatus::Installed;
-                                ctx.request_repaint();
-                            } else {
-                                log::warn!("failed to install Japanese font: invalid font data; falling back to English");
-                                self.font_status = FontStatus::Failed;
-                                self.app.preferences.language = "en".to_string();
-                                ctx.request_repaint();
-                            }
-                        }
-                        Err(err) => {
-                            log::warn!("failed to fetch Japanese font from {JAPANESE_FONT_PATH}: {err}; falling back to English");
-                            self.font_status = FontStatus::Failed;
-                            self.app.preferences.language = "en".to_string();
-                            ctx.request_repaint();
-                        }
+            let done = self.font_result.borrow_mut().take();
+            if let Some(res) = done {
+                let installed = match res {
+                    Ok(bytes) => solvecraft_ui_egui::fonts::install_cjk_font(ctx, bytes),
+                    Err(err) => {
+                        log::warn!("failed to fetch CJK font from {JAPANESE_FONT_PATH}: {err}");
+                        false
                     }
+                };
+                if installed {
+                    log::info!("loaded web CJK font from {JAPANESE_FONT_PATH}");
+                } else {
+                    log::warn!("CJK font unavailable; showing English for this session");
                 }
+                self.font.finished(installed, &mut self.app.preferences.language);
+                ctx.request_repaint();
             }
-
-            if self.app.preferences.language == "ja" {
-                match self.font_status {
-                    FontStatus::Unloaded => {
-                        self.font_status = FontStatus::Loading;
-                        let slot = self.font_result.clone();
-                        let ctx_clone = ctx.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let res = fetch_font_bytes(JAPANESE_FONT_PATH).await;
-                            *slot.borrow_mut() = Some(res);
-                            ctx_clone.request_repaint();
-                        });
-                    }
-                    FontStatus::Failed => {
-                        // Prevent tofu glyphs if font loading failed
-                        self.app.preferences.language = "en".to_string();
-                    }
-                    FontStatus::Loading | FontStatus::Installed => {}
-                }
+            if self.font.tick(&mut self.app.preferences.language) {
+                let slot = self.font_result.clone();
+                let ctx = ctx.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let res = fetch_font_bytes(JAPANESE_FONT_PATH).await;
+                    *slot.borrow_mut() = Some(res);
+                    ctx.request_repaint();
+                });
             }
         }
     }
@@ -386,7 +362,11 @@ mod web {
             self.recovery_prompt(&ctx);
         }
         fn save(&mut self, storage: &mut dyn eframe::Storage) {
+            // Persist the user's own language, not a session-only English fallback.
+            let saved = self.font.persisted_language(&self.app.preferences.language).to_owned();
+            let live = std::mem::replace(&mut self.app.preferences.language, saved);
             storage.set_string(PREFS_KEY, self.app.prefs());
+            self.app.preferences.language = live;
         }
     }
 
@@ -475,7 +455,7 @@ mod web {
                             renaming: None,
                             rename_focus: false,
                             recents_synced: false,
-                            font_status: FontStatus::Unloaded,
+                            font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),
                         }))
                     }),
