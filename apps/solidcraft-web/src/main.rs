@@ -375,7 +375,7 @@ mod web {
             let done = self.font_result.borrow_mut().take();
             if let Some(res) = done {
                 let installed = match res {
-                    Ok(bytes) => solidcraft_ui_egui::fonts::install_cjk_font(ctx, bytes),
+                    Ok(bytes) => solidcraft_ui_egui::fonts::install_cjk_font_for(ctx, bytes, &self.app.preferences.language),
                     Err(err) => {
                         log::warn!("failed to fetch CJK font from {JAPANESE_FONT_PATH}: {err}");
                         false

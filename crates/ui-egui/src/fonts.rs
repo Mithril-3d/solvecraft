@@ -111,11 +111,31 @@ fn with_fallback(mut fonts: egui::FontDefinitions, name: &str, bytes: Vec<u8>) -
     Some(fonts)
 }
 
+/// Move `name` to the head of [`egui::FontFamily::Proportional`] so that ASCII characters
+/// (digits, units, labels) and CJK glyphs use the same face, keeping them on one baseline.
+fn promote_font_to_front(fonts: &mut egui::FontDefinitions, name: &str) {
+    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional)
+        && let Some(pos) = list.iter().position(|e| e == name)
+    {
+        let item = list.remove(pos);
+        list.insert(0, item);
+    }
+}
+
 /// Install font bytes as fallback for Proportional and Monospace font families.
+/// For a Japanese UI, promotes the font to the front of Proportional so digits and labels share one baseline.
 /// Returns true if the font was parsed and installed successfully.
 pub fn install_cjk_font(ctx: &egui::Context, bytes: Vec<u8>) -> bool {
+    install_cjk_font_for(ctx, bytes, "ja")
+}
+
+/// Install font bytes for `language`. For Japanese, promotes the font to the front of Proportional.
+pub fn install_cjk_font_for(ctx: &egui::Context, bytes: Vec<u8>, language: &str) -> bool {
     match with_cjk_fallback(egui::FontDefinitions::default(), bytes) {
-        Some(fonts) => {
+        Some(mut fonts) => {
+            if language == "ja" {
+                promote_font_to_front(&mut fonts, CJK_FALLBACK);
+            }
             ctx.set_fonts(fonts);
             true
         }
@@ -460,9 +480,16 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
 
     #[cfg(target_os = "macos")]
     {
-        let dirs = ["/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts"];
-        for d in dirs {
-            if let Some(bytes) = scan_dir_for_font(std::path::Path::new(d), 2, is_cjk_font_name) {
+        let mut dirs = vec![
+            std::path::PathBuf::from("/System/Library/Fonts"),
+            std::path::PathBuf::from("/System/Library/Fonts/Supplemental"),
+            std::path::PathBuf::from("/Library/Fonts"),
+        ];
+        if let Ok(home) = std::env::var("HOME") {
+            dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
+        }
+        for d in &dirs {
+            if let Some(bytes) = scan_dir_for_font(d, 2, is_cjk_font_name) {
                 return Some(bytes);
             }
         }
@@ -519,7 +546,8 @@ pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
     if let Some(font) = self::ui_font(ui_font) {
         fonts = with_ui_font(fonts, font);
     }
-    for name in fallback_order(language) {
+    let order = fallback_order(language);
+    for name in order {
         let bytes = match name {
             CJK_FALLBACK => cjk.clone(),
             CHINESE_FALLBACK => chinese.clone(),
@@ -534,6 +562,15 @@ pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
         }
     }
     if found {
+        if needs_cjk_font(language) && ui_font.trim().is_empty() {
+            // For a CJK UI (Japanese, Chinese, Korean) without a custom interface font,
+            // promote the primary CJK font to the front of FontFamily::Proportional.
+            // This ensures that ASCII characters (digits, units, English words) within mixed
+            // labels (e.g. "4 個選択中", "2 mm") are drawn with the same font face as the
+            // CJK glyphs, sharing identical line height, ascender, and baseline (#1070 follow-up).
+            let primary = order[0];
+            promote_font_to_front(&mut fonts, primary);
+        }
         ctx.set_fonts(fonts);
     }
 }
@@ -666,6 +703,33 @@ mod tests {
     }
 
     #[test]
+    fn cjk_ui_promotes_primary_cjk_font_to_front_for_consistent_baseline() {
+        let defaults = egui::FontDefinitions::default();
+        let mut fonts = with_cjk_fallback(defaults.clone(), latin_font_bytes()).unwrap();
+        promote_font_to_front(&mut fonts, CJK_FALLBACK);
+        let prop = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(prop.first().map(String::as_str), Some(CJK_FALLBACK), "CJK font is promoted to first so digits and CJK share one baseline");
+        assert!(prop.contains(&defaults.families[&egui::FontFamily::Proportional][0]), "Latin font remains in the fallback chain");
+    }
+
+    #[test]
+    fn install_cjk_font_for_promotes_only_for_japanese() {
+        let ctx = egui::Context::default();
+        assert!(install_cjk_font_for(&ctx, latin_font_bytes(), "ja"));
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let fonts = ctx.fonts(|f| f.definitions().clone());
+        let prop = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(prop.first().map(String::as_str), Some(CJK_FALLBACK));
+
+        let ctx_zh = egui::Context::default();
+        assert!(install_cjk_font_for(&ctx_zh, latin_font_bytes(), "zh"));
+        ctx_zh.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let fonts_zh = ctx_zh.fonts(|f| f.definitions().clone());
+        let prop_zh = &fonts_zh.families[&egui::FontFamily::Proportional];
+        assert_ne!(prop_zh.first().map(String::as_str), Some(CJK_FALLBACK));
+    }
+
+    #[test]
     fn hangul_font_falls_back_after_the_cjk_font() {
         let defaults = egui::FontDefinitions::default();
         let cjk = with_cjk_fallback(defaults.clone(), latin_font_bytes()).unwrap();
@@ -755,10 +819,11 @@ mod tests {
         let ctx = egui::Context::default();
         let run = |text: &'static str| {
             let mut seen = false;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.label(text);
                 seen = painted_cjk(ui.ctx());
             });
+            out.textures_delta.clear();
             seen
         };
         assert!(!run("Untitled"));
