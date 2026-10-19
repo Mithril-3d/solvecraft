@@ -508,8 +508,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut hovered = None;
     let mut picked = None;
     let w = crate::context_menu::LIST_W - 10.0;
+    // Title, rows up to the scroll height, margins and border.
+    let size = vec2(w + 10.0, 30.0 + (p.rows.len() as f32 * 24.0).min(360.0));
     let resp = crate::frame::area(egui::Id::new("sc_select_other"))
-        .fixed_pos(p.at + vec2(12.0, 12.0))
+        .fixed_pos(crate::context_menu::place(p.at, vec2(12.0, 12.0), size, ctx.content_rect()))
         .constrain(true)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {

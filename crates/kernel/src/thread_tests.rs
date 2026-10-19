@@ -44,3 +44,21 @@ fn faceted_cut_into_a_bore() {
     let want = 4.0 * PI * 0.2 * (1.5f64.powi(2) - 1.23f64.powi(2));
     assert!((removed - want).abs() < 0.03 * want, "{removed} vs {want}");
 }
+
+/// #1250: a long thread (48 turns of an M8 groove on a 60 mm shaft). The groove's facets come in
+/// sweep order; taken as BSP splitters in that order they made the tree as deep as the facet
+/// list ("planar boolean: tree too deep", after minutes and gigabytes). It cuts now, closed.
+#[test]
+fn a_long_thread_cuts_without_a_deep_tree() {
+    let (r, len, p) = (4.0, 60.0, 1.25);
+    let shaft = cylinder(Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0), r, len).unwrap();
+    let k = Vec3::new(0.0, 0.0, 1.0);
+    let base = Vec3::new(0.0, 0.0, -p);
+    let plane = Plane { origin: base, x: Vec3::new(1.0, 0.0, 0.0), y: k };
+    let section = [Vec2::new(3.3, -0.08), Vec2::new(4.1, -0.5), Vec2::new(4.1, 0.5), Vec2::new(3.3, 0.08)];
+    let groove = sweep_helix_mesh(&plane, &section, base, k, p, len / p + 2.0, 48).unwrap();
+    let cut = faceted_boolean(&shaft, &groove, BoolOp::Cut, p * 0.005).unwrap().unwrap();
+    let v = cut.tessellate(0.01).unwrap().measure().volume;
+    let v0 = PI * r * r * len;
+    assert!(v < v0 * 0.95 && v > v0 * 0.6, "{v} of {v0}");
+}

@@ -47,7 +47,18 @@ for ((attempt=0; attempt<300; attempt++)); do
   sleep .1
 done
 test "$ready" = 1
-for request in "{\"id\":1,\"method\":\"ui.inspect\",\"params\":{},\"token\":\"$SOLIDCRAFT_CONTROL_TOKEN\"}" '{"id":2,"method":"engine.execute","params":{"command":"solid.box","params":{"length":30,"width":20,"height":10}}}' '{"id":3,"method":"document.inspect","params":{"measure":true}}'; do
+# The control port opens before the first frame, so ui.inspect has no viewport yet; poll until it does.
+inspect="{\"id\":1,\"method\":\"ui.inspect\",\"params\":{},\"token\":\"$SOLIDCRAFT_CONTROL_TOKEN\"}"
+deadline=$((SECONDS + 60))
+until printf '%s\n' "$inspect" >&3 && IFS= read -r -t 30 reply <&3 && [[ "$reply" =~ \"viewport\":\ *\[ ]]; do
+  if ! kill -0 "$app" 2>/dev/null || ((SECONDS >= deadline)); then
+    echo "viewport never appeared: ${reply:-no reply}" >&2
+    exit 1
+  fi
+  sleep .25
+done
+printf '%s\n' "$reply"
+for request in '{"id":2,"method":"engine.execute","params":{"command":"solid.box","params":{"length":30,"width":20,"height":10}}}' '{"id":3,"method":"document.inspect","params":{"measure":true}}'; do
   printf '%s\n' "$request" >&3
   IFS= read -r -t 30 reply <&3
   printf '%s\n' "$reply"

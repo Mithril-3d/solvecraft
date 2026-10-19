@@ -8,6 +8,9 @@ mod topology;
 mod volume;
 
 pub use collision::Collision;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use collision::test_hooks as collision_test_hooks;
 pub use in_out_judge::IncludingPointInDomain;
 pub use point_cloud::WithPointCloud;
 pub use splitting::ExperimentalSplitters;

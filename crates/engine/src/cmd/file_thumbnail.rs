@@ -4,6 +4,15 @@ use solidcraft_geom::Aabb3;
 use solidcraft_render::{Camera, Rgb, Scene, SceneMesh, StandardView};
 
 pub(super) fn saved(s: &Session) -> Option<Vec<u8>> {
+    let (scene, camera) = scene(s)?;
+    let [width, height] = solidcraft_io::THUMBNAIL_SIZE;
+    // Drawn by the renderer the host installed (the GPU); none installed, no thumbnail.
+    let renderer = crate::capture::installed()?;
+    crate::capture::png_with(Some(&*renderer), &scene, &camera, u32::try_from(width).ok()?, u32::try_from(height).ok()?).ok().map(|p| p.bytes)
+}
+
+/// What the thumbnail shows: the shown bodies' warm display meshes in their colours, iso, fitted.
+fn scene(s: &Session) -> Option<(Scene, Camera)> {
     if s.active_sketch.is_some() || !s.pending_moves.is_empty() || s.model.results.iter().any(|r| r.error.is_some()) {
         return None;
     }
@@ -38,76 +47,16 @@ pub(super) fn saved(s: &Session) -> Option<Vec<u8>> {
     camera.distance *= 0.7;
     scene.radius = (bounds.diagonal() * 0.5).max(camera.half_height()).max(10.);
     scene.background = Some((crate::view::colors::BG_TOP, crate::view::colors::BG_BOTTOM));
-    let [width, height] = solidcraft_io::THUMBNAIL_SIZE;
-    if !within_raster_budget(&scene, &camera, width, height) {
-        return None;
-    }
-    let image = solidcraft_render::render(&scene, &camera, width, height);
-    solidcraft_render::png(width, height, image.rgba)
-}
-
-// Bound overlapping-triangle work too, not only mesh size. The renderer uses
-// 2x supersampling; conservatively count each projected triangle's pixel box.
-fn within_raster_budget(scene: &Scene, camera: &Camera, width: usize, height: usize) -> bool {
-    let (w, h) = ((width * 2) as f64, (height * 2) as f64);
-    let matrix = camera.view_proj(w / h, scene.radius.max(1.));
-    let mut pixels = 0usize;
-    let mut colors = 0usize;
-    for entry in &scene.meshes {
-        colors = colors.saturating_add(entry.mesh.triangles.len().saturating_mul(entry.face_colors.len()));
-        if colors > 1_000_000 {
-            return false;
-        }
-        let mut projected = Vec::with_capacity(entry.mesh.positions.len());
-        for point in &entry.mesh.positions {
-            let q = matrix.apply(*point);
-            if q.iter().any(|x| !x.is_finite()) || q[3] <= 1e-9 {
-                return false;
-            }
-            let pixel = [(q[0] / q[3] + 1.) * 0.5 * w, (1. - q[1] / q[3]) * 0.5 * h];
-            if pixel.iter().any(|x| !x.is_finite()) {
-                return false;
-            }
-            projected.push(pixel);
-        }
-        for triangle in &entry.mesh.triangles {
-            let [Some(a), Some(b), Some(c)] = triangle.map(|i| projected.get(i as usize).copied()) else {
-                return false;
-            };
-            let dx = (a[0].max(b[0]).max(c[0]).ceil().clamp(0., w) - a[0].min(b[0]).min(c[0]).floor().clamp(0., w) + 2.) as usize;
-            let dy = (a[1].max(b[1]).max(c[1]).ceil().clamp(0., h) - a[1].min(b[1]).min(c[1]).floor().clamp(0., h) + 2.) as usize;
-            pixels = pixels.saturating_add(dx.saturating_mul(dy));
-            if pixels > 4_000_000 {
-                return false;
-            }
-        }
-    }
-    true
+    Some((scene, camera))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn portable_thumbnail_refuses_excessive_overdraw() {
-        let mut session = Session::default();
-        session.execute("solid.box", &serde_json::json!({"length":10,"width":20,"height":30})).unwrap();
-        let mesh = session.world_state().bodies[0].mesh();
-        let bounds = mesh.bounds();
-        let mut camera = Camera::default();
-        camera.set_view(StandardView::Iso);
-        camera.fit(&bounds);
-        let mut scene = Scene { radius: bounds.diagonal(), ..Scene::default() };
-        scene.meshes.push(SceneMesh { mesh: mesh.clone(), color: Rgb(100, 100, 100), face_colors: vec![] });
-        assert!(within_raster_budget(&scene, &camera, 240, 150));
-        let mut repeated = (*mesh).clone();
-        repeated.triangles = vec![repeated.triangles[0]; 100_000];
-        scene.meshes[0].mesh = std::sync::Arc::new(repeated);
-        assert!(!within_raster_budget(&scene, &camera, 240, 150));
-    }
 
     #[test]
     fn portable_thumbnail_preserves_saved_visibility() {
+        crate::capture::install_test_renderer();
         let mut session = Session::default();
         session.execute("solid.box", &serde_json::json!({"length":10,"width":20,"height":30,"body_name":"Visible"})).unwrap();
         session.execute("solid.box", &serde_json::json!({"length":100,"width":100,"height":100,"body_name":"Hidden"})).unwrap();
@@ -116,6 +65,7 @@ mod tests {
         for body in &world.bodies {
             body.mesh();
         }
+        assert_eq!(scene(&session).unwrap().0.meshes.len(), 1, "the hidden body is not in the picture");
         let expected = saved(&session).unwrap();
         let bytes = session.design_container(solidcraft_io::DesignCompression::Fast, false, true).unwrap();
         let doc = solidcraft_io::read_design(&bytes).unwrap();
@@ -131,6 +81,7 @@ mod tests {
 
     #[test]
     fn portable_thumbnail_never_forces_cold_evaluation_or_meshing() {
+        crate::capture::install_test_renderer();
         let mut session = Session::default();
         session.execute("solid.box", &serde_json::json!({"length":10,"width":20,"height":30})).unwrap();
         let world = session.world_state();
@@ -146,5 +97,18 @@ mod tests {
         assert_eq!(solidcraft_io::read_design(&bytes).unwrap(), *session.doc);
         let disabled = session.design_container(solidcraft_io::DesignCompression::Fast, false, false).unwrap();
         assert!(solidcraft_io::read_design_thumbnail(&disabled).is_none());
+    }
+
+    /// Without a renderer installed (a browser, a tool that draws nothing) a save has no
+    /// thumbnail and does not fail.
+    #[test]
+    fn without_a_renderer_a_save_has_no_thumbnail() {
+        let mut session = Session::default();
+        session.execute("solid.box", &serde_json::json!({"length":10,"width":20,"height":30})).unwrap();
+        for body in &session.world_state().bodies {
+            body.mesh();
+        }
+        let (scene, camera) = scene(&session).unwrap();
+        assert!(crate::capture::png_with(None, &scene, &camera, 240, 150).is_err());
     }
 }

@@ -2,7 +2,7 @@
 struct U {
     vp: mat4x4<f32>,
     back: vec4<f32>,   // xyz = toward the eye, w = 1 for linear output
-    screen: vec4<f32>, // viewport width, height (px), depth bias (see `biased_z`), silhouettes on (1)
+    screen: vec4<f32>, // viewport width, height (px), unused, silhouettes on (1)
     clip: vec4<f32>,   // section plane: normal, d (zero normal: no section)
     cap: vec4<f32>,    // colour of the inside of cut bodies
     ana: vec4<f32>,    // surface analysis: mode (1 zebra, 2 draft, 3 curvature), parameter
@@ -10,9 +10,26 @@ struct U {
     acc_u: vec4<f32>,  // accessibility map axes (xyz, offset)
     acc_v: vec4<f32>,
     eye: vec4<f32>,    // eye position, w = 1 for perspective (0: orthographic, looking along -back)
+    ao: vec4<f32>,     // radius in world units (zero: disabled)
+    // analysis colours (`theme::AnalysisColors`): draft positive, between, negative; reachable,
+    // blocked; curvature flat, middle, tight
+    ana_c: array<vec4<f32>, 8>,
+    ana_f: vec4<f32>,  // x = 1: stripe the negative draft and blocked faces
+    depth: vec4<f32>,  // x = 1: reversed depth (1 near, 0 far); y, z: the faces' push (`FACE_BIAS`)
 };
 
+fn reversed() -> bool {
+    return u.depth.x > 0.5;
+}
+
+/// Clip-space depth measured the usual way (0 at the near plane, w at the far one), whichever
+/// way the depth buffer runs.
+fn near_z(c: vec4<f32>) -> f32 {
+    return select(c.z, c.w - c.z, reversed());
+}
+
 @group(1) @binding(2) var acc_t: texture_2d<f32>;
+@group(2) @binding(0) var ao_depth: texture_depth_2d;
 
 fn clipped(p: vec3<f32>) -> bool {
     return length(u.clip.xyz) > 0.5 && dot(u.clip.xyz, p) > u.clip.w;
@@ -66,9 +83,20 @@ struct CutOut {
 @fragment
 fn fs_solid_cut(i: TOut, @builtin(front_facing) front: bool) -> CutOut {
     var o: CutOut;
+    // Derivatives (in `pushed`) first, before `solid` may discard.
+    o.depth = pushed(cap_depth(i.wp, i.pos.z));
     o.c = solid(i, front);
-    o.depth = cap_depth(i.wp, i.pos.z);
     return o;
+}
+
+/// A depth the shader writes itself, pushed back like the faces the GPU pushes (`FACE_BIAS`,
+/// which does not apply then): its own slope over `depth.z` pixels and `depth.y` depth steps.
+fn pushed(z: f32) -> f32 {
+    let slope = max(abs(dpdx(z)), abs(dpdy(z)));
+    // One step: 2⁻²⁴ in a 24-bit buffer; a float buffer's steps follow the value (2⁻²³ of it).
+    let step = select(1.0 / 16777216.0, abs(z) * 1.1920929e-7, reversed());
+    let push = slope * u.depth.z + step * u.depth.y;
+    return clamp(z - select(-push, push, reversed()), 0.0, 1.0);
 }
 
 /// Depth of the section plane on the view ray through `wp` (a far wall seen through the cut),
@@ -81,6 +109,7 @@ fn cap_depth(wp: vec3<f32>, z: f32) -> f32 {
     let p = wp + dir * ((u.clip.w - dot(u.clip.xyz, wp)) / dn);
     let c = u.vp * vec4<f32>(p, 1.0);
     if (c.w <= 0.0) { return z; }
+    if (reversed()) { return clamp(c.z / c.w, z, 1.0); }
     return clamp(c.z / c.w, 0.0, z);
 }
 
@@ -92,7 +121,7 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
     let fw = fwidth(ndv);
     if (clipped(i.wp)) { discard; }
     if (!front && length(u.clip.xyz) > 0.5) {
-        // The cut face in its body's colour (as Fusion's "from component"), tinted toward the
+        // The cut face in its body's colour ("from component" colouring), tinted toward the
         // cap colour so it reads as a cut, hatched at 45 degrees on screen.
         let base = mix(i.c.rgb, u.cap.rgb, 0.35);
         let h = fract((i.pos.x + i.pos.y) / 9.0);
@@ -101,7 +130,7 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
     if (u.ana.x > 0.5 && length(i.n) > 0.5) {
         return analysis(i, k);
     }
-    let c = shade(i);
+    let c = lit(i, occlusion(i));
     // Silhouettes (styles with edges): where a curved surface turns away from the eye, a line
     // about 1.5 px wide, on the visible surface only (depth-correct).
     if (u.screen.w > 0.5 && length(i.n) > 0.5 && fw > 1e-6) {
@@ -109,6 +138,59 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
         return vec4<f32>(mix(c.rgb, out_color(vec4<f32>(0.07, 0.08, 0.10, 1.0)).rgb, a), c.a);
     }
     return c;
+}
+
+// A single-sample opaque depth map, independent of the window's MSAA and its UI offsets.
+@fragment
+fn fs_ao_depth(i: TOut, @builtin(front_facing) front: bool) -> @builtin(frag_depth) f32 {
+    if (clipped(i.wp) || length(i.n) < 0.5) { discard; }
+    if (!front && length(u.clip.xyz) > 0.5) { return cap_depth(i.wp, i.pos.z); }
+    return i.pos.z;
+}
+
+// Deterministic cosine-weighted hemisphere samples. Projecting the sample and a point one
+// radius toward the eye supplies a depth range in both orthographic and perspective views;
+// distant foreground geometry cannot cast a dark halo onto a background surface.
+fn occlusion(i: TOut) -> f32 {
+    let radius = u.ao.x;
+    if (radius <= 0.0 || length(i.n) < 0.5) { return 1.0; }
+    var n = normalize(i.n);
+    if (dot(n, u.back.xyz) < 0.0) { n = -n; }
+    let axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.z) > 0.9);
+    let tangent = normalize(cross(axis, n));
+    let bitangent = cross(n, tangent);
+    let size = vec2<i32>(textureDimensions(ao_depth));
+    // The map is a 1 × 1 stand-in until a frame draws into it (the product preview draws no
+    // prepass): sampling it tells nothing, so leave the surface unoccluded.
+    if (size.x < 2 || size.y < 2) { return 1.0; }
+    // One comparison for both depth directions: depths read as 0 near / 1 far (mirrored when
+    // the buffer runs reversed). The map is cleared to its far plane either way, so a texel
+    // with nothing in it reads as 1 and the `d < 1.0` test below skips it.
+    let flip = reversed();
+    var blocked = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) {
+        let f = (f32(j) + 0.5) / 32.0;
+        let angle = f32(j) * 2.39996323;
+        let direction = tangent * (cos(angle) * sqrt(f)) + bitangent * (sin(angle) * sqrt(f)) + n * sqrt(1.0 - f);
+        let reach = radius * (0.2 + 0.8 * fract(f32(j) * 0.61803399 + 0.5));
+        let sample = i.wp + n * (radius * 0.025) + direction * reach;
+        let q = u.vp * vec4<f32>(sample, 1.0);
+        let near = u.vp * vec4<f32>(sample + u.back.xyz * radius, 1.0);
+        if (q.w <= 0.0 || near.w <= 0.0) { continue; }
+        let ndc = q.xyz / q.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (any(uv < vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || ndc.z < 0.0 || ndc.z > 1.0) { continue; }
+        let d0 = textureLoad(ao_depth, vec2<i32>(uv * vec2<f32>(size)), 0);
+        let zs = select(ndc.z, 1.0 - ndc.z, flip);
+        let zn = select(near.z / near.w, 1.0 - near.z / near.w, flip);
+        let d = select(d0, 1.0 - d0, flip);
+        let span = max(zs - zn, 1e-7);
+        let delta = (zs - d) / span;
+        if (d < 1.0 && delta > 0.005 && delta < 1.0) {
+            blocked = blocked + smoothstep(0.005, 0.15, delta) * (1.0 - smoothstep(0.5, 1.0, delta));
+        }
+    }
+    return 1.0 - 0.85 * blocked / 32.0;
 }
 
 /// How fast the normal turns across the pixel (per mm).
@@ -150,8 +232,8 @@ fn analysis(i: TOut, k: f32) -> vec4<f32> {
         // Slack of a pixel and a half, more on slopes (the map holds the pixel's highest point).
         let slack = u.ana.y * (1.0 + sqrt(max(1.0 - cn * cn, 0.0)) / max(cn, 0.05));
         let clear = dot(i.wp, d) >= top - slack;
-        var c = vec3<f32>(0.85, 0.22, 0.20);
-        if (facing && clear) { c = vec3<f32>(0.20, 0.75, 0.30); }
+        var c = u.ana_c[4].rgb;
+        if (facing && clear) { c = u.ana_c[3].rgb; } else { c = stripe(i, c); }
         return out_color(vec4<f32>(c * lit, 1.0));
     }
     if (u.ana.x > 3.5) {
@@ -171,16 +253,23 @@ fn analysis(i: TOut, k: f32) -> vec4<f32> {
     }
     if (u.ana.x < 2.5) {
         let a = degrees(asin(clamp(dot(normalize(i.n), normalize(u.pull.xyz)), -1.0, 1.0)));
-        var c = vec3<f32>(0.95, 0.80, 0.15);
-        if (a >= u.ana.y) { c = vec3<f32>(0.20, 0.75, 0.30); }
-        if (a <= -u.ana.y) { c = vec3<f32>(0.85, 0.22, 0.20); }
+        var c = u.ana_c[1].rgb;
+        if (a >= u.ana.y) { c = u.ana_c[0].rgb; }
+        if (a <= -u.ana.y) { c = stripe(i, u.ana_c[2].rgb); }
         return out_color(vec4<f32>(c * lit, 1.0));
     }
     // Curvature from how fast the normal turns across the pixel.
     let t = clamp(k * u.ana.y, 0.0, 1.0);
-    let c = select(mix(vec3<f32>(0.10, 0.80, 0.25), vec3<f32>(0.90, 0.15, 0.10), t * 2.0 - 1.0),
-                   mix(vec3<f32>(0.15, 0.35, 0.95), vec3<f32>(0.10, 0.80, 0.25), t * 2.0), t < 0.5);
+    let c = select(mix(u.ana_c[6].rgb, u.ana_c[7].rgb, t * 2.0 - 1.0), mix(u.ana_c[5].rgb, u.ana_c[6].rgb, t * 2.0), t < 0.5);
     return out_color(vec4<f32>(c * lit, 1.0));
+}
+
+/// A "bad" analysis face (negative draft, blocked): with the stripes on (colour vision modes), the
+/// section cap's 45 degree hatch over it, so colour is not the only cue.
+fn stripe(i: TOut, c: vec3<f32>) -> vec3<f32> {
+    if (u.ana_f.x < 0.5) { return c; }
+    let h = fract((i.pos.x + i.pos.y) / 9.0);
+    return select(c, c * 0.6, h < 0.22);
 }
 
 @fragment
@@ -189,7 +278,17 @@ fn fs_tri(i: TOut) -> @location(0) vec4<f32> {
     return shade(i);
 }
 
+/// Reference planes: shaded like `fs_tri`, but never cut by the section plane.
+@fragment
+fn fs_tri_all(i: TOut) -> @location(0) vec4<f32> {
+    return shade(i);
+}
+
 fn shade(i: TOut) -> vec4<f32> {
+    return lit(i, 1.0);
+}
+
+fn lit(i: TOut, visibility: f32) -> vec4<f32> {
     // A zero normal marks flat colour (selection fills, translucent planes).
     if (length(i.n) < 0.5) {
         return out_color(i.c);
@@ -202,32 +301,12 @@ fn shade(i: TOut) -> vec4<f32> {
     let fill = max(dot(n, v), 0.0);
     let h = normalize(key + v);
     let spec = pow(max(dot(n, h), 0.0), 40.0) * 0.25;
-    let k = 0.42 + 0.38 * diff + 0.25 * fill;
+    let k = 0.42 + 0.38 * diff + 0.25 * fill - (0.42 + 0.25 * fill) * (1.0 - visibility);
     return out_color(vec4<f32>(min(i.c.rgb * k + vec3<f32>(spec), vec3<f32>(1.0)), i.c.a));
 }
 
-/// Clip-space z of `p` (clipped to `c`) pulled `s` depth biases toward the eye (pushed away
-/// when negative). Orthographic depth is linear in distance, so the bias is a fixed step of it.
-/// Perspective depth is not: near the far plane a fixed step spans tens of millimetres (edges
-/// showed through walls), so the point moves toward the eye by a fraction of its distance.
-fn biased_z(p: vec3<f32>, c: vec4<f32>, s: f32) -> f32 {
-    if (u.eye.w > 0.5) {
-        let q = u.vp * vec4<f32>(mix(p, u.eye.xyz, u.screen.z * 8.0 * s), 1.0);
-        return q.z / max(q.w, 1e-6) * c.w;
-    }
-    return c.z - u.screen.z * s * c.w;
-}
-
-@vertex
-fn vs_ghost(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>) -> TOut {
-    var o: TOut;
-    o.pos = u.vp * vec4<f32>(p, 1.0);
-    o.pos.z = biased_z(p, o.pos, -4.0);
-    o.n = n;
-    o.c = c;
-    o.wp = p;
-    return o;
-}
+// Lines, decals and ghosts are drawn at their own depth: opaque faces are pushed back by their
+// slope instead (`FACE_BIAS`, #1434), so what lies on a face draws over it at any angle.
 
 struct LOut {
     @builtin(position) pos: vec4<f32>,
@@ -244,12 +323,14 @@ fn vs_line(@builtin(vertex_index) vi: u32, @location(0) a: vec3<f32>, @location(
     // An end behind the near plane (clip z < 0) has no screen point: its divide flips the
     // line or drops it whole (ground grid lines running past the eye at a low angle). Cut
     // the segment at the plane instead; clip space is linear in the world point.
-    if (ca.z < 0.0 && cb.z > 0.0) {
-        let k = ca.z / (ca.z - cb.z);
+    let za = near_z(ca);
+    let zb = near_z(cb);
+    if (za < 0.0 && zb > 0.0) {
+        let k = za / (za - zb);
         ca = mix(ca, cb, k);
         pa = mix(a, b, k);
-    } else if (cb.z < 0.0 && ca.z > 0.0) {
-        let k = cb.z / (cb.z - ca.z);
+    } else if (zb < 0.0 && za > 0.0) {
+        let k = zb / (zb - za);
         cb = mix(cb, ca, k);
         pb = mix(b, a, k);
     }
@@ -268,7 +349,7 @@ fn vs_line(@builtin(vertex_index) vi: u32, @location(0) a: vec3<f32>, @location(
     let base = select(ca, cb, t > 0.5);
     let off = nrm * s * w * 0.5 + dir * (t * 2.0 - 1.0) * w * 0.5;
     var o: LOut;
-    o.pos = vec4<f32>(base.xy + off / half * base.w, biased_z(select(pa, pb, t > 0.5), base, 1.0), base.w);
+    o.pos = vec4<f32>(base.xy + off / half * base.w, base.z, base.w);
     o.c = c;
     o.wp = select(pa, pb, t > 0.5);
     return o;
@@ -293,9 +374,8 @@ struct IOut {
 @vertex
 fn vs_img(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) a: f32) -> IOut {
     var o: IOut;
+    // On a face it shows over it: the face is pushed back (`FACE_BIAS`).
     o.pos = u.vp * vec4<f32>(p, 1.0);
-    // Pulled toward the eye like lines, so a decal on a face is not lost in it.
-    o.pos.z = biased_z(p, o.pos, 1.0);
     o.uv = uv;
     o.a = a;
     o.wp = p;

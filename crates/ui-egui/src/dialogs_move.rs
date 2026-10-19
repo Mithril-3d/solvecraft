@@ -288,8 +288,15 @@ pub fn drag(app: &SolveApp, d: &mut Dialog, g: Drag) {
 
 /// The dialog for editing a move: Free Move with its translation and, about a world axis
 /// through the origin, its angle (another axis is kept as it is).
-pub fn for_feature(d: &mut Dialog, bodies: &[String], translate: &[String; 3], axis: Option<Vec3>, angle: Option<&String>, copy: bool) {
-    let [x, y, z] = translate.clone();
+pub fn for_feature(
+    d: &mut Dialog,
+    bodies: &[String],
+    translate: &[solidcraft_engine::doc::Expr; 3],
+    axis: Option<Vec3>,
+    angle: Option<&solidcraft_engine::doc::Expr>,
+    copy: bool,
+) {
+    let [x, y, z] = translate.clone().map(String::from);
     let mut k = kind(FREE);
     if let Kind::Move { x: kx, y: ky, z: kz, rx, ry, rz, .. } = &mut k {
         (*kx, *ky, *kz) = (x, y, z);
@@ -297,9 +304,9 @@ pub fn for_feature(d: &mut Dialog, bodies: &[String], translate: &[String; 3], a
             let dir = axis.unwrap_or(Vec3::Z);
             let world = [Vec3::X, Vec3::Y, Vec3::Z].iter().position(|w| dir.cross(*w).len() < 1e-9 && dir.dot(*w) > 0.0);
             match world {
-                Some(0) => *rx = a.clone(),
-                Some(1) => *ry = a.clone(),
-                Some(_) => *rz = a.clone(),
+                Some(0) => *rx = a.to_string(),
+                Some(1) => *ry = a.to_string(),
+                Some(_) => *rz = a.to_string(),
                 None => {
                     d.extra.insert("axis".into(), json!([dir.x, dir.y, dir.z]));
                     d.extra.insert("angle".into(), json!(a));

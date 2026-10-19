@@ -1,0 +1,385 @@
+{
+  "format": "solidcraft/19",
+  "name": "Untitled",
+  "units": "mm",
+  "params": [],
+  "features": [
+    {
+      "id": 1,
+      "name": "Sketch1",
+      "suppressed": false,
+      "type": "sketch",
+      "plane": {
+        "type": "origin",
+        "name": "XY"
+      },
+      "sketch": {
+        "points": [
+          {
+            "id": "origin",
+            "pos": [
+              0.0,
+              0.0
+            ],
+            "fixed": true
+          },
+          {
+            "id": "p1",
+            "pos": [
+              0.0,
+              0.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p2",
+            "pos": [
+              80.0,
+              0.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p3",
+            "pos": [
+              80.0,
+              40.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p4",
+            "pos": [
+              0.0,
+              40.0
+            ],
+            "fixed": false
+          }
+        ],
+        "curves": [
+          {
+            "id": "l1",
+            "type": "line",
+            "a": 1,
+            "b": 2,
+            "construction": false
+          },
+          {
+            "id": "l2",
+            "type": "line",
+            "a": 2,
+            "b": 3,
+            "construction": false
+          },
+          {
+            "id": "l3",
+            "type": "line",
+            "a": 3,
+            "b": 4,
+            "construction": false
+          },
+          {
+            "id": "l4",
+            "type": "line",
+            "a": 4,
+            "b": 1,
+            "construction": false
+          }
+        ],
+        "constraints": [
+          {
+            "id": "k1",
+            "type": "horizontal",
+            "l": 0
+          },
+          {
+            "id": "k2",
+            "type": "horizontal",
+            "l": 2
+          },
+          {
+            "id": "k3",
+            "type": "vertical",
+            "l": 1
+          },
+          {
+            "id": "k4",
+            "type": "vertical",
+            "l": 3
+          },
+          {
+            "id": "k5",
+            "type": "coincident",
+            "p": 0,
+            "q": 1
+          }
+        ],
+        "counters": {
+          "k": 5,
+          "l": 4,
+          "p": 4
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Extrude1",
+      "suppressed": false,
+      "param_names": [
+        "d1"
+      ],
+      "type": "extrude",
+      "sketch": 1,
+      "profiles": {
+        "type": "all"
+      },
+      "extent": {
+        "distance": "20",
+        "direction": "positive"
+      },
+      "operation": "new_body"
+    },
+    {
+      "id": 3,
+      "name": "Sketch2",
+      "suppressed": false,
+      "type": "sketch",
+      "plane": {
+        "type": "custom",
+        "plane": {
+          "origin": [
+            0.0,
+            0.0,
+            20.0
+          ],
+          "x_dir": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "y_dir": [
+            0.0,
+            1.0,
+            0.0
+          ]
+        }
+      },
+      "sketch": {
+        "points": [
+          {
+            "id": "origin",
+            "pos": [
+              0.0,
+              0.0
+            ],
+            "fixed": true
+          },
+          {
+            "id": "p1",
+            "pos": [
+              10.0,
+              10.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p2",
+            "pos": [
+              30.0,
+              10.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p3",
+            "pos": [
+              30.0,
+              30.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "p4",
+            "pos": [
+              10.0,
+              30.0
+            ],
+            "fixed": false
+          },
+          {
+            "id": "c1.center",
+            "pos": [
+              55.0,
+              20.0
+            ],
+            "fixed": false
+          }
+        ],
+        "curves": [
+          {
+            "id": "l1",
+            "type": "line",
+            "a": 1,
+            "b": 2,
+            "construction": false
+          },
+          {
+            "id": "l2",
+            "type": "line",
+            "a": 2,
+            "b": 3,
+            "construction": false
+          },
+          {
+            "id": "l3",
+            "type": "line",
+            "a": 3,
+            "b": 4,
+            "construction": false
+          },
+          {
+            "id": "l4",
+            "type": "line",
+            "a": 4,
+            "b": 1,
+            "construction": false
+          },
+          {
+            "id": "c1",
+            "type": "circle",
+            "c": 5,
+            "r": 8.0,
+            "construction": false
+          }
+        ],
+        "constraints": [
+          {
+            "id": "k1",
+            "type": "horizontal",
+            "l": 0
+          },
+          {
+            "id": "k2",
+            "type": "horizontal",
+            "l": 2
+          },
+          {
+            "id": "k3",
+            "type": "vertical",
+            "l": 1
+          },
+          {
+            "id": "k4",
+            "type": "vertical",
+            "l": 3
+          }
+        ],
+        "counters": {
+          "c": 1,
+          "k": 4,
+          "l": 4,
+          "p": 4
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Extrude2",
+      "suppressed": false,
+      "param_names": [
+        "d2",
+        "d3"
+      ],
+      "type": "extrude",
+      "sketch": 3,
+      "profiles": {
+        "type": "all"
+      },
+      "extent": {
+        "distance": "10",
+        "direction": "positive",
+        "taper": "-5 deg"
+      },
+      "operation": "join"
+    },
+    {
+      "id": 5,
+      "name": "Fillet1",
+      "suppressed": false,
+      "param_names": [
+        "d4"
+      ],
+      "edge_refs": [
+        {
+          "dir": [
+            -0.08682659386424767,
+            -0.08682659386424767,
+            0.9924325091389671
+          ],
+          "min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "max": [
+            80.0,
+            40.0,
+            30.00000000052501
+          ]
+        }
+      ],
+      "edge_names": [
+        "F4:side:l2|F4:side:l3"
+      ],
+      "type": "fillet",
+      "edges": [
+        [
+          29.56255668237038,
+          29.56255668237038,
+          25.0
+        ]
+      ],
+      "radius": "1"
+    },
+    {
+      "id": 6,
+      "name": "Fillet2",
+      "suppressed": false,
+      "param_names": [
+        "d5"
+      ],
+      "edge_refs": [
+        {
+          "dir": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "max": [
+            80.0,
+            40.0,
+            30.00000000247808
+          ]
+        }
+      ],
+      "edge_names": [
+        "F4:side:c1#1|F4:top#[F4:side:c1]"
+      ],
+      "type": "fillet",
+      "edges": [
+        [
+          62.12511336474076,
+          20.0,
+          30.0
+        ]
+      ],
+      "radius": "0.5"
+    }
+  ],
+  "next_id": 7
+}

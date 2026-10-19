@@ -1,0 +1,14 @@
+[
+  {"note": "#1630: a rectangle or a circle draws by press, drag and release as well as by two clicks: the press places the first point, the release the second."},
+  {"start": "sketch.create"},
+  {"click": {"plane": "XY"}},
+  {"start": "sketch.rectangle.two_point"},
+  {"drag": [{"sketch": [10, 10]}, {"sketch": [40, 30]}], "steps": 8},
+  {"expect": {"query": {"command": "sketch.inspect", "path": ["curves", 3, "construction"], "value": false}}},
+  {"expect": {"query": {"command": "sketch.inspect", "path": ["curves", 4], "value": null}}},
+  {"key": "Escape"},
+  {"start": "sketch.circle.center"},
+  {"drag": [{"sketch": [-30, 10]}, {"sketch": [-20, 10]}], "steps": 8},
+  {"expect": {"query": {"command": "sketch.inspect", "path": ["curves", 4, "construction"], "value": false}}},
+  {"expect": {"query": {"command": "sketch.inspect", "path": ["curves", 5], "value": null}}}
+]

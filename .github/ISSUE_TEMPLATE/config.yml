@@ -1,0 +1,7 @@
+# Blank issues stay on: the app's Report an Issue opens issues/new?title=…&body=… with the report
+# filled in (crates/ui-egui/src/issue_report.rs), which GitHub drops when blank issues are off.
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and chat
+    url: https://discord.gg/FtU4NQNVDH
+    about: Ask questions and talk with users and contributors on the SolidCraft Discord.

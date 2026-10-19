@@ -27,13 +27,21 @@ pub struct OffsetRoleFlags {
     pub centerline: bool,
     pub reversed: bool,
     pub fixed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub infinite: bool,
 }
 impl OffsetRoleFlags {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
     fn of(curve: &Curve) -> Self {
-        Self { construction: curve.construction, centerline: curve.centerline, reversed: curve.reversed, fixed: curve.fixed }
+        Self {
+            construction: curve.construction,
+            centerline: curve.centerline,
+            reversed: curve.reversed,
+            fixed: curve.fixed,
+            infinite: curve.infinite,
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -614,6 +622,7 @@ impl Sketch {
                     link: None,
                     centerline: false,
                     fixed: false,
+                    infinite: false,
                 });
                 outputs.push(output);
             }
@@ -767,6 +776,7 @@ impl Sketch {
                         link: None,
                         centerline: role.flags.centerline,
                         fixed: role.flags.fixed,
+                        infinite: role.flags.infinite,
                     });
                 }
                 outputs.push(role.output.clone());

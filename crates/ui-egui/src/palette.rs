@@ -15,16 +15,22 @@ pub struct Palette {
     focus: bool,
 }
 
-/// Commands whose id or label matches the query.
+/// Commands whose id or label matches the query: (id, label in the current language, icon).
+/// The label matches in the current language and in English, so a name typed in either finds
+/// the command.
 pub fn matches(q: &str) -> Vec<(&'static str, &'static str, &'static str)> {
-    let q = q.trim().to_ascii_lowercase();
-    let mut v: Vec<(&'static str, &'static str, &'static str)> = command_specs()
+    let q = q.trim().to_lowercase();
+    let mut v: Vec<(bool, bool, &'static str, &'static str, &'static str)> = command_specs()
         .into_iter()
-        .filter(|c| q.is_empty() || c.label.to_ascii_lowercase().contains(&q) || c.id.to_ascii_lowercase().contains(&q))
-        .map(|c| (c.id, c.label, c.icon))
+        .filter_map(|c| {
+            let label = crate::i18n::tr_label(c.label);
+            let (shown, english, id) = (label.to_lowercase(), c.label.to_lowercase(), c.id.to_lowercase());
+            let found = q.is_empty() || shown.contains(&q) || english.contains(&q) || id.contains(&q);
+            found.then(|| (!(shown.starts_with(&q) || english.starts_with(&q)), !id.starts_with(&q), label, c.id, c.icon))
+        })
         .collect();
-    v.sort_by_key(|(id, label, _)| (!label.to_ascii_lowercase().starts_with(&q), !id.to_ascii_lowercase().starts_with(&q), *label));
-    v
+    v.sort();
+    v.into_iter().map(|(_, _, label, id, icon)| (id, label, icon)).collect()
 }
 
 /// Execute a line of palette input.
@@ -134,5 +140,21 @@ pub fn popup(app: &mut SolveApp, ctx: &egui::Context) {
     } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.ui.palette_open = false;
         app.palette.text.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The command line finds a name typed in the current language or in English (#2544).
+    #[test]
+    fn matches_finds_a_name_in_the_current_language_and_in_english() {
+        let _ja = crate::i18n::scope("ja");
+        let name = crate::i18n::Locale::for_language("ja").text("cmd.sketch_rectangle_center");
+        for query in [name, "Center Rectangle", "sketch.rectangle.center"] {
+            let found = matches(query);
+            assert_eq!(found.first().map(|m| (m.0, m.1)), Some(("sketch.rectangle.center", name)), "{query:?}");
+        }
     }
 }

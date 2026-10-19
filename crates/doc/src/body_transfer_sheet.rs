@@ -32,7 +32,7 @@ pub(crate) fn remap_sheet_metadata(st: &mut ModelState, names: &[String], transf
         .filter(|(_, t)| names.contains(t.body.as_str()))
         .map(|(i, t)| {
             let point = apply_point(transform, t.axis_point);
-            let axis = apply_vector(transform, t.axis).normalized().ok_or_else(|| DocError::Invalid("invalid transferred thread axis".into()))?;
+            let axis = apply_vector(transform, *t.axis).unit().ok_or_else(|| DocError::Invalid("invalid transferred thread axis".into()))?;
             if !point.is_finite() {
                 return Err(DocError::Invalid("invalid transferred thread placement".into()));
             }

@@ -16,12 +16,12 @@ use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("material.create", "New Physical Material", create).icon("material").params(
-        "name (not a built-in material's); density_g_cm3: (0, 1000]; appearance?: library name (appearance.library) | color?: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1): the look bodies of this material get without an appearance of their own. Assign it with material.assign",
+        "name (not a built-in material's); density_g_cm3: (0, 1000]; appearance?: library name (appearance.library) | color?: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1), pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (opaque only, needs color/appearance): the default look. Optical edits do not change density. Assign it with material.assign",
     ),
     CommandSpec::new("material.edit", "Edit Physical Material", edit).icon("material").enabled(has_user_materials).params(
-        "material: a material defined in this design; name? (bodies and configuration cells follow); density_g_cm3?; appearance? | color?, opacity? (as material.create; color: null clears the look)",
+        "material: a material defined in this design; name? (bodies and configuration cells follow); density_g_cm3?; appearance? | color?, opacity?, pbr? (as material.create; color: null clears the look). Omitted appearance/color retains the entire current look",
     ),
-    CommandSpec::new("material.delete", "Delete Physical Material", delete).enabled(has_user_materials).params(
+    CommandSpec::new("material.delete", "Delete Physical Material", delete).icon("delete").enabled(has_user_materials).params(
         "material: a material defined in this design; replace?: material for the bodies and configuration cells that use it (without it, a material in use is refused)",
     ),
 ];
@@ -60,6 +60,9 @@ fn density(cmd: &str, p: &Value) -> Result<f64> {
 /// The look `appearance` / `color` / `opacity` give: `None` when none is given, `Some(None)`
 /// to clear it (`color: null`).
 fn look(cmd: &str, p: &Value, material: &str) -> Result<Option<Option<Look>>> {
+    if p.get("pbr").is_some() && str_(p, "appearance").is_none() && p.get("color").is_none_or(Value::is_null) {
+        return Err(bad(cmd, "`pbr` requires an appearance or color"));
+    }
     let opacity = match p.get("opacity") {
         Some(o) => Some(o.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x)).ok_or_else(|| bad(cmd, "`opacity` must be 0…1"))?),
         None => None,
@@ -79,6 +82,7 @@ fn look(cmd: &str, p: &Value, material: &str) -> Result<Option<Option<Look>>> {
     if let Some(o) = opacity {
         l.opacity = o;
     }
+    super::inspect::attach_pbr(cmd, p, &mut l)?;
     Ok(Some(Some(l)))
 }
 

@@ -113,7 +113,7 @@
   "click": {
    "sketch": [
     50,
-    -10
+    10
    ]
   }
  },
@@ -139,7 +139,10 @@
   "start": "solid.extrude"
  },
  {
-  "text": "20"
+  "note": "The iso view sees the XZ sketch from behind (its normal is +Y), so the extrude comes toward the camera (-Y). -20 takes it back along +Y, where the joint below expects it."
+ },
+ {
+  "text": "-20"
  },
  {
   "key": "Enter"

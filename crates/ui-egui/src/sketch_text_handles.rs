@@ -245,10 +245,13 @@ pub(crate) fn drag_to(app: &mut SolveApp, proj: &Proj, pos: Pos2, shift: bool) {
     let Some(d) = DRAG.with(|d| d.borrow().clone()) else { return };
     let Some(to) = on_plane(app, proj, pos) else { return };
     let Some((at, height, angle)) = follow(&d, to, shift) else { return };
-    let mut params = json!({"link": d.start.link, "at": [at.x, at.y], "height": height, "live": true});
-    // A resize keeps the exact saved angle.
+    let mut params = json!({"link": d.start.link, "at": [at.x, at.y], "live": true});
+    // A resize keeps the exact saved angle; a rotation keeps the height (and the expression
+    // behind it, if it has one).
     if d.grab == Grab::Rotate {
         params["angle"] = json!(angle.to_degrees());
+    } else {
+        params["height"] = json!(height);
     }
     if app.session.execute("sketch.edit_text", &params).is_ok() {
         app.session.undo.truncate(d.depth + 1);
@@ -447,6 +450,41 @@ mod tests {
         assert_eq!(h.app.session.undo.len(), before.1 + 1);
         h.app.run("edit.undo", json!({})).unwrap();
         assert_eq!(h.app.session.doc.to_json(), before.0);
+    }
+
+    #[test]
+    fn turning_a_text_keeps_the_expression_of_its_height_and_resizing_replaces_it() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.run("parameters.add", json!({"name":"tall","expression":"10 mm"})).unwrap();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let result = h.app.run("sketch.text", json!({"text":"II","at":[0,0],"height":"tall"})).unwrap();
+        let link = result["link"].as_str().unwrap().to_owned();
+        h.call("ui.view", json!({"view":"top"}));
+        h.app.cam.distance = 60.0;
+        h.app.session.selection = vec![Sel::SketchCurve { id: result["curves"][0].as_str().unwrap().into() }];
+        h.frames(3);
+        let height_expr = |h: &Harness| {
+            let sk = h.app.session.doc.sketch(h.app.session.active_sketch.unwrap()).unwrap();
+            let LinkSource::Text { exprs, .. } = &sk.link(&link).unwrap().source else { panic!("text") };
+            exprs.height.clone()
+        };
+        assert_eq!(height_expr(&h).as_deref(), Some("tall"));
+        let f = frame(&h.app, &link).unwrap();
+        let center = f.to_sketch(f.center());
+        let to = center + rotate(Vec2::new(0.0, 15.0), 40_f64.to_radians());
+        h.step(&json!({"drag":[{"handle":"text_rotate"},{"sketch":[to.x,to.y]}],"steps":6})).unwrap();
+        h.frames(2);
+        let (_, height, angle) = source(&h, &link);
+        assert!(angle.abs() > 0.5 && height == 10.0, "turned: {angle} {height}");
+        assert_eq!(height_expr(&h).as_deref(), Some("tall"), "turning leaves the height alone");
+        let f = frame(&h.app, &link).unwrap();
+        let pivot = f.to_sketch(f.min);
+        let target = pivot + (f.to_sketch(f.max) - pivot) * 2.0;
+        h.step(&json!({"drag":[{"handle":"text_corner_2"},{"sketch":[target.x,target.y]}],"steps":6})).unwrap();
+        h.frames(2);
+        assert!((source(&h, &link).1 - 20.0).abs() < 0.5);
+        assert_eq!(height_expr(&h), None, "a height set by hand is a number");
     }
 
     #[test]

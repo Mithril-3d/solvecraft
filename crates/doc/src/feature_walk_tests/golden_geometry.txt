@@ -1,0 +1,190 @@
+body_transfer
+sketch
+  moves: plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2]
+sketch_along_path
+  moves: plane.path.at[0], plane.path.at[1], plane.path.at[2]
+extrude
+  moves: extent.from[0], extent.from[1], extent.from[2], extent.to[0], extent.to[1], extent.to[2]
+  face points: [1, 1.5, 1.25], [2, 2.5, 2.25]
+  profiles: 1 all
+extrude_thin
+revolve
+  moves: axis.dir[0], axis.dir[1], axis.dir[2], axis.origin[0], axis.origin[1], axis.origin[2], to[0], to[1], to[2]
+  face points: [3, 3.5, 3.25]
+  profiles: 1 all
+fillet_constant
+  moves: edges[0][0], edges[0][1], edges[0][2]
+fillet_chord
+  moves: edges[0][0], edges[0][1], edges[0][2]
+fillet_curvature
+  moves: edges[0][0], edges[0][1], edges[0][2]
+fillet_variable
+  moves: edges[0][0], edges[0][1], edges[0][2], style.start[0], style.start[1], style.start[2]
+fillet_spline
+  moves: edges[0][0], edges[0][1], edges[0][2], style.start[0], style.start[1], style.start[2]
+chamfer
+  moves: edges[0][0], edges[0][1], edges[0][2]
+box
+  moves: corner[0], corner[1], corner[2]
+  placement: box.x, box.y, box.z
+cylinder
+  moves: axis[0], axis[2], base[0], base[1], base[2]
+  placement: cyl.x, cyl.y, cyl.z
+sphere
+  moves: center[0], center[1], center[2]
+  placement: sph.x, sph.y, sph.z
+torus
+  moves: center[0], center[1], center[2]
+  placement: tor.x, tor.y, tor.z
+combine
+pattern_rectangular
+  moves: pattern.dir1[0], pattern.dir1[1], pattern.dir2[1], pattern.dir2[2]
+pattern_circular
+  moves: pattern.axis[0], pattern.axis[2], pattern.origin[0], pattern.origin[1], pattern.origin[2]
+pattern_path
+mirror
+  moves: plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2]
+hole_simple
+  moves: direction[0], direction[2], position[0], position[1], position[2], to[0], to[1], to[2]
+  face points: [0, 0, 0], [4, 4.5, 4.25]
+hole_drilled
+  moves: direction[0], direction[2], position[0], position[1], position[2], to[0], to[1], to[2]
+  face points: [4, 4.5, 4.25]
+hole_counterbore
+  moves: direction[0], direction[2], position[0], position[1], position[2], to[0], to[1], to[2]
+  face points: [4, 4.5, 4.25]
+hole_countersink
+  moves: direction[0], direction[2], position[0], position[1], position[2], to[0], to[1], to[2]
+  face points: [4, 4.5, 4.25]
+thread
+  moves: face[0], face[1], face[2]
+  face points: [0, 0, 0]
+loft
+  profiles: 4 all, 5 all
+sweep
+  profiles: 1 all
+sweep_options
+  moves: orientation.direction[1], orientation.direction[2]
+  profiles: 1 all
+shell
+  moves: faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+draft
+  moves: faces[0][0], faces[0][1], faces[0][2], neutral.axis_dir[0], neutral.axis_dir[1], neutral.axis_origin[0], neutral.axis_origin[1], neutral.axis_origin[2], pull[0], pull[2]
+  face points: [0, 0, 0]
+construction_plane
+  moves: plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2]
+split
+  moves: plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2], tool.point[0], tool.point[1], tool.point[2]
+split_line
+  moves: plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2]
+construction_axis
+  moves: def.a.plane.axis_dir[0], def.a.plane.axis_dir[1], def.a.plane.axis_origin[0], def.a.plane.axis_origin[1], def.a.plane.axis_origin[2], def.b.plane.axis_dir[0], def.b.plane.axis_dir[1], def.b.plane.axis_origin[0], def.b.plane.axis_origin[1], def.b.plane.axis_origin[2]
+construction_point_planes
+  moves: def.a.plane.axis_dir[0], def.a.plane.axis_dir[1], def.a.plane.axis_origin[0], def.a.plane.axis_origin[1], def.a.plane.axis_origin[2], def.b.plane.axis_dir[0], def.b.plane.axis_dir[1], def.b.plane.axis_origin[0], def.b.plane.axis_origin[1], def.b.plane.axis_origin[2], def.c.plane.axis_dir[0], def.c.plane.axis_dir[1], def.c.plane.axis_origin[0], def.c.plane.axis_origin[1], def.c.plane.axis_origin[2]
+construction_point_along
+  moves: def.path.at[0], def.path.at[1], def.path.at[2]
+split_face
+  moves: faces[0][0], faces[0][1], faces[0][2], plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2], tool.point[0], tool.point[1], tool.point[2]
+  face points: [0, 0, 0]
+scale
+  moves: origin[0], origin[1], origin[2]
+offset_face
+  moves: faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+delete_face
+  moves: faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+bounding_solid
+pipe
+emboss
+  face points: [5, 5.5, 5.25]
+  profiles: 1 all
+rib
+replace_face
+  moves: faces[0][0], faces[0][1], faces[0][2], target.axis_dir[0], target.axis_dir[1], target.axis_origin[0], target.axis_origin[1], target.axis_origin[2]
+  face points: [0, 0, 0]
+align
+  moves: from[0], from[1], from[2], from_normal[0], from_normal[2], to[0], to[1], to[2], to_normal[0], to_normal[1]
+coil
+  moves: axis[0], axis[2], base[0], base[1], base[2]
+  placement: coil.x, coil.y, coil.z
+sheet_base
+  profiles: 1 all
+sheet_contour
+sheet_flange
+  moves: edges[0].point[0], edges[0].point[1], edges[0].point[2], edges[1].point[0], edges[1].point[1], edges[1].point[2]
+sheet_hem
+  moves: edges[0][0], edges[0][1], edges[0][2]
+sheet_perforate
+sheet_fold
+  moves: a[0], a[1], a[2], b[1], b[2], fixed[0], fixed[1], fixed[2]
+sheet_unfold
+sheet_convert
+  moves: bends[0][0], bends[0][1], bends[0][2], face[0], face[1], face[2]
+  face points: [0, 0, 0]
+boss
+  moves: direction[0], direction[2], position[0], position[1], position[2]
+  face points: [0, 0, 0]
+lip
+  moves: face[0], face[1], face[2]
+snap_fit
+  moves: direction[0], direction[2], hook[0], hook[1], position[0], position[1], position[2]
+  face points: [0, 0, 0]
+rest
+  moves: along[0], along[1], along[2], direction[0], direction[2], position[0], position[1], position[2]
+  face points: [0, 0, 0]
+boundary_fill
+  moves: cells[0][0], cells[0][1], cells[0][2]
+remove
+patch
+  profiles: 8 all
+stitch
+thicken
+surface_extrude
+  moves: extent.from[0], extent.from[1], extent.from[2], extent.to[0], extent.to[1], extent.to[2]
+  face points: [1, 1.5, 1.25], [2, 2.5, 2.25]
+surface_revolve
+  moves: axis.dir[0], axis.dir[1], axis.dir[2], axis.origin[0], axis.origin[1], axis.origin[2]
+surface_sweep
+surface_sweep_options
+surface_loft
+surface_blend
+  moves: align[0][0], align[0][1], align[0][2], align[1][0], align[1][1], align[1][2], from.edges[0][0], from.edges[0][1], from.edges[0][2], to.edges[0][0], to.edges[0][1], to.edges[0][2]
+surface_offset
+  moves: faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+surface_blend
+  moves: align[0][0], align[0][1], align[0][2], align[1][0], align[1][1], align[1][2], from.edges[0][0], from.edges[0][1], from.edges[0][2], to.edges[0][0], to.edges[0][1], to.edges[0][2]
+surface_boundary
+surface_network
+  moves: u[1].edges[0][0], u[1].edges[0][1], u[1].edges[0][2], v[1].point[0], v[1].point[1], v[1].point[2]
+surface_match
+  moves: edges[0][0], edges[0][1], edges[0][2], faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+surface_fair
+  moves: faces[0][0], faces[0][1], faces[0][2]
+  face points: [0, 0, 0]
+unstitch
+  moves: faces[0][0], faces[0][1], faces[0][2]
+reverse_normal
+  moves: faces[0][0], faces[0][1], faces[0][2]
+surface_untrim
+  moves: face.point[0], face.point[1], face.point[2], holes[0][0], holes[0][1], holes[0][2]
+  face points: [0, 0, 0]
+surface_extend
+  moves: edges[0][0], edges[0][1], edges[0][2]
+surface_extend_to_plane
+  moves: edges[0][0], edges[0][1], edges[0][2], up_to.plane.axis_dir[0], up_to.plane.axis_dir[1], up_to.plane.axis_origin[0], up_to.plane.axis_origin[1], up_to.plane.axis_origin[2]
+surface_extend_to_face
+  moves: edges[0][0], edges[0][1], edges[0][2], up_to.face.point[0], up_to.face.point[1], up_to.face.point[2]
+surface_ruled
+  moves: direction[0], direction[2], edges[0][0], edges[0][1], edges[0][2], face[1], face[2]
+  face points: [1, 0, 0]
+surface_trim
+  moves: keep[0], keep[1], keep[2], plane.axis_dir[0], plane.axis_dir[1], plane.axis_origin[0], plane.axis_origin[1], plane.axis_origin[2], tool.point[0], tool.point[1], tool.point[2]
+move
+  moves: rotate_axis[1], rotate_axis[2]
+import
+mesh_convert
+mesh_import

@@ -1,0 +1,177 @@
+//! Windows: the resize border of the window without OS decorations (#1381).
+//!
+//! The window keeps its native thick frame (`WS_THICKFRAME`, so Aero Snap, Win+arrows and the
+//! OS's own move and size loops work) but winit draws no frame: its `WM_NCCALCSIZE` makes the
+//! whole window client area, and every point then hit-tests as `HTCLIENT`. This module puts the
+//! resize border back by answering `WM_NCHITTEST` itself: within Windows' resize-border width
+//! for the window's current DPI from each edge (`solidcraft_ui_egui::titlebar::resize_hit`;
+//! 8 px at 100 %, corners win), it returns `HTLEFT`, `HTTOPRIGHT`, … So from the first message
+//! the OS shows its resize cursors and runs its own resize, whatever egui has laid out, whatever
+//! the scale; nothing waits for a first frame or a first size change.
+//!
+//! It also answers `WM_GETDPISCALEDSIZE` with the size the window will really have at the new
+//! DPI (the same logical size, as winit computes it), so the rect Windows suggests while the
+//! title bar is dragged onto a monitor with another scale is the rect winit then applies: the
+//! window rescales once at the crossing and stays under the pointer, instead of the OS's move
+//! loop and winit disagreeing about a frame the window doesn't have.
+//!
+//! Replacing a window procedure has no safe API, hence the `unsafe_code` allowance on this
+//! module (the app crate denies it; see `native_crash.rs` and `open_documents.rs` for the others).
+//! The procedure is installed once, on the thread that owns the window, for the main window only,
+//! and calls the previous one (winit's) for everything it doesn't answer.
+#![allow(unsafe_code)]
+
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use solidcraft_ui_egui::titlebar;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CallWindowProcW, GWL_STYLE, GWLP_WNDPROC, GetClientRect, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsZoomed, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SetWindowLongPtrW, WM_GETDPISCALEDSIZE,
+    WM_NCDESTROY, WM_NCHITTEST, WNDPROC, WS_THICKFRAME,
+};
+
+/// The window procedure ours replaced (winit's), as an address; 0 before [`install`].
+static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
+
+/// Answer the main window's hit test and DPI-size questions from now on. Call it once, on the
+/// thread that created the window (eframe's app creator). `false` if it isn't a Win32 window.
+pub fn install(window: &impl HasWindowHandle) -> bool {
+    let Ok(handle) = window.window_handle() else { return false };
+    let RawWindowHandle::Win32(w) = handle.as_raw() else { return false };
+    let hwnd = w.hwnd.get() as HWND;
+    if PREVIOUS.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+    // SAFETY: `hwnd` is the live window eframe just created on this thread; `frame_proc` has the
+    // WNDPROC signature and stays valid for the life of the process. SetWindowLongPtrW returns
+    // the previous procedure, which `frame_proc` calls for every other message.
+    let previous = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, frame_proc as *const () as isize as _) };
+    // `as _`: on 32-bit Windows SetWindowLongPtrW is SetWindowLongW, which takes and
+    // returns i32.
+    if previous == 0 {
+        return false;
+    }
+    PREVIOUS.store(previous as _, Ordering::SeqCst);
+    true
+}
+
+/// The procedure ours replaced.
+fn previous() -> WNDPROC {
+    let p = PREVIOUS.load(Ordering::SeqCst);
+    // SAFETY: a nonzero value is the WNDPROC that SetWindowLongPtrW returned in `install`.
+    (p != 0).then(|| unsafe { std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(p) })
+}
+
+unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let prev = previous();
+    // SAFETY: the arguments are the message as Windows delivered it to this window.
+    let call_previous = || unsafe { CallWindowProcW(prev, hwnd, msg, wparam, lparam) };
+    match msg {
+        WM_NCHITTEST => {
+            let default = call_previous();
+            // Screen coordinates, signed (monitors left of or above the primary one).
+            let (x, y) = (i32::from(lparam as u16 as i16), i32::from((lparam >> 16) as u16 as i16));
+            // The border, else what winit and the system say (`HTCLIENT` everywhere else).
+            border_hit(hwnd, x, y).map_or(default, |hit| hit as LRESULT)
+        }
+        WM_GETDPISCALEDSIZE => {
+            let new_dpi = wparam as u32;
+            // SAFETY: for this message lParam points to a SIZE the system reads back.
+            match (resizable(hwnd), client_size(hwnd), unsafe { (lparam as *mut SIZE).as_mut() }) {
+                (true, Some(size), Some(out)) => {
+                    // SAFETY: a window handle the system passed in.
+                    let old_dpi = unsafe { GetDpiForWindow(hwnd) };
+                    match titlebar::dpi_scaled_size(size, old_dpi, new_dpi) {
+                        Some((cx, cy)) => {
+                            *out = SIZE { cx, cy };
+                            1
+                        }
+                        None => call_previous(),
+                    }
+                }
+                _ => call_previous(),
+            }
+        }
+        WM_NCDESTROY => {
+            // Hand the window back to winit's procedure for its last message.
+            if prev.is_some() {
+                // SAFETY: restores the procedure this window had before `install`.
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, PREVIOUS.load(Ordering::SeqCst) as _) };
+            }
+            call_previous()
+        }
+        _ => call_previous(),
+    }
+}
+
+/// The window can be resized by its border now: it has the thick frame (not fullscreen, which
+/// drops it) and is neither maximized nor minimized.
+fn resizable(hwnd: HWND) -> bool {
+    // SAFETY: plain queries on a window handle the system passed in.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        style & WS_THICKFRAME != 0 && IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0
+    }
+}
+
+/// The client area's size in pixels (the whole window: winit gives it no frame).
+fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: `r` is a valid RECT to fill.
+    (unsafe { GetClientRect(hwnd, &mut r) } != 0).then_some((r.right - r.left, r.bottom - r.top))
+}
+
+/// Windows' resize border at the window's DPI: the sizing frame plus its padding, as Windows
+/// itself sizes it, or 8 px scaled when the system has no answer.
+fn border_px(hwnd: HWND) -> f32 {
+    // SAFETY: plain queries.
+    let (dpi, metric) = unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        (dpi, GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi))
+    };
+    let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+    if metric > 0 { metric as f32 } else { titlebar::resize_border_px(scale) }
+}
+
+/// The `HT*` resize code at screen point (`x`, `y`), if it is on the border.
+fn border_hit(hwnd: HWND, x: i32, y: i32) -> Option<u32> {
+    if !resizable(hwnd) {
+        return None;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: `r` is a valid RECT to fill.
+    if unsafe { GetWindowRect(hwnd, &mut r) } == 0 {
+        return None;
+    }
+    let w = egui::Rect::from_min_max(egui::pos2(r.left as f32, r.top as f32), egui::pos2(r.right as f32, r.bottom as f32));
+    titlebar::resize_hit(w, egui::pos2(x as f32, y as f32), border_px(hwnd)).map(hit_code)
+}
+
+fn hit_code(d: egui::ResizeDirection) -> u32 {
+    use egui::ResizeDirection::*;
+    match d {
+        North => HTTOP,
+        South => HTBOTTOM,
+        West => HTLEFT,
+        East => HTRIGHT,
+        NorthWest => HTTOPLEFT,
+        NorthEast => HTTOPRIGHT,
+        SouthWest => HTBOTTOMLEFT,
+        SouthEast => HTBOTTOMRIGHT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_direction_has_its_own_hit_code() {
+        use egui::ResizeDirection::*;
+        let codes: Vec<u32> = [North, South, West, East, NorthWest, NorthEast, SouthWest, SouthEast].into_iter().map(hit_code).collect();
+        assert_eq!(codes, vec![HTTOP, HTBOTTOM, HTLEFT, HTRIGHT, HTTOPLEFT, HTTOPRIGHT, HTBOTTOMLEFT, HTBOTTOMRIGHT]);
+    }
+}

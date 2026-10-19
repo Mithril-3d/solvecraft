@@ -609,3 +609,71 @@ fn a_rectangle_put_onto_a_projected_edge_stays_a_closed_profile() {
     let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
     assert!((volume(&reopened, "Pad") - 3000.0).abs() < 1e-6, "{}", volume(&reopened, "Pad"));
 }
+
+/// A face with letters cut into it, extruded as a cut: its edges come into the face's sketch
+/// as the letters' exact curves (a font's quadratics and cubics), not fitted to the mesh, so the
+/// tool's walls lie on the letters' walls and the cut takes what the same region picked in the
+/// sketch takes (#1360). Fitted to the mesh (684 lines, 31 arcs and 18 splines here), they lay
+/// a few hundredths off the letters' walls, and the boolean found no result.
+#[test]
+fn a_face_engraved_with_text_projects_its_letters_exactly_and_extrudes() {
+    let volume = |s: &mut Session| run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    let engraved = || {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane":"XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[105,26]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance":40}));
+        run(&mut s, "sketch.create", json!({"plane":{"face":[50,13,40]}}));
+        run(&mut s, "sketch.text", json!({"text":"textvraiment tres long","at":[3,9],"height":6.5}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance":-1,"operation":"cut"}));
+        s
+    };
+    // The face round the letters, drawn in a sketch in its plane.
+    let mut drawn = engraved();
+    let before = volume(&mut drawn);
+    run(&mut drawn, "sketch.create", json!({"plane":"XY","offset":40}));
+    run(&mut drawn, "sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[105,26]}));
+    run(&mut drawn, "sketch.text", json!({"text":"textvraiment tres long","at":[3,9],"height":6.5}));
+    run(&mut drawn, "sketch.finish", json!({}));
+    run(&mut drawn, "solid.extrude", json!({"distance":-3.5,"operation":"cut","profiles":[{"point":[1,1]}]}));
+    let taken = before - volume(&mut drawn);
+    assert!(taken > 0.0, "{taken}");
+    // The engraved face itself, extruded as a cut.
+    let mut s = engraved();
+    let id = run(&mut s, "solid.extrude", json!({"distance":-3.5,"operation":"cut","face":[1,1,40]}))["feature"].as_u64().unwrap();
+    let r = s.model.result(id).unwrap();
+    assert!(r.error.is_none(), "{r:?}");
+    let face = before - volume(&mut s);
+    assert!((face - taken).abs() < 1e-6 * before, "{face} {taken}");
+    // Its sketch got the letters as Bézier pieces.
+    let st = s.model.state();
+    let sketch = &st.sketches.last().unwrap().sketch;
+    let pieces =
+        sketch.curves.iter().filter(|c| c.link.is_some() && matches!(c.kind, solidcraft_sketch::CurveKind::Spline { control: true, .. })).count();
+    assert!(pieces > 100, "{pieces}");
+}
+
+/// A design saved before free-form edges came in exactly, by the build before it: an "S" cut
+/// 1 mm into a 30 × 20 × 10 block, then a sketch on that face (its edges projected, the letter's
+/// fitted to the mesh as 72 lines, 9 arcs and 2 splines) with a circle cut 3 mm. On reopening, the
+/// face's link is laid out again with the letter's exact pieces, and the part builds the same.
+#[test]
+fn a_face_sketch_saved_with_fitted_letters_reopens_and_builds_the_same() {
+    let text = include_str!("../../../../tests/projection/before-1508/engraved_face_sketched.json");
+    let mut s = Session::new(solidcraft_doc::Document::from_json(text).unwrap());
+    let volume = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    for name in ["Extrude2", "Sketch3", "Extrude3"] {
+        let id = s.doc.find_feature(name).unwrap().id;
+        let r = s.model.result(id).unwrap();
+        assert!(r.error.is_none(), "{name}: {:?}", r.error);
+    }
+    // The build that saved it measured 5916.018831 mm³.
+    assert!((volume - 5916.018830904924).abs() < 1e-3, "{volume}");
+    let st = s.model.state();
+    let sketch = &st.sketches.last().unwrap().sketch;
+    let pieces =
+        sketch.curves.iter().filter(|c| c.link.is_some() && matches!(c.kind, solidcraft_sketch::CurveKind::Spline { control: true, .. })).count();
+    assert!(pieces > 0, "{pieces}");
+}

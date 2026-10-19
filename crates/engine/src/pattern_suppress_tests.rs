@@ -121,7 +121,7 @@ fn enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen
         let FeatureKind::Extrude { sketch, profiles, .. } = &feature.kind else {
             panic!("lip extrusion");
         };
-        let solved = state.sketch(*sketch).unwrap();
+        let solved = state.sketch(sketch.0).unwrap();
         assert!((solved.plane.origin.z - 30.).abs() < 1e-8);
         let inner = &solved.sketch.offsets[1];
         assert_eq!(inner.outputs.len(), 4);

@@ -19,6 +19,7 @@ use crate::{DocError, Document, IDENTITY, Mat, Result, apply_point, apply_vector
 #[path = "sheet_convert.rs"]
 mod convert;
 pub use convert::{bend_edge_names, convert_body};
+pub(crate) use convert::{outline_loop, round_wall};
 
 // Bound the aggregate geometry, including sampled curves and intermediate clipping pieces.
 // These are work limits, never geometry truncation: a larger input returns a useful error.
@@ -30,6 +31,8 @@ const MAX_FLAT_POINTS: usize = 16_384;
 const MAX_FLAT_SAMPLES: usize = 65_536;
 const MAX_FLAT_PIECES: usize = 4096;
 const MAX_FLAT_WORK: usize = 500_000_000;
+/// Pieces of flat material sharing less area than this (mm²) only touch.
+const TOUCH_AREA: f64 = 1e-6;
 
 /// Starts the warning a fold gives when its `fixed` point touches no material: a recompute keeps
 /// the side the point lies on, and the `sheet.fold` command refuses such a point (#263).
@@ -287,7 +290,7 @@ fn rule_hem_gap() -> String {
 }
 
 impl SheetRule {
-    /// Fusion's default: Steel (mm), 2.5 mm, K 0.44, bend radius = Thickness.
+    /// Default: Steel (mm), 2.5 mm, K 0.44, bend radius = Thickness.
     pub fn steel() -> SheetRule {
         SheetRule {
             name: "Steel (mm)".into(),
@@ -356,6 +359,15 @@ impl ReliefShape {
             ReliefShape::Tear => "tear",
         }
     }
+}
+
+/// The corner relief an edge flange feature asks for in place of the rule's. A value left out
+/// follows the rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReliefOverride {
+    pub shape: Option<ReliefShape>,
+    /// How far across the relief is (mm).
+    pub size: Option<f64>,
 }
 
 /// A rule's values (mm, unit-less K).
@@ -446,6 +458,10 @@ pub struct SheetFlange {
     /// instead of a rectangle `leg` long.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<Vec<Vec2>>,
+    /// A converted face's panel as drawn: `shape` with arcs where the face's edges are round
+    /// (flat coordinates, counter-clockwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Loop2>,
     /// Which feature made it: `F<feature>.<k>` (persistent edge names).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
@@ -482,6 +498,15 @@ pub struct SheetBody {
     /// pattern both carry it (#560). Derived from feature history, like `pockets`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bores: Vec<SheetBore>,
+    /// Perforation fields (#732), flat coordinates; their holes are computed on demand and never cut into the B-rep.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub perforations: Vec<SheetPerforation>,
+    /// Regions (flat coordinates) that text cut or machined, letters with their counters as
+    /// holes: a record of where the sheet's text went, so that its DXF can write the letters on
+    /// layers of their own (see [`SheetBody::letters`]). The cut-outs and pockets themselves are
+    /// in `holes` and `pockets`. Derived from feature history, like `pockets`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<Region2>,
     /// Unfolded.
     pub flat: bool,
     /// Gap between flanges that meet at a corner.
@@ -507,6 +532,16 @@ pub struct SheetBore {
     pub axis: Vec3,
     pub radius: f64,
     pub height: f64,
+}
+
+/// A perforation field from a `sheet.perforate` feature (#732).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SheetPerforation {
+    pub feature: u64,
+    pub diameter: f64,
+    pub pitch: f64,
+    pub margin: f64,
+    pub square: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -543,14 +578,22 @@ fn rev_edge(e: EdgeSpec) -> EdgeSpec {
     e.reversed()
 }
 
-/// Largest distance between a folded bend edge and the cubic chain standing in for it.
+/// Largest distance between a folded bend edge and the chain standing in for it.
 const BEND_CHAIN_TOL: f64 = 1e-7;
-/// Most halvings of a bend edge's parameter while fitting its chain.
-const BEND_CHAIN_DEPTH: usize = 10;
+/// Degree of the pieces of a folded bend edge's chain. Hermite pieces of degree 7 match the
+/// edge's point and first three derivatives at both ends, so one or two of them follow a helix
+/// round a whole bend, where cubic pieces (point and tangent) took 32 and more.
+const BEND_CHAIN_DEGREE: usize = 7;
+/// Most pieces of a folded bend edge's chain.
+const BEND_CHAIN_PIECES: usize = 256;
 
-fn cubic_at(p0: Vec3, c1: Vec3, c2: Vec3, p1: Vec3, t: f64) -> Vec3 {
-    let u = 1.0 - t;
-    p0 * (u * u * u) + c1 * (3.0 * u * u * t) + c2 * (3.0 * u * t * t) + p1 * (t * t * t)
+/// The point at `t` of the Bézier over `c` (de Casteljau).
+fn bezier_at(c: &[Vec3], t: f64) -> Vec3 {
+    let mut w = c.to_vec();
+    while w.len() > 1 {
+        w = w.windows(2).map(|p| p[0].lerp(p[1], t)).collect();
+    }
+    w.first().copied().unwrap_or(Vec3::ZERO)
 }
 
 fn dedup(p: &[Vec2]) -> Vec<Vec2> {
@@ -829,6 +872,9 @@ impl SheetBody {
 
     /// Flat region of a flange's panel.
     pub fn panel(&self, f: &SheetFlange) -> Region2 {
+        if let Some(lp) = &f.exact {
+            return Region2 { outer: lp.ccw(), holes: Vec::new() };
+        }
         if let Some(sh) = &f.shape {
             return Region2 { outer: Loop2::polygon(sh).ccw(), holes: Vec::new() };
         }
@@ -935,8 +981,10 @@ impl SheetBody {
     }
 
     /// A flat point of flange `f`'s bend zone folded onto the bend at height `z` (not clamped
-    /// to the zone), with its rates of change along the zone's flat `n` and `d` directions.
-    fn zone_point(&self, f: &SheetFlange, q: Vec2, z: f64) -> (Vec3, Vec3, Vec3) {
+    /// to the zone), with its first three derivatives along the zone's flat `n` direction and
+    /// its first along `d` (along `d` the bend is straight: the higher ones are zero, and so are
+    /// the mixed ones).
+    fn zone_point(&self, f: &SheetFlange, q: Vec2, z: f64) -> (Vec3, [Vec3; 3], Vec3) {
         let s = (q - f.p).dot(f.n);
         let u = (q - f.p).dot(f.d);
         let neutral = (f.radius + self.k * self.t).max(1e-12);
@@ -949,58 +997,91 @@ impl SheetBody {
         let (sn, cs) = phi.sin_cos();
         let w = self.world(f.parent);
         let local = axis_o + v3(f.d) * u + ez * cs + ek * sn;
+        // Each derivative along n turns the last a right angle about the axis and divides it by
+        // the neutral radius.
         let ds = (ez * -sn + ek * cs) * (1.0 / neutral);
-        (apply_point(&w, local), apply_vector(&w, ds), apply_vector(&w, v3(f.d)))
+        let dss = (ez * cs + ek * sn) * (-1.0 / (neutral * neutral));
+        let dsss = ds * (-1.0 / (neutral * neutral));
+        let along_n = [ds, dss, dsss].map(|v| apply_vector(&w, v));
+        (apply_point(&w, local), along_n, apply_vector(&w, v3(f.d)))
     }
 
     /// A flat edge of flange `f`'s bend zone, folded at height `z`, at parameter `t`: the point
-    /// and its derivative.
-    fn zone_edge_at(&self, f: &SheetFlange, e: &Seg2, z: f64, t: f64) -> (Vec3, Vec3) {
-        let (p, ds, du) = self.zone_point(f, e.point_at(t), z);
-        let dq = e.derivative(t);
-        (p, ds * dq.dot(f.n) + du * dq.dot(f.d))
+    /// and its first three derivatives.
+    fn zone_edge_at(&self, f: &SheetFlange, e: &Seg2, z: f64, t: f64) -> [Vec3; 4] {
+        let (p, [g1, g2, g3], du) = self.zone_point(f, e.point_at(t), z);
+        let [q1, q2, q3] = match e.derivatives(t, 3).as_deref() {
+            Some(&[q1, q2, q3]) => [q1, q2, q3],
+            _ => [e.derivative(t), Vec2::ZERO, Vec2::ZERO],
+        };
+        let ([s1, s2, s3], [u1, u2, u3]) = ([q1, q2, q3].map(|q| q.dot(f.n)), [q1, q2, q3].map(|q| q.dot(f.d)));
+        // The chain rule (Faà di Bruno) through s(t) along n and u(t) along d.
+        [p, g1 * s1 + du * u1, g2 * (s1 * s1) + g1 * s2 + du * u2, g3 * (s1 * s1 * s1) + g2 * (3.0 * s1 * s2) + g1 * s3 + du * u3]
     }
 
-    /// Where to break a bend zone's flat edge so cubic Hermite pieces follow the folded edge
-    /// to within [`BEND_CHAIN_TOL`] on both faces. The breaks depend on the flat edge only, so
-    /// the top face, bottom face and wall of a cut-out share one chain per height.
-    fn zone_breaks(&self, f: &SheetFlange, e: &Seg2) -> Vec<f64> {
-        let mut out = vec![0.0];
-        let mut todo = vec![(0.0, 1.0, 0usize)];
-        while let Some((t0, t1, depth)) = todo.pop() {
-            let fits = depth >= BEND_CHAIN_DEPTH
-                || [0.0, self.t].iter().all(|&z| {
-                    let h = t1 - t0;
-                    let ((p0, d0), (p1, d1)) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
-                    let (c1, c2) = (p0 + d0 * (h / 3.0), p1 - d1 * (h / 3.0));
-                    [0.25, 0.5, 0.75].iter().all(|&x| cubic_at(p0, c1, c2, p1, x).dist(self.zone_edge_at(f, e, z, t0 + h * x).0) <= BEND_CHAIN_TOL)
-                });
-            if fits {
-                out.push(t1);
-            } else {
-                let m = (t0 + t1) / 2.0;
-                // Depth first, right half last on the stack: breaks come out in order.
-                todo.push((m, t1, depth + 1));
-                todo.push((t0, m, depth + 1));
+    /// The control points of the Hermite piece of degree 7 of a folded bend edge from `t0` to
+    /// `t1`: it has the edge's point and first three derivatives at both ends. (The k-th
+    /// derivative of a Bézier of degree 7 at its start is 7!/(7 − k)! times the k-th forward
+    /// difference of its first control points, and the edge's k-th derivative scales by
+    /// (t1 − t0)^k to the piece's parameter; at its end the same, backwards.)
+    fn zone_piece(&self, f: &SheetFlange, e: &Seg2, z: f64, t0: f64, t1: f64) -> [Vec3; BEND_CHAIN_DEGREE + 1] {
+        let h = t1 - t0;
+        let ([p0, a1, a2, a3], [p1, b1, b2, b3]) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
+        let (k1, k2, k3) = (h / 7.0, h * h / 42.0, h * h * h / 210.0);
+        [
+            p0,
+            p0 + a1 * k1,
+            p0 + a1 * (2.0 * k1) + a2 * k2,
+            p0 + a1 * (3.0 * k1) + a2 * (3.0 * k2) + a3 * k3,
+            p1 - b1 * (3.0 * k1) + b2 * (3.0 * k2) - b3 * k3,
+            p1 - b1 * (2.0 * k1) + b2 * k2,
+            p1 - b1 * k1,
+            p1,
+        ]
+    }
+
+    /// Into how many equal pieces (of its parameter) a bend zone's flat edge is folded, so that
+    /// the Hermite pieces are within [`BEND_CHAIN_TOL`] of the folded edge on both faces. The
+    /// count depends on the flat edge only, so the top face, bottom face and wall of a cut-out
+    /// share one chain per height; and as the pieces are equal, the chain's parameter runs evenly
+    /// with the edge's, and the pieces join with equal derivatives up to the third.
+    fn zone_pieces(&self, f: &SheetFlange, e: &Seg2) -> usize {
+        // The largest distance between the pieces and the folded edge, at points inside each.
+        let worst = |n: usize| {
+            let mut worst = 0.0f64;
+            for k in 0..n {
+                let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+                for z in [0.0, self.t] {
+                    let c = self.zone_piece(f, e, z, t0, t1);
+                    for j in 1..8 {
+                        let t = t0 + (t1 - t0) * j as f64 / 8.0;
+                        worst = worst.max(bezier_at(&c, j as f64 / 8.0).dist(self.zone_edge_at(f, e, z, t)[0]));
+                    }
+                }
             }
+            worst
+        };
+        let mut n = 1;
+        loop {
+            let off = worst(n);
+            if off <= BEND_CHAIN_TOL || !off.is_finite() || n >= BEND_CHAIN_PIECES {
+                return n;
+            }
+            // The distance falls as the eighth power of the pieces' length.
+            let guess = (n as f64 * (off / BEND_CHAIN_TOL).powf(1.0 / 8.0)).ceil();
+            n = (guess as usize).clamp(n + 1, BEND_CHAIN_PIECES);
         }
-        out
     }
 
-    /// A bend zone's flat edge folded at height `z`: a chain of cubic Hermite pieces.
+    /// A bend zone's flat edge folded at height `z`: a chain of Hermite pieces of degree 7.
     fn zone_chain(&self, f: &SheetFlange, e: &Seg2, z: f64) -> EdgeSpec {
-        let breaks = self.zone_breaks(f, e);
-        let mut ctrl = Vec::with_capacity(breaks.len() * 3);
-        for w in breaks.windows(2) {
-            let (t0, t1) = (w[0], w[1]);
-            let h = t1 - t0;
-            let ((p0, d0), (p1, d1)) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
-            if ctrl.is_empty() {
-                ctrl.push(p0);
-            }
-            ctrl.extend([p0 + d0 * (h / 3.0), p1 - d1 * (h / 3.0), p1]);
+        let n = self.zone_pieces(f, e);
+        let mut ctrl = Vec::with_capacity(BEND_CHAIN_DEGREE * n + 1);
+        for k in 0..n {
+            let c = self.zone_piece(f, e, z, k as f64 / n as f64, (k + 1) as f64 / n as f64);
+            ctrl.extend_from_slice(if k == 0 { &c } else { &c[1..] });
         }
-        EdgeSpec::Chain { ctrl: ctrl.into() }
+        EdgeSpec::Chain { degree: BEND_CHAIN_DEGREE, ctrl: ctrl.into() }
     }
 
     /// A flat edge of a piece as a 3D edge at height `z`.
@@ -1058,17 +1139,38 @@ impl SheetBody {
             cuts.push(fitted_region(&pocket)?);
         }
         let cuts = material_union(cuts, work)?;
+        let cut_boxes = cuts.iter().map(|c| loop_box(&c.outer)).collect::<Result<Vec<_>>>()?;
         let mut out = Vec::new();
         let mut points = 0usize;
         for (piece, region) in pieces {
             let panel = fitted_region(&planar_region(&region)?)?;
-            let material = if cuts.is_empty() { vec![panel] } else { material_boolean(&[panel], &cuts, kernel::BoolOp::Cut, work)? };
+            // Each piece meets only the cut-outs near it: arranging every cut-out of the sheet (a
+            // label's letters on its base) against each flange and bend zone too would charge the
+            // budget for all of them once per piece.
+            let (lo, hi) = loop_box(&panel.outer)?;
+            let near: Vec<Region2> = cuts
+                .iter()
+                .zip(&cut_boxes)
+                .filter(|(_, (a, b))| a.x <= hi.x && b.x >= lo.x && a.y <= hi.y && b.y >= lo.y)
+                .map(|(c, _)| c.clone())
+                .collect();
+            let material = if near.is_empty() { vec![panel] } else { material_boolean(&[panel], &near, kernel::BoolOp::Cut, work)? };
             for region in material {
                 points = points.saturating_add(region_complexity(std::slice::from_ref(&region))?.1);
                 if points > MAX_FLAT_POINTS || out.len() >= MAX_FLAT_PIECES {
                     return Err(flat_budget_error());
                 }
-                out.push(Cell { piece, outer: region.outer.segs, holes: region.holes.into_iter().map(|l| l.segs).collect() });
+                // A piece shorter than the model's tolerance is no edge: a cut-out's corner a hair
+                // beside a bend line comes out of the booleans as corners a hair apart, on the
+                // panel and on the bend, joined by such an edge or by a loop of them on its own.
+                // The sew welds the corners left on either side.
+                let hairless = |l: Loop2| -> Vec<Seg2> { l.segs.into_iter().filter(|e| e.length() >= LINEAR_TOL).collect() };
+                let outer = hairless(region.outer);
+                if outer.is_empty() {
+                    continue;
+                }
+                let holes = region.holes.into_iter().map(hairless).filter(|h| !h.is_empty()).collect();
+                out.push(Cell { piece, outer, holes });
             }
         }
         Ok(out)
@@ -1251,7 +1353,7 @@ impl SheetBody {
         // origin. Fitting planes after a distant component transfer loses precision.
         let mut local = self.clone();
         local.frame = Plane::XY;
-        let body = kernel::sew(&local.faces(&cells, 0.0, self.t, &mut work)?)?;
+        let body = kernel::sew_touching(&local.faces(&cells, 0.0, self.t, &mut work)?)?;
         let body = local.machine_pockets(body, &mut work)?;
         let body = local.machine_bores(body, &mut work)?;
         self.place_local_solid(body)
@@ -1421,7 +1523,7 @@ impl SheetBody {
                 })?;
                 kernel::extrude_planar_regions(&self.frame, &[region], 0.0, self.t)?
             } else {
-                kernel::sew(&self.faces(std::slice::from_ref(&cell), 0.0, self.t, &mut work)?)?
+                kernel::sew_touching(&self.faces(std::slice::from_ref(&cell), 0.0, self.t, &mut work)?)?
             };
             if kernel::boolean(&solid, &drill, kernel::BoolOp::Intersect)?.is_none() {
                 continue;
@@ -1454,6 +1556,9 @@ impl SheetBody {
     }
 
     fn machine_pockets(&self, mut body: Body, work: &mut FlatWork) -> Result<Body> {
+        if self.pockets.is_empty() {
+            return Ok(body);
+        }
         if self.pockets.len() > 1000 {
             return Err(flat_budget_error());
         }
@@ -1525,7 +1630,7 @@ impl SheetBody {
                 Piece::Panel(pi) => apply_vector(&self.world(pi), Vec3::Z).cross(plane.normal()).len() > 1e-6,
             })
             .collect();
-        cells.iter().map(|c| Ok(kernel::sew(&self.faces(std::slice::from_ref(c), 0.0, self.t, &mut work)?)?)).collect()
+        cells.iter().map(|c| Ok(kernel::sew_touching(&self.faces(std::slice::from_ref(c), 0.0, self.t, &mut work)?)?)).collect()
     }
 
     fn through_pocket_regions(&self, work: &mut FlatWork) -> Result<Vec<Region2>> {
@@ -1567,6 +1672,26 @@ impl SheetBody {
             }
         }
         Ok(through.unwrap_or_default())
+    }
+
+    /// The text the sheet carries: what [`SheetBody::labels`] records, ready to tell whether a
+    /// loop of the flat pattern is a letter.
+    pub fn letters(&self) -> Letters {
+        let regions = self
+            .labels
+            .iter()
+            .map(|r| {
+                let (mut lo, mut hi) = (Vec2::new(f64::MAX, f64::MAX), Vec2::new(f64::MIN, f64::MIN));
+                for p in r.outer.polyline(1e-3) {
+                    lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
+                    hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
+                }
+                // A polyline of 0.001 mm chords is within 0.001 mm of the curve.
+                let pad = Vec2::new(0.01, 0.01);
+                (lo - pad, hi + pad, std::iter::once(&r.outer).chain(&r.holes).flat_map(|lp| lp.segs.iter().copied()).collect())
+            })
+            .collect();
+        Letters { regions }
     }
 
     /// Pocket operations clipped to the surviving flat material, with exact depth intervals.
@@ -1639,6 +1764,84 @@ impl SheetBody {
         let regions = if cuts.is_empty() { regions } else { material_boolean(&regions, &cuts, kernel::BoolOp::Cut, &mut work)? };
         Ok(regions)
     }
+
+    /// The pieces of flat material that a cut parted from the base: `after` is this sheet's
+    /// [`Self::flat_material`] after the cut, `before` the sheet before it. A piece is parted when
+    /// it holds none of the base panel, lies in a piece that held some before the cut, and no
+    /// other piece surrounds it: a flange cut off along its bend (with any flange on it), the
+    /// part of a ring's inside that lies on a flange's edge, the tip of a flange beyond a cut
+    /// through a closed corner. A ring's island and a letter's counter, inside other material,
+    /// are not counted; nor are pieces an earlier cut parted, nor anything once no piece holds
+    /// the base.
+    pub(crate) fn parted_from_base(&self, after: &[Region2], before: &SheetBody) -> Result<Vec<Region2>> {
+        if after.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let mut work = FlatWork::new();
+        work.charge(after.len().saturating_mul(after.len()))?;
+        let base = [planar_region(&self.base)?];
+        let holds_base = |piece: &Region2, work: &mut FlatWork| -> Result<bool> {
+            let common = material_boolean(std::slice::from_ref(piece), &base, kernel::BoolOp::Intersect, work)?;
+            Ok(common.iter().map(Region2::area).sum::<f64>() > TOUCH_AREA)
+        };
+        // The cheap test first: a piece inside another's outline is an island, whatever it holds.
+        let outlines: Vec<(Vec<Vec2>, Vec2, Vec2)> = after
+            .iter()
+            .map(|r| {
+                let pts = r.outer.polyline(1e-3);
+                let lo = pts.iter().fold(Vec2::new(f64::MAX, f64::MAX), |a, p| Vec2::new(a.x.min(p.x), a.y.min(p.y)));
+                let hi = pts.iter().fold(Vec2::new(f64::MIN, f64::MIN), |a, p| Vec2::new(a.x.max(p.x), a.y.max(p.y)));
+                (pts, lo, hi)
+            })
+            .collect();
+        let (mut open, mut islands) = (Vec::new(), Vec::new());
+        for (i, piece) in after.iter().enumerate() {
+            let p = piece.interior_point();
+            let inside = |(pts, lo, hi): &(Vec<Vec2>, Vec2, Vec2)| (lo.x..=hi.x).contains(&p.x) && (lo.y..=hi.y).contains(&p.y) && point_in(pts, p);
+            if outlines.iter().enumerate().any(|(j, o)| j != i && inside(o)) {
+                islands.push(piece);
+            } else {
+                open.push(piece);
+            }
+        }
+        let (mut joined, mut loose) = (false, Vec::new());
+        for piece in open {
+            if holds_base(piece, &mut work)? {
+                joined = true;
+            } else {
+                loose.push(piece);
+            }
+        }
+        if loose.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The base may be an island itself (a cut all round it).
+        for piece in islands {
+            if joined {
+                break;
+            }
+            joined = holds_base(piece, &mut work)?;
+        }
+        if !joined {
+            return Ok(Vec::new());
+        }
+        // A cut only takes material away: each piece lies in the piece it was part of.
+        let mut held = Vec::new();
+        for piece in before.flat_material()? {
+            if holds_base(&piece, &mut work)? {
+                held.push(piece);
+            }
+        }
+        Ok(loose
+            .into_iter()
+            .filter(|piece| {
+                let p = piece.interior_point();
+                held.iter().any(|h| h.contains(p))
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Outline loops of the flat pattern (flat coordinates): the pieces' edges, shared ones left out.
     pub fn outline(&self) -> Result<Vec<Vec<Vec2>>> {
         if self.flanges.len().saturating_mul(2).saturating_add(1) > MAX_FLAT_PIECES {
@@ -1695,7 +1898,98 @@ impl SheetBody {
         out
     }
 
-    /// Topology counted as Fusion does: a round hole is one face bounded by two closed circular
+    /// The flat bend zones, one per bend.
+    pub fn bend_zones(&self) -> Vec<Region2> {
+        self.flanges.iter().map(|f| self.zone(f)).collect()
+    }
+
+    /// Hole centres of a perforation field (#732), flat coordinates: a staggered (60°, odd rows shifted half a pitch)
+    /// or square grid from the flat bounding box's lower-left corner plus margin + radius; a hole is kept where it is
+    /// at least margin clear of the material's edges and cut-outs and of every bend zone.
+    pub fn perforation_holes(&self, p: &SheetPerforation) -> Result<Vec<Vec2>> {
+        let regions = self.flat_regions()?;
+        let zones = self.bend_zones();
+        let clear = p.diameter / 2.0 + p.margin;
+        let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+        let mut add = |l: &Loop2| {
+            let pts = l.polyline(1e-3);
+            for k in 0..pts.len() {
+                if let (Some(&a), Some(&b)) = (pts.get(k), pts.get((k + 1) % pts.len())) {
+                    segs.push((a, b));
+                }
+            }
+        };
+        for r in &regions {
+            add(&r.outer);
+            r.holes.iter().for_each(&mut add);
+        }
+        zones.iter().for_each(|z| add(&z.outer));
+        let (mut lo, mut hi) = (Vec2::new(f64::MAX, f64::MAX), Vec2::new(f64::MIN, f64::MIN));
+        for (a, _) in &segs {
+            lo = Vec2::new(lo.x.min(a.x), lo.y.min(a.y));
+            hi = Vec2::new(hi.x.max(a.x), hi.y.max(a.y));
+        }
+        if !(lo.x <= hi.x) || !(p.pitch > 0.0) {
+            return Ok(Vec::new());
+        }
+        // Segments bucketed in a grid, so each hole only checks the edges near it.
+        let cell = (2.0 * clear).max(p.pitch).max(1.0);
+        let (nx, ny) = (((hi.x - lo.x) / cell) as usize + 1, ((hi.y - lo.y) / cell) as usize + 1);
+        let mut grid: Vec<Vec<usize>> = vec![Vec::new(); nx.saturating_mul(ny)];
+        let idx = |x: f64, y: f64| -> (usize, usize) {
+            (((x - lo.x) / cell).floor().clamp(0.0, (nx - 1) as f64) as usize, ((y - lo.y) / cell).floor().clamp(0.0, (ny - 1) as f64) as usize)
+        };
+        for (i, (a, b)) in segs.iter().enumerate() {
+            let (i0, j0) = idx(a.x.min(b.x) - clear, a.y.min(b.y) - clear);
+            let (i1, j1) = idx(a.x.max(b.x) + clear, a.y.max(b.y) + clear);
+            for j in j0..=j1 {
+                for ii in i0..=i1 {
+                    if let Some(c) = grid.get_mut(j * nx + ii) {
+                        c.push(i);
+                    }
+                }
+            }
+        }
+        let dist = |c: Vec2, (a, b): (Vec2, Vec2)| -> f64 {
+            let (d, l) = (b - a, (b - a).dot(b - a));
+            let t = if l > 0.0 { ((c - a).dot(d) / l).clamp(0.0, 1.0) } else { 0.0 };
+            c.dist(a + d * t)
+        };
+        let dy = if p.square { p.pitch } else { p.pitch * 3f64.sqrt() / 2.0 };
+        let mut out = Vec::new();
+        let mut row = 0usize;
+        loop {
+            let y = lo.y + clear + row as f64 * dy;
+            if y > hi.y - clear + 1e-9 {
+                break;
+            }
+            let mut x = lo.x + clear + if !p.square && row % 2 == 1 { p.pitch / 2.0 } else { 0.0 };
+            while x <= hi.x - clear + 1e-9 {
+                let c = Vec2::new(x, y);
+                let (i, j) = idx(x, y);
+                let near = grid.get(j * nx + i).map(Vec::as_slice).unwrap_or(&[]);
+                if regions.iter().any(|r| r.contains(c))
+                    && !zones.iter().any(|z| z.contains(c))
+                    && near.iter().all(|&k| segs.get(k).is_none_or(|&s| dist(c, s) >= clear - 1e-9))
+                {
+                    out.push(c);
+                }
+                x += p.pitch;
+            }
+            row += 1;
+        }
+        Ok(out)
+    }
+
+    /// Open area of all perforation fields (mm²): what they take out of the sheet's faces.
+    pub fn perforated_area(&self) -> f64 {
+        self.perforations
+            .iter()
+            .map(|p| self.perforation_holes(p).map_or(0.0, |h| h.len() as f64) * std::f64::consts::PI * (p.diameter / 2.0).powi(2))
+            .sum()
+    }
+
+    /// Topology counted by faces and loops: a round hole is one face bounded by two closed circular
     /// edges (one vertex each), where the sewn solid splits it into arcs. Returns the change to
     /// the sewn (faces, edges, vertices).
     pub fn round_hole_correction(&self) -> (i64, i64, i64) {
@@ -1923,7 +2217,7 @@ impl SheetBody {
         flip: bool,
     ) -> Result<(Vec<usize>, Vec<String>)> {
         let each: Vec<EdgeFlange> = picks.iter().map(|&pick| EdgeFlange { pick, height, angle }).collect();
-        self.add_flanges_each(&each, radius, position, flip)
+        self.add_flanges_each(&each, radius, position, flip, ReliefOverride::default())
     }
 
     /// Edge flanges that each have their own height and angle, in one go: every edge is trimmed
@@ -1936,8 +2230,16 @@ impl SheetBody {
     /// the base that ends beside more of the base gets the rule's bend relief there
     /// (`relieve_bend_ends`). Where cut-outs have taken part of a picked edge away, the flange
     /// runs along the stretch they leave nearest the pick and takes its setback off that stretch
-    /// only; an edge they took whole is refused.
-    pub fn add_flanges_each(&mut self, edges: &[EdgeFlange], radius: f64, position: &str, flip: bool) -> Result<(Vec<usize>, Vec<String>)> {
+    /// only; an edge they took whole is refused. The corners between these flanges are relieved
+    /// as the rule says, except where `relief` names another shape or size.
+    pub fn add_flanges_each(
+        &mut self,
+        edges: &[EdgeFlange],
+        radius: f64,
+        position: &str,
+        flip: bool,
+        relief: ReliefOverride,
+    ) -> Result<(Vec<usize>, Vec<String>)> {
         if edges.is_empty() || edges.len() > 1000 {
             return Err(DocError::Invalid("pick 1…1000 edges".into()));
         }
@@ -2053,6 +2355,7 @@ impl SheetBody {
                 radius,
                 leg: leg.max(0.0),
                 shape: None,
+                exact: None,
                 tag: String::new(),
                 ext: (0.0, 0.0),
                 slope: (0.0, 0.0),
@@ -2064,7 +2367,7 @@ impl SheetBody {
         for (&i, &free) in made.iter().zip(&freed) {
             notes.extend(self.relieve_bend_ends(i, free));
         }
-        notes.extend(self.close_corners(&made));
+        notes.extend(self.close_corners(&made, relief));
         notes.extend(self.close_return_corners(&made));
         Ok((made, notes))
     }
@@ -2078,7 +2381,7 @@ impl SheetBody {
     /// such end left as it is.
     fn relieve_bend_ends(&mut self, i: usize, free: (bool, bool)) -> Vec<String> {
         let Some(f) = self.flanges.get(i).cloned() else { return Vec::new() };
-        if f.parent.is_some() || f.shape.is_some() {
+        if f.parent.is_some() {
             return Vec::new();
         }
         let (width, depth) = (self.bend_relief.0, self.bend_relief.1.max(0.0));
@@ -2482,37 +2785,50 @@ impl SheetBody {
         out
     }
 
-    /// Close the corners the new flanges make, then cut the rule's relief at each (or tear it).
-    /// Returns a note for every corner left open, without its relief or not torn.
-    fn close_corners(&mut self, made: &[usize]) -> Vec<String> {
+    /// Close the corners the new flanges make, then cut the relief at each (or tear it): the
+    /// rule's, but for the shape or size `relief` names. Returns a note for every corner left
+    /// open, without its relief or not torn.
+    fn close_corners(&mut self, made: &[usize], relief: ReliefOverride) -> Vec<String> {
         let corners = self.corners(made);
         let mut notes = Vec::new();
-        let at = |s: &SheetBody, c: Vec2| {
-            let w = apply_point(&s.frame_mat(), v3(c));
-            format!("({:.3}, {:.3}, {:.3})", w.x, w.y, w.z)
-        };
         let mut closed = Vec::with_capacity(corners.len());
         for k in &corners {
             match self.close_corner(k) {
                 Ok(()) => closed.push(*k),
-                Err(why) => notes.push(format!("the flanges at {} are left open: {why}", at(self, k.c))),
+                Err(why) => notes.push(format!("the flanges at {} are left open: {why}", self.shown(k.c))),
             }
         }
-        match self.relief {
+        notes.extend(self.relieve_corners(&corners, &closed, relief));
+        notes
+    }
+
+    /// A point of the flat frame, in the part's coordinates, for a note.
+    fn shown(&self, c: Vec2) -> String {
+        let w = apply_point(&self.frame_mat(), v3(c));
+        format!("({:.3}, {:.3}, {:.3})", w.x, w.y, w.z)
+    }
+
+    /// Cut the relief at each of `corners`, or tear those of them that are `closed`: the rule's,
+    /// but for the shape or size `relief` names. Returns a note for every corner without its
+    /// relief or not torn.
+    fn relieve_corners(&mut self, corners: &[Corner], closed: &[Corner], relief: ReliefOverride) -> Vec<String> {
+        let mut notes = Vec::new();
+        let (shape, size) = (relief.shape.unwrap_or(self.relief), relief.size.unwrap_or(self.relief_size));
+        match shape {
             ReliefShape::Notch => {}
             // The reliefs come last: they move the bends' ends, which is how the corners were found.
             ReliefShape::Round | ReliefShape::Rectangular => {
-                for k in &corners {
-                    if let Err(why) = self.relieve_corner(k, &corners) {
-                        notes.push(format!("no corner relief at {}: {why}", at(self, k.c)));
+                for k in corners {
+                    if let Err(why) = self.relieve_corner(k, corners, shape, size) {
+                        notes.push(format!("no corner relief at {}: {why}", self.shown(k.c)));
                     }
                 }
             }
             // A tear cuts to the flanges' closed ends, so a corner left open gets none.
             ReliefShape::Tear => {
-                for k in &closed {
+                for k in closed {
                     if let Err(why) = self.tear_corner(k) {
-                        notes.push(format!("the corner at {} keeps its notch: {why}", at(self, k.c)));
+                        notes.push(format!("the corner at {} keeps its notch: {why}", self.shown(k.c)));
                     }
                 }
             }
@@ -2679,7 +2995,7 @@ impl SheetBody {
         Ok(())
     }
 
-    /// Cut the rule's relief where two bends meet at a corner of the base, `relief_size / 2`
+    /// Cut a relief `size` across where two bends meet at a corner of the base, `size / 2`
     /// from the corner along both edges: a round about the corner through the angle the base
     /// fills there, or the square with that side (a kite where the corner isn't square, its
     /// cuts square to the two edges). The base's edges then start that far from the corner, so
@@ -2689,8 +3005,7 @@ impl SheetBody {
     /// that would leave nothing of an edge it starts on (with the relief at that edge's other
     /// end, where there is one), or one reaching as far from the corner as another edge of the
     /// base is, is refused with the reason.
-    fn relieve_corner(&mut self, k: &Corner, corners: &[Corner]) -> std::result::Result<(), String> {
-        let size = self.relief_size;
+    fn relieve_corner(&mut self, k: &Corner, corners: &[Corner], shape: ReliefShape, size: f64) -> std::result::Result<(), String> {
         if !(size >= MIN_CORNER_RELIEF) {
             return Err(format!("the relief size {size:.4} mm is below {MIN_CORNER_RELIEF} mm"));
         }
@@ -2722,7 +3037,7 @@ impl SheetBody {
         }
         // The relief from the edge that ends at the corner to the one that starts there, and
         // how far from the corner it reaches.
-        let (relief, reach) = match self.relief {
+        let (relief, reach) = match shape {
             ReliefShape::Notch | ReliefShape::Tear => return Ok(()),
             ReliefShape::Round => (vec![Seg2::Arc { center: c, radius: r, start: da.angle(), sweep: -alpha }], r),
             ReliefShape::Rectangular => {
@@ -2785,6 +3100,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         });
         Ok(self.flanges.len() - 1)
@@ -2919,6 +3235,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         };
         let ba = self.allowance(&probe);
@@ -2983,6 +3300,7 @@ impl SheetBody {
             Some(j) => {
                 if let Some(f) = self.flanges.get_mut(j) {
                     f.shape = Some(ccw(fixed_part.clone()));
+                    f.exact = None;
                 }
             }
         }
@@ -2999,6 +3317,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: Some(ccw(moving)),
+            exact: None,
             tag: String::new(),
         });
         let i = self.flanges.len() - 1;
@@ -3124,6 +3443,7 @@ impl SheetBody {
             Some(j) => {
                 if let Some(f) = self.flanges.get_mut(j) {
                     f.shape = Some(ccw(fixed));
+                    f.exact = None;
                 }
             }
         }
@@ -3142,6 +3462,7 @@ impl SheetBody {
                 slope: (0.0, 0.0),
                 tear: (false, false),
                 shape: Some(ccw(moving)),
+                exact: None,
                 tag: String::new(),
             });
         }
@@ -3824,6 +4145,30 @@ fn polys_cross(a: &[Vec2], b: &[Vec2]) -> bool {
     })
 }
 
+/// Whether every segment of `lp` lies on one of `curves` (its ends and its middle, within
+/// 0.0001 mm): the loop is made of those curves, or of parts of them.
+pub fn loop_lies_on(lp: &Loop2, curves: &[Seg2]) -> bool {
+    const TOL: f64 = 1e-4;
+    let near = |p: Vec2| curves.iter().any(|c| c.point_at(c.closest_param(p)).dist(p) <= TOL);
+    !lp.segs.is_empty() && lp.segs.iter().all(|g| near(g.start()) && near(g.mid()) && near(g.end()))
+}
+
+/// Tells which loops of a sheet's flat pattern are letters (see [`SheetBody::letters`]).
+#[derive(Clone, Debug)]
+pub struct Letters {
+    /// Each text region's corners (lowest, highest) and the segments of its outlines.
+    regions: Vec<(Vec2, Vec2, Vec<Seg2>)>,
+}
+
+impl Letters {
+    /// Whether `lp` is made of the outlines of text the sheet carries: a letter, or one of its
+    /// counters.
+    pub fn is_letter(&self, lp: &Loop2) -> bool {
+        let Some(p) = lp.segs.first().map(Seg2::start) else { return false };
+        self.regions.iter().any(|(lo, hi, curves)| p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y && loop_lies_on(lp, curves))
+    }
+}
+
 /// Bounded overlap predicate, including crossing-only cuts whose vertices lie outside a panel.
 pub(crate) fn flat_regions_overlap(a: &Region2, b: &Region2, work: &mut FlatWork) -> Result<bool> {
     let (a, b) = (planar_region(a)?, planar_region(b)?);
@@ -3844,6 +4189,8 @@ pub fn base_flange(body: &str, rule: &str, rv: &RuleValues, plane: Plane, region
         holes,
         pockets: Vec::new(),
         bores: Vec::new(),
+        perforations: Vec::new(),
+        labels: Vec::new(),
         flat: false,
         gap: rv.gap,
         relief: rv.corner_relief_shape,
@@ -3900,6 +4247,8 @@ pub fn contour_flange(body: &str, rule: &str, rv: &RuleValues, plane: &Plane, pt
         holes: Vec::new(),
         pockets: Vec::new(),
         bores: Vec::new(),
+        perforations: Vec::new(),
+        labels: Vec::new(),
         flat: false,
         gap: rv.gap,
         relief: rv.corner_relief_shape,
@@ -3939,6 +4288,7 @@ pub fn contour_flange(body: &str, rule: &str, rv: &RuleValues, plane: &Plane, pt
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         };
         let ba = sheet.allowance(&f);
@@ -3964,7 +4314,9 @@ pub fn rename_plane_sheet_body(plane: &mut crate::PlaneRef, old: &str, new: &str
                 *name = renamed;
             }
         }
-        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } => rename_plane_sheet_body(base, old, new),
+        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } | crate::PlaneRef::Flipped { base, .. } => {
+            rename_plane_sheet_body(base, old, new)
+        }
         _ => {}
     }
 }
@@ -3974,7 +4326,9 @@ pub fn rename_plane_sheet_body(plane: &mut crate::PlaneRef, old: &str, new: &str
 pub fn plane_sheet_face(plane: &crate::PlaneRef) -> Option<&str> {
     match plane {
         crate::PlaneRef::Face { name: Some(name), anchor: None, .. } if split_sheet_face_name(name).is_some() => Some(name),
-        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } => plane_sheet_face(base),
+        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } | crate::PlaneRef::Flipped { base, .. } => {
+            plane_sheet_face(base)
+        }
         _ => None,
     }
 }
@@ -4041,6 +4395,41 @@ mod tests {
 
     fn vol(b: &Body) -> f64 {
         kernel::measure(b).map(|m| m.volume).unwrap_or(f64::NAN)
+    }
+
+    #[test]
+    fn loops_lie_on_the_curves_they_are_made_of() {
+        let circle = Loop2::circle(Vec2::new(5.0, 5.0), 3.0);
+        let curves: Vec<Seg2> = circle.segs.clone();
+        // The loop itself, started elsewhere and run the other way, and a loop of its halves.
+        assert!(loop_lies_on(&circle, &curves));
+        assert!(loop_lies_on(&Loop2::circle_from(Vec2::new(5.0, 5.0), 3.0, 1.0).reversed(), &curves));
+        let halves: Vec<Seg2> = circle.segs.iter().flat_map(|g| [g.split_half().0, g.split_half().1]).collect();
+        assert!(loop_lies_on(&Loop2 { segs: halves }, &curves));
+        // Another circle, a square and an empty loop do not.
+        assert!(!loop_lies_on(&Loop2::circle(Vec2::new(5.0, 5.0), 3.1), &curves));
+        assert!(!loop_lies_on(&Loop2::circle(Vec2::new(5.0, 5.0), 2.0), &curves));
+        assert!(!loop_lies_on(&rect(Vec2::ZERO, Vec2::X, Vec2::new(1.0, 1.0), Vec2::Y).outer, &curves));
+        assert!(!loop_lies_on(&Loop2 { segs: Vec::new() }, &curves));
+        // A loop only partly on them (a letter across the sheet's edge) is not on them.
+        let notch = Loop2 { segs: vec![circle.segs[0], Seg2::Line { a: circle.segs[0].end(), b: Vec2::new(50.0, 50.0) }] };
+        assert!(!loop_lies_on(&notch, &curves));
+    }
+
+    #[test]
+    fn a_sheet_knows_the_letters_it_carries() {
+        // A recorded text region with a counter: its outline and its counter are letters, the same
+        // circle elsewhere, a loop near it that is another size and a loop far away are not.
+        let mut s = plate(100.0, 60.0);
+        let counter = Loop2::circle(Vec2::new(20.0, 20.0), 2.0).reversed();
+        s.labels.push(Region2 { outer: Loop2::circle(Vec2::new(20.0, 20.0), 5.0), holes: vec![counter.clone()] });
+        let letters = s.letters();
+        assert!(letters.is_letter(&Loop2::circle(Vec2::new(20.0, 20.0), 5.0)));
+        assert!(letters.is_letter(&counter.reversed()));
+        assert!(!letters.is_letter(&Loop2::circle(Vec2::new(20.0, 20.0), 4.0)));
+        assert!(!letters.is_letter(&Loop2::circle(Vec2::new(70.0, 20.0), 5.0)));
+        // A sheet that carries none has no letters.
+        assert!(!plate(100.0, 60.0).letters().is_letter(&Loop2::circle(Vec2::new(20.0, 20.0), 5.0)));
     }
 
     #[test]
@@ -4586,21 +4975,34 @@ mod tests {
             assert!(s.zone_point(&f, q, z).0.dist(s.map3(Piece::Zone(0), q, z)) < 1e-12);
         }
         // A flat line across the whole zone, 15 mm along the bend: the bend angle and the
-        // distance along the axis both grow evenly along it.
+        // distance along the axis both grow evenly along it. Two pieces of degree 7 follow it
+        // (cubic ones took 32).
         let e = Seg2::Line { a: f.p + f.d * 20.0, b: f.p + f.n * s.allowance(&f) + f.d * 35.0 };
-        let breaks = s.zone_breaks(&f, &e);
+        let n = s.zone_pieces(&f, &e);
+        assert_eq!(n, 2);
         for z in [0.0, 2.0] {
             let helix = |t: f64| {
                 let (phi, rho) = (angle * t, 3.0 - z);
                 Vec3::new(e.point_at(t).x, setback - rho * phi.sin(), 3.0 - rho * phi.cos())
             };
-            let EdgeSpec::Chain { ctrl } = s.zone_chain(&f, &e, z) else { panic!("a slanted edge folds to a chain") };
-            assert_eq!(ctrl.len(), 3 * (breaks.len() - 1) + 1);
-            for (k, w) in breaks.windows(2).enumerate() {
-                for x in [0.0, 0.1, 0.37, 0.5, 0.81, 1.0] {
-                    let p = cubic_at(ctrl[3 * k], ctrl[3 * k + 1], ctrl[3 * k + 2], ctrl[3 * k + 3], x);
-                    let exact = helix(w[0] + (w[1] - w[0]) * x);
-                    assert!(p.dist(exact) < BEND_CHAIN_TOL, "height {z}, piece {k}: {}", p.dist(exact));
+            let EdgeSpec::Chain { degree: 7, ctrl } = s.zone_chain(&f, &e, z) else { panic!("a slanted edge folds to a chain of degree 7") };
+            assert_eq!(ctrl.len(), 7 * n + 1);
+            for k in 0..n {
+                for i in 0..=40 {
+                    let x = i as f64 / 40.0;
+                    let off = bezier_at(&ctrl[7 * k..=7 * k + 7], x).dist(helix((k as f64 + x) / n as f64));
+                    assert!(off < BEND_CHAIN_TOL, "height {z}, piece {k}, {x}: {off}");
+                }
+            }
+            // The pieces are equal, so the chain is one smooth curve: on either side of a joint
+            // the first three differences of the control points are the same.
+            let diff = |p: &[Vec3]| p.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+            for k in 1..n {
+                let (mut before, mut after) = (ctrl[7 * k - 3..=7 * k].to_vec(), ctrl[7 * k..=7 * k + 3].to_vec());
+                for order in 1..=3 {
+                    (before, after) = (diff(&before), diff(&after));
+                    let (b, a) = (before[before.len() - 1], after[0]);
+                    assert!(b.dist(a) < 1e-12, "height {z}, joint {k}, order {order}: {b:?} vs {a:?}");
                 }
             }
         }
@@ -4638,6 +5040,42 @@ mod tests {
 
     fn flat_area(s: &SheetBody) -> f64 {
         s.flat_regions().unwrap().iter().map(Region2::area).sum()
+    }
+
+    /// A plate (0, 0) (100, 0) (85, 20) (0, 20) with a 30 mm inside flange on its slanted edge
+    /// (2 mm sheet, R 2, K 0.5: the folded sheet holds its flat area times the thickness), and a
+    /// 4 mm² triangle cut out of the flat across the bend line, with a corner on the line or a
+    /// hair (0.01 to 0.1 µm) to either side of it, in the middle of the bend and near its ends.
+    /// The planar booleans leave such a corner as corners a hair apart on the base and on the
+    /// bend, and the refold joined them by an edge as short ("sew: a degenerate edge").
+    #[test]
+    fn a_cut_out_corner_a_hair_beside_a_bend_line_refolds() {
+        let rule = RuleValues { bend_radius: 2.0, ..alu() };
+        let outline = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Vec2::new(85.0, 20.0), Vec2::new(0.0, 20.0)];
+        for deg in [90.0f64, 120.0] {
+            let mut s = base_flange("Body1", "AL2", &rule, Plane::XY, Region2 { outer: Loop2::polygon(&outline).ccw(), holes: vec![] });
+            s.add_flange(Vec3::new(92.5, 10.0, 2.0), 30.0, deg.to_radians(), 2.0, "inside", false).unwrap();
+            let (a0, v0) = (flat_area(&s), vol(&s.solid().unwrap()));
+            if deg == 90.0 {
+                // The base less 4 mm along the edge's normal (5 mm along x): 1750; the bend
+                // 25 x 3π/2; the flange 25 x 26.
+                assert!((a0 - (2400.0 + 37.5 * std::f64::consts::PI)).abs() < 1e-9, "{a0}");
+            }
+            // The measure follows the bend by facets.
+            assert!((v0 / (a0 * 2.0) - 1.0).abs() < 1e-4, "{deg}°: {v0} vs {}", a0 * 2.0);
+            let f = s.flanges[0].clone();
+            for (along, off) in [(0.5, 0.0), (0.5, 1e-8), (0.5, 5e-8), (0.5, -5e-8), (0.5, 1e-7), (0.5, -1e-7), (0.16, 5e-8), (0.84, -5e-8)] {
+                let what = format!("{deg}°, corner {along} along the bend, {off} mm beside it");
+                let c = f.p + f.d * (f.len * along) + f.n * off;
+                let triangle = Loop2::polygon(&[c, c - f.n * 2.8 - f.d * 0.4, c + f.n * 0.4 - f.d * 2.8]).ccw();
+                let mut cut = s.clone();
+                cut.holes.push(Region2 { outer: triangle, holes: vec![] });
+                assert!((a0 - flat_area(&cut) - 4.0).abs() < 1e-6, "{what}: flat area {}", a0 - flat_area(&cut));
+                let body = cut.solid().unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert!(body.validity().is_empty(), "{what}: {:?}", body.validity());
+                assert!((v0 - vol(&body) - 8.0).abs() < 0.01, "{what}: {} vs 8", v0 - vol(&body));
+            }
+        }
     }
 
     /// Distance between two parallel 3D lines through a0→a1 and b0→b1 (None if not parallel).
@@ -5229,7 +5667,7 @@ mod tests {
                         assert!((s.base.area() - base).abs() < tol, "{what}: {} vs {base}", s.base.area());
                         assert!((flat_area(&s) - (base + len * (ba + panel))).abs() < 1e-6, "{what}: {}", flat_area(&s));
                         // (A sliver 0.0001 wide is below the flat pattern's shortest edge.)
-                        if hair < 0.0 || hair > 1e-3 {
+                        if !(0.0..=1e-3).contains(&hair) {
                             holds_the_flat_material(&s, &what);
                         } else {
                             let b = s.solid().unwrap_or_else(|e| panic!("{what}: no solid: {e}"));
@@ -5730,7 +6168,7 @@ mod tests {
     /// sheet and the notes on corners left open.
     fn flanges_each(base: Region2, rv: &RuleValues, each: &[EdgeFlange]) -> (SheetBody, Vec<String>) {
         let mut s = base_flange("Body1", "AL2", rv, Plane::XY, base);
-        let notes = s.add_flanges_each(each, rv.bend_radius, "inside", false).unwrap().1;
+        let notes = s.add_flanges_each(each, rv.bend_radius, "inside", false, ReliefOverride::default()).unwrap().1;
         (s, notes)
     }
 
@@ -6285,7 +6723,7 @@ mod tests {
         let (mut s, _) = tray(&rv, 90.0, 20.0);
         let each: Vec<EdgeFlange> =
             (0..4).map(|i| EdgeFlange { pick: far_edge_pick(&s, i, true), height: 12.0, angle: [90f64, 70.0][i % 2].to_radians() }).collect();
-        let (made, notes) = s.add_flanges_each(&each, 1.0, "inside", false).unwrap();
+        let (made, notes) = s.add_flanges_each(&each, 1.0, "inside", false, ReliefOverride::default()).unwrap();
         assert!(notes.is_empty() && made == [4, 5, 6, 7], "{made:?} {notes:?}");
         for (a, a_end, b, b_end) in TRAY_RETURNS {
             let (fa, fb) = (&s.flanges[a], &s.flanges[b]);
@@ -6458,7 +6896,7 @@ mod tests {
                     EdgeFlange { pick: far_edge_pick(&s, i, true), height: 12.0, angle: deg.to_radians() }
                 })
                 .collect();
-            let (_, notes) = s.add_flanges_each(&each, 1.0, "inside", false).unwrap();
+            let (_, notes) = s.add_flanges_each(&each, 1.0, "inside", false, ReliefOverride::default()).unwrap();
             assert!(notes.is_empty(), "{what}: {notes:?}");
             returns_keep_out_of_the_walls(&s, &what);
             holds_the_flat_material(&s, &what);
@@ -6798,6 +7236,103 @@ mod tests {
         }
     }
 
+    /// The plate (0, 0) (100, 0) (85, 20) (0, 20) with a 30 mm inside flange on its slanted edge
+    /// (2 mm sheet, R 2, K 0.5: the folded sheet holds its flat area times the thickness), and a
+    /// triangle cut out of the flat with one corner on the bend line: where the line meets the
+    /// plate's edge, at either end, the triangle on the bend or on the base; in the line's middle,
+    /// from either side; and on the plate's straight edge, from inside. At the plate's edge the
+    /// sheet is pinched (two wedges of material meet along the thickness); in the middle the
+    /// triangle's tip touches the next piece. The refold ran the face through that corner twice
+    /// ("This wire is not simple").
+    #[test]
+    fn a_cut_out_with_a_corner_on_a_bend_line_or_the_sheets_edge_refolds() {
+        let rule = RuleValues { bend_radius: 2.0, ..alu() };
+        let outline = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Vec2::new(85.0, 20.0), Vec2::new(0.0, 20.0)];
+        for deg in [90.0f64, 120.0] {
+            let mut s = base_flange("Body1", "AL2", &rule, Plane::XY, Region2 { outer: Loop2::polygon(&outline).ccw(), holes: vec![] });
+            s.add_flange(Vec3::new(92.5, 10.0, 2.0), 30.0, deg.to_radians(), 2.0, "inside", false).unwrap();
+            let (a0, v0) = (flat_area(&s), vol(&s.solid().unwrap()));
+            let f = s.flanges[0].clone();
+            let (start, end, middle) = (f.p, f.p + f.d * f.len, f.p + f.d * (f.len / 2.0));
+            // The bend line runs from the plate's edge y = 0 to y = 20, the bend on its +n side,
+            // square across at its ends; the base's corner at either end is at least 53.13°
+            // wide, the edge running off at (0.6, -0.8) along and across the line. The triangles'
+            // other corners as steps along the line and across it.
+            let cases = [
+                ("on the bend at the line's start", start, [(2.0, 1.0), (0.4, 2.2)], 2.0),
+                ("on the bend at the line's end", end, [(-2.0, 1.0), (-0.4, 2.2)], 2.0),
+                ("on the base at the line's start", start, [(4.0, -1.0), (2.0, -2.0)], 3.0),
+                ("on the base at the line's middle", middle, [(-1.0, -2.0), (1.0, -2.0)], 2.0),
+                ("on the bend at the line's middle", middle, [(-1.0, 2.0), (1.0, 2.0)], 2.0),
+            ];
+            for (what, c, others, area) in cases {
+                let what = format!("{deg}°, {what}");
+                let corners: Vec<Vec2> = std::iter::once(c).chain(others.iter().map(|(u, v)| c + f.d * *u + f.n * *v)).collect();
+                let mut cut = s.clone();
+                cut.holes.push(Region2 { outer: Loop2::polygon(&corners).ccw(), holes: vec![] });
+                assert!((a0 - flat_area(&cut) - area).abs() < 1e-6, "{what}: flat area {}", a0 - flat_area(&cut));
+                let body = cut.solid().unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert!(body.validity().is_empty() && body.shell_count() == 1, "{what}: {:?}", body.validity());
+                assert!((v0 - vol(&body) - area * 2.0).abs() < 0.01, "{what}: {} vs {}", v0 - vol(&body), area * 2.0);
+            }
+            // A 4 mm² triangle standing on the plate's edge y = 20 at x = 40.
+            let mut cut = s.clone();
+            cut.holes
+                .push(Region2 { outer: Loop2::polygon(&[Vec2::new(40.0, 20.0), Vec2::new(38.0, 18.0), Vec2::new(42.0, 18.0)]).ccw(), holes: vec![] });
+            assert!((a0 - flat_area(&cut) - 4.0).abs() < 1e-6, "{deg}°, on the edge: flat area {}", a0 - flat_area(&cut));
+            let body = cut.solid().unwrap_or_else(|e| panic!("{deg}°, on the edge: {e}"));
+            assert!(body.validity().is_empty() && body.shell_count() == 1, "{deg}°, on the edge: {:?}", body.validity());
+            assert!((v0 - vol(&body) - 8.0).abs() < 0.01, "{deg}°, on the edge: {} vs 8", v0 - vol(&body));
+        }
+    }
+
+    /// The plate (0, 0) (100, 0) (85, 20) (0, 20) with a 30 mm inside flange on its slanted edge
+    /// (2 mm sheet, R 2, K 0.5: the folded sheet holds its flat area times the thickness), and a
+    /// triangle cut out of the flat on one side of the bend line only, with a corner a hair (0.01
+    /// or 0.05 µm) from the line, short of it or across: on the base, in the line's middle and
+    /// near its ends; and at either end of the line, where it meets the plate's edge, on the base
+    /// and on the bend. The planar booleans leave such a corner as corners a hair apart, on the
+    /// base and on the bend; joined, they are a corner where the cut-out touches the bend line or
+    /// the plate's edge. So the refold needs both: without the joining it failed with "sew: a
+    /// degenerate edge", without the touching sew with "This wire is not simple".
+    #[test]
+    fn a_cut_out_on_one_side_of_a_bend_line_with_a_corner_a_hair_from_it_refolds() {
+        let rule = RuleValues { bend_radius: 2.0, ..alu() };
+        let outline = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Vec2::new(85.0, 20.0), Vec2::new(0.0, 20.0)];
+        for deg in [90.0f64, 120.0] {
+            let mut s = base_flange("Body1", "AL2", &rule, Plane::XY, Region2 { outer: Loop2::polygon(&outline).ccw(), holes: vec![] });
+            s.add_flange(Vec3::new(92.5, 10.0, 2.0), 30.0, deg.to_radians(), 2.0, "inside", false).unwrap();
+            let (a0, v0) = (flat_area(&s), vol(&s.solid().unwrap()));
+            let f = s.flanges[0].clone();
+            // The corner at a fraction of the line, the triangle's other corners as steps along the
+            // line and across it (the bend on its +n side; the base's corner at either end of the
+            // line is at least 53.13° wide), and the triangle's area.
+            let cases = [
+                ("on the base in the line's middle", 0.5, [(-1.0, -2.0), (1.0, -2.0)], 2.0),
+                ("on the base near the line's start", 0.16, [(-1.0, -2.0), (1.0, -2.0)], 2.0),
+                ("on the base near the line's end", 0.84, [(-1.0, -2.0), (1.0, -2.0)], 2.0),
+                ("on the base at the line's start", 0.0, [(3.0, -2.0), (2.0, -2.0)], 1.0),
+                ("on the base at the line's end", 1.0, [(-2.0, -2.0), (-3.0, -2.0)], 1.0),
+                ("on the bend at the line's start", 0.0, [(1.25, 2.0), (0.25, 2.0)], 1.0),
+                ("on the bend at the line's end", 1.0, [(-0.25, 2.0), (-1.25, 2.0)], 1.0),
+            ];
+            for (what, along, others, area) in cases {
+                // Across the line toward the bend.
+                for off in [-5e-8, -1e-8, 1e-8, 5e-8] {
+                    let what = format!("{deg}°, {what}, {off} mm across the line");
+                    let c = f.p + f.d * (f.len * along) + f.n * off;
+                    let corners: Vec<Vec2> = std::iter::once(c).chain(others.iter().map(|(u, v)| c + f.d * *u + f.n * *v)).collect();
+                    let mut cut = s.clone();
+                    cut.holes.push(Region2 { outer: Loop2::polygon(&corners).ccw(), holes: vec![] });
+                    assert!((a0 - flat_area(&cut) - area).abs() < 1e-5, "{what}: flat area {}", a0 - flat_area(&cut));
+                    let body = cut.solid().unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert!(body.validity().is_empty() && body.shell_count() == 1, "{what}: {:?}", body.validity());
+                    assert!((v0 - vol(&body) - area * 2.0).abs() < 0.01, "{what}: {} vs {}", v0 - vol(&body), area * 2.0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_tear_holds_at_every_angle() {
         use std::f64::consts::{FRAC_PI_2, PI};
@@ -6972,6 +7507,59 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_bend_end_folds_to_two_smooth_pieces_on_its_helix() {
+        // The tray of `a_tear_cuts_each_bend_from_the_corner_to_its_flanges_end` (T = 2, R = 1):
+        // each of its eight torn bend ends is the wall ruled between a helix on the bend's inner
+        // face and one on its outer face, `bend_end` at the turn φ from 0 to θ. Cubic pieces took
+        // 32 at either angle, which a viewer draws as 32 strips; two pieces of degree 7 hold the
+        // helix to within the chains' tolerance.
+        for deg in [90.0f64, 72.0] {
+            let what = format!("{deg}°");
+            let (s, _) = tray(&torn(), deg, 38.6);
+            let mut work = FlatWork::new();
+            let cells = s.cells_with_work(&mut work).unwrap();
+            let faces = s.faces(&cells, 0.0, s.t, &mut work).unwrap();
+            let walls: Vec<(&EdgeSpec, &EdgeSpec)> = faces
+                .iter()
+                .filter_map(|f| match &f.surface {
+                    SurfSpec::Ruled { a, b } => Some((a, b)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(walls.len(), 8, "{what}");
+            let th = deg.to_radians();
+            for (bottom, top) in walls {
+                for (chain, z) in [(bottom, 0.0), (top, s.t)] {
+                    let EdgeSpec::Chain { ctrl, .. } = chain else { panic!("{what}: a torn end folds to a chain") };
+                    assert_eq!(ctrl.len(), 15, "{what}: two pieces of degree 7");
+                    // The torn end this chain runs along, and which way.
+                    let (first, last) = (ctrl[0], ctrl[ctrl.len() - 1]);
+                    let end = s.flanges.iter().flat_map(|f| [(f, false), (f, true)]).find_map(|(f, at_end)| {
+                        let at = |phi: f64| s.bend_end(f, at_end, phi, z);
+                        if at(0.0).dist(first) < 1e-9 && at(th).dist(last) < 1e-9 {
+                            Some((f, at_end, false))
+                        } else if at(th).dist(first) < 1e-9 && at(0.0).dist(last) < 1e-9 {
+                            Some((f, at_end, true))
+                        } else {
+                            None
+                        }
+                    });
+                    let Some((f, at_end, back)) = end else { panic!("{what}: {first:?} to {last:?} is no torn end") };
+                    for k in 0..2 {
+                        for i in 0..=40 {
+                            let t = (k as f64 + i as f64 / 40.0) / 2.0;
+                            let exact = s.bend_end(f, at_end, th * if back { 1.0 - t } else { t }, z);
+                            let off = bezier_at(&ctrl[7 * k..=7 * k + 7], i as f64 / 40.0).dist(exact);
+                            assert!(off < BEND_CHAIN_TOL, "{what}: height {z}, {t}: {off}");
+                        }
+                    }
+                }
+            }
+            holds_the_flat_material(&s, &what);
+        }
+    }
+
+    #[test]
     fn a_torn_bend_end_is_no_flat_face() {
         use std::f64::consts::{FRAC_PI_2, SQRT_2};
         // A bend's flat ends are faces a sketch can sit on (`rim.bend0`, `rim.bend1`). The bar's top
@@ -7026,5 +7614,50 @@ mod tests {
             assert_eq!((&s.base, &s.flanges), (&notch.base, &notch.flanges), "{what}");
             holds_the_flat_material(&s, &what);
         }
+    }
+
+    /// The 100 x 60 plate with a 20 mm flange on its y = 0 edge (2.5 mm, R 2.5, K 0.44): in the
+    /// flat the base starts at y = t + R = 5, the bend's zone is (π/2)·(R + K·t) long and the
+    /// flange's panel 20 − 5, so its far edge lies at y = 5 − (π/2)·3.6 − 15.
+    #[test]
+    fn a_cut_names_the_pieces_it_parts_from_the_base_and_no_others() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let far = 5.0 - FRAC_PI_2 * (2.5 + 0.44 * 2.5) - 15.0;
+        let mut s = plate(100.0, 60.0);
+        s.add_flange(Vec3::new(50.0, 0.0, 2.5), 20.0, FRAC_PI_2, 2.5, "inside", false).unwrap();
+        let r = |x0: f64, y0: f64, x1: f64, y1: f64| rect(Vec2::new(x0, y0), Vec2::new(x1, y0), Vec2::new(x1, y1), Vec2::new(x0, y1));
+        let ring = |c: Vec2, ro: f64, ri: f64| Region2 { outer: Loop2::circle(c, ro), holes: vec![Loop2::circle(c, ri)] };
+        let parted = |before: &SheetBody, holes: &[Region2]| {
+            let mut after = before.clone();
+            after.holes.extend_from_slice(holes);
+            after.parted_from_base(&after.flat_material().unwrap(), before).unwrap()
+        };
+        // A slot across the flange beside its bend parts the rest of the flange: 100 × (−3 − far).
+        let slot = r(-5.0, -3.0, 105.0, -1.0);
+        let p = parted(&s, std::slice::from_ref(&slot));
+        assert!(p.len() == 1 && (p[0].area() - 100.0 * (-3.0 - far)).abs() < 1e-6, "{p:?}");
+        // So does a ring on the flange's far edge: the half of its inside on the flange, π·2²/2.
+        let p = parted(&s, &[ring(Vec2::new(50.0, far), 4.0, 2.0)]);
+        assert!(p.len() == 1 && (p[0].area() - 2.0 * PI).abs() < 1e-6, "{p:?}");
+        // A ring's island, on the base or on the flange, has material round it; a strip across the
+        // whole sheet leaves two halves that each keep their part of the base. None is named.
+        for holes in [ring(Vec2::new(50.0, 30.0), 10.0, 5.0), ring(Vec2::new(50.0, -9.0), 4.0, 2.0), r(45.0, -30.0, 55.0, 70.0)] {
+            assert!(parted(&s, std::slice::from_ref(&holes)).is_empty(), "{holes:?}");
+        }
+        // Pieces an earlier cut parted are not named again, nor when a later cut splits them.
+        let mut cut = s.clone();
+        cut.holes.push(slot);
+        for holes in [Region2 { outer: Loop2::circle(Vec2::new(30.0, 30.0), 4.0), holes: vec![] }, r(45.0, -30.0, 55.0, -2.0)] {
+            assert!(parted(&cut, std::slice::from_ref(&holes)).is_empty(), "{holes:?}");
+        }
+        // Nothing is named once no piece holds the base: a cut that takes the base and both bends
+        // of a sheet with flanges on two sides leaves the two flanges.
+        let mut two = plate(100.0, 60.0);
+        two.add_flanges(&[Vec3::new(50.0, 0.0, 2.5), Vec3::new(50.0, 60.0, 2.5)], 20.0, FRAC_PI_2, 2.5, "inside", false).unwrap();
+        let mut after = two.clone();
+        after.holes.push(r(-5.0, -3.0, 105.0, 63.0));
+        let material = after.flat_material().unwrap();
+        assert_eq!(material.len(), 2);
+        assert!(after.parted_from_base(&material, &two).unwrap().is_empty());
     }
 }

@@ -37,6 +37,29 @@ fn check_nested(body: &Body) {
     }
 }
 
+/// Robustness seed 15, shrunk: a sphere cut at a corner of a part with a sealed internal void far
+/// from the sphere. The same cut on the part without the void works; with it, the boolean failed
+/// ("no result", then "the exact fallback … takes planar faces only"). A cut from a box or a
+/// cylinder on the voided part worked.
+#[test]
+fn sphere_cut_far_from_a_void_keeps_the_void() {
+    let block = box_solid(Vec3::ZERO, Vec3::new(40.0, 40.0, 40.0)).unwrap();
+    let cavity = box_solid(Vec3::new(25.0, 25.0, 25.0), Vec3::new(30.0, 30.0, 30.0)).unwrap();
+    let hollow = boolean(&block, &cavity, BoolOp::Cut).unwrap().unwrap();
+    assert_eq!(hollow.solid.boundaries().len(), 2, "the cavity is a second shell");
+    let ball = sphere(Vec3::new(0.0, 0.0, 40.0), 8.0).unwrap();
+    let cut = boolean(&hollow, &ball, BoolOp::Cut).unwrap().unwrap();
+    // The block, less the cavity, less the eighth of the ball inside the corner.
+    let want = 64_000.0 - 125.0 - std::f64::consts::PI * 512.0 / 6.0;
+    let got = measure(&cut).unwrap().volume;
+    assert!((got - want).abs() < want * 1e-3, "volume {got}, want {want}");
+    assert_eq!(cut.solid.boundaries().len(), 2, "the cavity stays a sealed second shell");
+    let mesh = cut.tessellate_with(0.01, true).unwrap();
+    for (p, material) in [(Vec3::new(27.5, 27.5, 27.5), false), (Vec3::new(1.0, 1.0, 39.0), false), (Vec3::new(20.0, 20.0, 20.0), true)] {
+        assert_eq!(mesh.contains(p), material, "material at {p:?}");
+    }
+}
+
 #[test]
 fn nested_cavities_stay_with_their_material_islands_for_every_shell_order() {
     let body = nested_island();

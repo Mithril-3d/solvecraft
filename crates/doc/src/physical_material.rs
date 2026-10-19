@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{DocError, Result};
 
@@ -116,6 +116,10 @@ pub struct Validation {
     pub property_kinds: Vec<String>,
     pub isotropic_moduli: Option<IsotropicModuli>,
     pub unspecified_conditions: Vec<String>,
+    /// Property kind -> absent condition fields under the existing family policy.
+    /// Empty when reading an older report that did not include this detail.
+    #[serde(default)]
+    pub missing_condition_fields: BTreeMap<String, Vec<String>>,
     pub source_review_required: Vec<String>,
     pub analysis_solver_available: bool,
     pub rendering_properties_available: bool,
@@ -256,6 +260,7 @@ impl MaterialCard {
         let mut kinds = BTreeSet::new();
         let mut used_sources = BTreeSet::new();
         let mut unspecified = Vec::new();
+        let mut missing_condition_fields = BTreeMap::new();
         let mut isotropic_moduli = None;
         for property in &self.properties {
             let kind = property.data.kind();
@@ -279,12 +284,20 @@ impl MaterialCard {
             if let Some(state) = &conditions.state {
                 text(state, 1024, "conditions.state")?;
             }
-            if conditions.temperature_k.is_none()
-                || conditions.state.is_none()
-                || (self.family == Family::Wood && conditions.moisture_dry_basis_kg_kg.is_none())
-                || (self.family == Family::Polymer && conditions.strain_rate_per_s.is_none())
-            {
+            let mut missing = Vec::new();
+            for (absent, field) in [
+                (conditions.temperature_k.is_none(), "temperature_k"),
+                (conditions.state.is_none(), "state"),
+                (self.family == Family::Wood && conditions.moisture_dry_basis_kg_kg.is_none(), "moisture_dry_basis_kg_kg"),
+                (self.family == Family::Polymer && conditions.strain_rate_per_s.is_none(), "strain_rate_per_s"),
+            ] {
+                if absent {
+                    missing.push(field.to_string());
+                }
+            }
+            if !missing.is_empty() {
                 unspecified.push(kind.to_string());
+                missing_condition_fields.insert(kind.to_string(), missing);
             }
             if let Some(moduli) = property.data.validate()? {
                 isotropic_moduli = Some(moduli);
@@ -295,6 +308,7 @@ impl MaterialCard {
             property_kinds: kinds.into_iter().collect(),
             isotropic_moduli,
             unspecified_conditions: unspecified,
+            missing_condition_fields,
             source_review_required: used_sources.into_iter().collect(),
             analysis_solver_available: false,
             rendering_properties_available: false,
@@ -305,6 +319,12 @@ impl MaterialCard {
 /// Bound JSON traversal before cloning/deserializing it. Metadata and numeric
 /// bounds are admission limits, not claims about a real material's valid range.
 pub fn validate_card(value: &Value) -> Result<Validation> {
+    admit_card(value)?.validate()
+}
+
+/// Bound and deserialize a candidate before cloning it. Semantic checks belong
+/// to `validate` or the derived query; this alone does not validate the numbers.
+pub fn admit_card(value: &Value) -> Result<MaterialCard> {
     let mut pending = vec![(value, 0usize)];
     let (mut nodes, mut bytes) = (0usize, 0usize);
     while let Some((value, depth)) = pending.pop() {
@@ -345,7 +365,69 @@ pub fn validate_card(value: &Value) -> Result<Validation> {
         }
     }
     let card: MaterialCard = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("material card: {e}")))?;
-    card.validate()
+    Ok(card)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DirectionalModulus {
+    pub direction: [f64; 3],
+    pub axes: Option<MaterialAxes>,
+    pub young_modulus_pa: f64,
+    pub validation: Validation,
+}
+
+impl MaterialCard {
+    /// Uniaxial small-strain modulus in the supplied material-local direction.
+    /// This is a constitutive query, not a body load case or structural solver.
+    pub fn directional_modulus(&self, direction: [f64; 3]) -> Result<DirectionalModulus> {
+        let validation = self.validate()?;
+        if !direction.iter().all(|x| x.is_finite()) {
+            return Err(invalid("direction: expected three finite components"));
+        }
+        let scale = direction.iter().fold(0.0_f64, |a, x| a.max(x.abs()));
+        if scale == 0. {
+            return Err(invalid("direction: must be nonzero"));
+        }
+        let scaled = direction.map(|x| x / scale);
+        let length = scaled.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let direction = scaled.map(|x| x / length);
+        let model = self
+            .properties
+            .iter()
+            .find_map(|p| match &p.data {
+                PropertyData::Elasticity { model } => Some(model),
+                _ => None,
+            })
+            .ok_or_else(|| invalid("elasticity is unspecified"))?;
+        let (axes, modulus) = match model {
+            Elasticity::Isotropic { young_modulus_pa, .. } => (None, *young_modulus_pa),
+            Elasticity::Orthotropic { axes, young_moduli_pa, shear_moduli_pa, poisson_ratios } => {
+                let [x, y, z] = direction;
+                let [e1, e2, e3] = *young_moduli_pa;
+                let [g12, g23, g31] = *shear_moduli_pa;
+                let [n12, n23, n31] = *poisson_ratios;
+                let [a, b, c] = [-n12 * (e2.sqrt() / e1.sqrt()), -n23 * (e3.sqrt() / e2.sqrt()), -n31 * (e1.sqrt() / e3.sqrt())];
+                let minor = 1. - a * a;
+                let determinant = 1. + 2. * a * b * c - a * a - b * b - c * c;
+                // Cholesky of the scaled normal compliance: evaluate the energy
+                // as sums of squares instead of cancelling positive/negative terms.
+                let l22 = minor.sqrt();
+                let l32 = (b - a * c) / l22;
+                let l33 = (determinant / minor).sqrt();
+                let [u, v, w] = [x * x / e1.sqrt(), y * y / e2.sqrt(), z * z / e3.sqrt()];
+                let terms = [u + a * v + c * w, l22 * v + l32 * w, l33 * w];
+                let compliance = terms.iter().map(|t| t * t).sum::<f64>() + (x * y).powi(2) / g12 + (y * z).powi(2) / g23 + (z * x).powi(2) / g31;
+                if !compliance.is_finite() || compliance <= 0. {
+                    return Err(invalid("directional compliance is unrepresentable"));
+                }
+                (Some(*axes), compliance.recip())
+            }
+        };
+        if !modulus.is_finite() || modulus <= 0. {
+            return Err(invalid("directional modulus is unrepresentable"));
+        }
+        Ok(DirectionalModulus { direction, axes, young_modulus_pa: modulus, validation })
+    }
 }
 
 #[cfg(test)]

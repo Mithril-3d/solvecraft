@@ -18,5 +18,12 @@ A few rules follow from the layering:
 - **Everything the user can do is a command** in `crates/engine`. See
   [The command engine](commands.md).
 - **The front end is swappable.** Nothing below `ui-egui` depends on egui. The CLI and the MCP
-  server run the same engine without a window, and `crates/render` has a CPU rasterizer so
-  headless screenshots work anywhere.
+  server run the same engine without a window. Headless pictures (`solidcraft-cli snapshot`, MCP
+  screenshots, `ui.render`, thumbnails) are drawn on the GPU with the viewport's own pipelines
+  (`crates/gpu`, `capture`): the engine describes the scene (`view::scene`) and the host installs
+  the renderer (`engine::capture`). The tiers, in order: a hardware GPU, a software adapter (Mesa
+  lavapipe or llvmpipe, WARP), and last `crates/render`'s CPU rasterizer, which draws no surface
+  analysis, highlights or legends. `SOLIDCRAFT_GPU=auto` walks all three, `hardware` and `software`
+  stay on their tier (an error without one), `cpu` forces the rasterizer; every picture's reply
+  names its `renderer` (`gpu`, `gpu-software`, `cpu`) and a CPU picture carries a warning.
+  `solidcraft-cli gpu` lists the adapters and the tier the policy lands on.

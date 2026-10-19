@@ -27,7 +27,7 @@ const KNOWN: [(&str, &str, &str); 2] = [
     (
         "m0-revolve-primitives",
         "Body1 bbox",
-        "partial revolves turn toward the sketch normal since ac43365 (as Fusion's do); M0 turned them the other way",
+        "partial revolves turn toward the sketch normal since ac43365 (as most parametric CAD tools do); M0 turned them the other way",
     ),
     ("components-arm", "body_count", "Measure counted only the root component's bodies then; it measures every placed body now"),
 ];

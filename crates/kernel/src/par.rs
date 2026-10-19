@@ -33,6 +33,37 @@ pub fn for_each_on_threads<T: Sync>(items: &[T], max_threads: usize, f: impl Fn(
     let _ = map_on_threads(items, max_threads, f);
 }
 
+/// Independent kernel jobs, with one computation lane per native dispatcher. Each dispatcher
+/// owns a single-thread Rayon pool: nested triangulation neither queues behind a common
+/// one-thread pool nor multiplies the requested concurrency. No second body can be stolen by
+/// a worker while it fills a shared lazy mesh cell. The browser runs serially.
+pub fn map_with_local_pools<T: Sync, R: Send>(items: &[T], max_threads: usize, f: impl Fn(&T) -> Result<R> + Sync) -> Vec<Result<R>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let one = |item: &T| {
+        use std::cell::OnceCell;
+        thread_local! {
+            static POOL: OnceCell<rayon::ThreadPool> = const { OnceCell::new() };
+        }
+        POOL.with(|cell| {
+            if cell.get().is_none() {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .map_err(|e| crate::KernelError::Failed(format!("cannot start mesh worker: {e}")))?;
+                let _ = cell.set(pool);
+            }
+            let pool = cell.get().ok_or_else(|| crate::KernelError::Failed("missing mesh worker".into()))?;
+            pool.install(|| guard("mesh worker", || f(item)))
+        })
+    };
+    #[cfg(target_arch = "wasm32")]
+    let one = |item: &T| guard("mesh worker", || f(item));
+    map_on_threads(items, max_threads, one)
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err(crate::KernelError::Internal("mesh worker failed".into()))))
+        .collect()
+}
+
 /// `f` over `items` as [`for_each_on_threads`] runs it, results in item order (`None` where an
 /// item panicked).
 pub fn map_on_threads<T: Sync, R: Send>(items: &[T], max_threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
@@ -81,6 +112,19 @@ pub fn map_on_threads<T: Sync, R: Send>(items: &[T], max_threads: usize, f: impl
 mod tests {
     use super::*;
     use crate::KernelError;
+
+    #[test]
+    fn local_pools_keep_order_and_errors_and_bound_nested_parallelism() {
+        let items: Vec<usize> = (0..32).collect();
+        let result = map_with_local_pools(&items, 8, |i| {
+            #[cfg(not(target_arch = "wasm32"))]
+            assert_eq!(rayon::current_num_threads(), 1);
+            if *i == 7 { Err(KernelError::Invalid("seven".into())) } else { Ok(*i * 2) }
+        });
+        for (i, r) in result.iter().enumerate() {
+            assert_eq!(r.as_ref().ok().copied(), (i != 7).then_some(i * 2));
+        }
+    }
 
     #[test]
     fn each_item_once_on_threads() {

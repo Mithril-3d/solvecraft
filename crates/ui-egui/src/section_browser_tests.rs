@@ -52,9 +52,17 @@ fn the_eye_hides_and_shows_the_section_and_delete_removes_it() {
     let back = h.app.session.section.expect("the eye turns it back on");
     assert!((back.0 - section.0).len() < 1e-9 && (back.1 - section.1).len() < 1e-9, "the same plane: {back:?} vs {section:?}");
 
-    // The folder's eye does the same.
+    // The folder's eye is its own: hiding it turns the section off without changing the
+    // section's eye, and hiding the section doesn't change the folder's.
     click(&mut h, "eye:Analysis");
     assert_eq!(h.app.session.section, None);
+    assert!(h.app.tree.analysis_hidden && !h.app.tree.section_hidden);
+    menu(&mut h, "Show/Hide");
+    assert!(h.app.session.section.is_none() && h.app.tree.section_hidden, "the menu hides the section itself");
+    assert!(h.app.tree.analysis_hidden, "the section's eye doesn't change the folder's");
+    click(&mut h, "eye:Analysis");
+    assert_eq!(h.app.session.section, None, "the section was hidden on its own meanwhile");
+    assert!(!h.app.tree.analysis_hidden);
     menu(&mut h, "Show/Hide");
     assert!(h.app.session.section.is_some(), "Show/Hide in the menu brings it back");
 

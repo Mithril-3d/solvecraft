@@ -16,6 +16,50 @@ use crate::scenario::Harness;
 use crate::selection::{AXES, CURVES, POINTS, SelInput};
 use crate::sketch_modify_ui::{Mod, commands};
 
+#[test]
+fn existing_patterns_reopen_from_menu_and_badge_and_edit_without_changing_surviving_ids() {
+    for circular in [false, true] {
+        let mut h = Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[10,0],[20,0]],"ids":["l1"]})).unwrap();
+        let cmd = if circular { "sketch.pattern.circular" } else { "sketch.pattern.rectangular" };
+        let p = if circular {
+            json!({"entities":["l1"],"center":"origin","count":4})
+        } else {
+            json!({"entities":["l1"],"dir":[0,1],"count":4,"spacing":12})
+        };
+        let out = h.app.run(cmd, p).unwrap();
+        let before = h.app.session.doc.to_json();
+        h.app.session.selection = vec![Sel::SketchCurve { id: "l2".into() }];
+        h.settle();
+        let menu = crate::context_menu::items(&h.app, &crate::context_menu::Target::Viewport);
+        let item = menu.iter().find(|item| item.id == "ui.editSketchPattern").expect("a copy offers Edit Sketch Pattern");
+        crate::context_menu::run_item(&mut h.app, item, egui::pos2(0.0, 0.0));
+        assert_eq!(h.app.session.doc.to_json(), before, "opening the editor commits nothing");
+        let d = h.app.dialog.as_ref().unwrap();
+        assert_eq!(d.extra["pattern"], out["pattern"]);
+        let cmds = apply_commands(&h.app, d).unwrap();
+        if !circular {
+            assert_eq!(cmds[0].1["dir"], json!([0.0, 1.0]));
+        }
+        h.app.dialog = None;
+        h.settle();
+        let cid = out["constraints"][0].as_str().unwrap();
+        let at = crate::sketch_tools::glyph_positions().into_iter().find(|(id, _)| id == cid).expect("pattern has a badge").1;
+        assert!(crate::sketch_modify_ui::double_click_pattern(&mut h.app, at));
+        let d = h.app.dialog.as_mut().unwrap();
+        match &mut d.kind {
+            Kind::SketchModify(Mod::PatternCirc { count, .. }) | Kind::SketchModify(Mod::PatternRect { count, .. }) => *count = "5".into(),
+            _ => panic!("wrong pattern editor"),
+        }
+        let d = h.app.dialog.clone().unwrap();
+        let cmds = apply_commands(&h.app, &d).unwrap();
+        let result = h.app.run(&cmds[0].0, cmds[0].1.clone()).unwrap();
+        assert_eq!(result["curves"][0], "l2");
+        assert_eq!(result["curves"].as_array().unwrap().len(), 4);
+    }
+}
+
 /// A sketch on XY holding one 20 by 10 rectangle at the origin.
 fn rectangle() -> Harness {
     let mut h = Harness::new();
@@ -239,7 +283,8 @@ fn moved(x: &str, y: &str, angle: &str) -> Mod {
 fn the_command_now_has_a_toolbar_placement_and_opens_a_window() {
     let spec = solidcraft_engine::find_command("sketch.move").expect("sketch.move is registered");
     assert_eq!((spec.tab, spec.panel), ("SKETCH", "MODIFY"));
-    assert_eq!(spec.icon, "move");
+    assert_eq!(spec.icon, "sketch_move");
+    assert_eq!(crate::icon_svg::resolve(spec.icon).master, "move", "reuse the finished Move drawing");
 
     let mut h = rectangle();
     let before = curve_ids(&h).len();
@@ -412,7 +457,7 @@ fn open(cmd: &str) -> (crate::scenario::Harness, String) {
 
 fn rect(h: &mut crate::scenario::Harness, count: &str, spacing: &str, count2: &str, spacing2: &str) {
     let d = h.app.dialog.as_mut().expect("the window opened");
-    if let Kind::SketchModify(Mod::PatternRect { count: c1, spacing: s1, count2: c2, spacing2: s2 }) = &mut d.kind {
+    if let Kind::SketchModify(Mod::PatternRect { count: c1, spacing: s1, count2: c2, spacing2: s2, .. }) = &mut d.kind {
         *c1 = count.into();
         *s1 = spacing.into();
         *c2 = count2.into();
@@ -428,10 +473,56 @@ fn rectangular_pattern_window_opens_instead_of_a_click_tool() {
     assert!(h.app.tool.is_none(), "the click tool still takes the command");
     let d = h.app.dialog.as_ref().expect("the window opened");
     assert!(matches!(d.kind, Kind::SketchModify(Mod::PatternRect { .. })), "{:?}", d.kind);
-    assert_eq!(d.inputs.iter().map(|i| i.label).collect::<Vec<_>>(), vec!["Entities", "Direction"]);
+    assert_eq!(d.inputs.iter().map(|i| i.label).collect::<Vec<_>>(), vec!["Entities", "Direction", "Direction 2"]);
     // Nothing is committed by opening the window.
     let sid = h.app.session.active_sketch.unwrap();
     assert_eq!(h.app.session.model.state().sketch(sid).unwrap().sketch.curves.len(), 1);
+}
+
+#[test]
+fn rectangular_columns_flip_and_center_independently_and_restore_even_counts_when_editing() {
+    use solidcraft_engine::sketch::PatternAlignment;
+    let (mut h, id) = open("sketch.pattern.rectangular");
+    h.app.dialog.as_mut().unwrap().inputs[0].items = vec![Sel::SketchCurve { id }];
+    rect(&mut h, "4", "20", "2", "10");
+    h.settle();
+    let first = crate::scenario::handle_at("dialog:Spacing").unwrap();
+    let second = crate::scenario::handle_at("dialog:Spacing 2").unwrap();
+    assert!(second.x - first.x > 180.0, "the directions should occupy separate columns: {first:?}, {second:?}");
+    assert!((second.y - first.y).abs() < 2.0, "the independent spacing fields should share a row");
+    for label in ["Alignment", "Alignment 2"] {
+        let left = crate::scenario::handle_at(&format!("dialog:{label}:Flip direction")).unwrap();
+        let right = crate::scenario::handle_at(&format!("dialog:{label}:Center")).unwrap();
+        assert!((left.y - right.y).abs() < 2.0, "alignment choices should fit on a single line: {left:?}, {right:?}");
+    }
+    h.step(&json!({"click":{"handle":"dialog:Alignment:Center"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Alignment 2:Flip direction"}})).unwrap();
+    let d = h.app.dialog.as_ref().unwrap();
+    let commands = apply_commands(&h.app, d).unwrap();
+    assert_eq!(commands[0].1["alignment"], "center");
+    assert_eq!(commands[0].1["alignment2"], "right");
+    assert_eq!(commands[0].1["reversed2"], true);
+    assert_eq!(commands[0].1["count"], 4);
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_none());
+    let sid = h.app.session.active_sketch.unwrap();
+    let pattern = h.app.session.world_state().sketch(sid).unwrap().sketch.patterns[0].id.clone();
+    assert!(crate::sketch_modify_ui::edit_pattern(&mut h.app, &pattern));
+    assert!(matches!(
+        h.app.dialog.as_ref().unwrap().kind,
+        Kind::SketchModify(Mod::PatternRect { alignment: PatternAlignment::Center, alignment2: PatternAlignment::Right, reversed2: true, .. })
+    ));
+    rect(&mut h, "4", "20", "3", "10");
+    assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_ok());
+    h.settle();
+    h.step(&json!({"click":{"handle":"dialog:Alignment:Flip direction"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Alignment 2:Center"}})).unwrap();
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands[0].1["alignment"], "center");
+    assert_eq!(commands[0].1["reversed"], true);
+    assert_eq!(commands[0].1["alignment2"], "center");
+    assert_eq!(commands[0].1["reversed2"], true);
 }
 
 #[test]
@@ -460,6 +551,45 @@ fn a_picked_axis_becomes_an_in_plane_direction() {
     let d = h.app.dialog.clone().unwrap();
     let cmds = apply_commands(&h.app, &d).unwrap();
     assert_eq!(cmds[0].1["dir"], json!([0.0, 1.0]), "sketch y on the XY plane");
+}
+
+#[test]
+fn two_picked_lines_are_sent_as_live_references_and_restored_in_the_editor() {
+    let (mut h, id) = open("sketch.pattern.rectangular");
+    h.app.run("sketch.line", json!({"points":[[0,-20],[10,-20]],"ids":["dir1"]})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,-40],[6,-32]],"ids":["dir2"]})).unwrap();
+    let d = h.app.dialog.as_mut().unwrap();
+    d.inputs[0].items = vec![Sel::SketchCurve { id }];
+    d.inputs[1].items = vec![Sel::SketchCurve { id: "dir1".into() }];
+    d.inputs[2].items = vec![Sel::SketchCurve { id: "dir2".into() }];
+    rect(&mut h, "3", "20", "2", "10");
+    let d = h.app.dialog.clone().unwrap();
+    let cmds = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(cmds[0].1["direction"], "dir1");
+    assert_eq!(cmds[0].1["direction2"], "dir2");
+    let out = h.app.run(&cmds[0].0, cmds[0].1.clone()).unwrap();
+    assert!(crate::sketch_modify_ui::edit_pattern(&mut h.app, out["pattern"].as_str().unwrap()));
+    let d = h.app.dialog.as_ref().unwrap();
+    assert_eq!(d.inputs[1].items, vec![Sel::SketchCurve { id: "dir1".into() }]);
+    assert_eq!(d.inputs[2].items, vec![Sel::SketchCurve { id: "dir2".into() }]);
+    let reopened = apply_commands(&h.app, d).unwrap();
+    assert_eq!(reopened[0].1["direction2"], "dir2");
+}
+
+#[test]
+fn sketch_pattern_tools_are_promoted_together_and_open_from_the_toolbar() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    let panels = crate::toolbar_custom::panel_lists("SKETCH");
+    let (_, cmds, promoted) = panels.iter().find(|(panel, ..)| *panel == "PATTERN").unwrap();
+    let ids: Vec<_> = cmds.iter().take(*promoted).map(|c| c.id).collect();
+    assert_eq!(ids, ["sketch.mirror", "sketch.pattern.rectangular", "sketch.pattern.circular"]);
+    for id in ids {
+        h.settle();
+        h.step(&json!({"click":{"handle":format!("toolbar:{id}")}})).unwrap();
+        assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(Kind::SketchModify(_))), "{id}");
+        h.step(&json!({"key":"Escape"})).unwrap();
+    }
 }
 
 #[test]
@@ -546,7 +676,7 @@ fn open_circ() -> (crate::scenario::Harness, String) {
 
 fn circ(h: &mut crate::scenario::Harness, count: &str, angle: &str) {
     let d = h.app.dialog.as_mut().expect("the window opened");
-    if let Kind::SketchModify(Mod::PatternCirc { count: c, angle: a }) = &mut d.kind {
+    if let Kind::SketchModify(Mod::PatternCirc { count: c, angle: a, .. }) = &mut d.kind {
         *c = count.into();
         *a = angle.into();
     } else {
@@ -581,6 +711,41 @@ fn the_typed_count_and_total_angle_reach_the_command() {
     circ(&mut h, "4", "90 deg");
     let d = h.app.dialog.clone().unwrap();
     assert_eq!(apply_commands(&h.app, &d).unwrap()[0].1["angle"], json!(90.0));
+}
+
+#[test]
+fn circular_flip_and_center_buttons_apply_and_reopen_the_saved_placement() {
+    use solidcraft_engine::sketch::{PatternAlignment, SketchPatternKind};
+    let (mut h, _) = open_circ();
+    circ(&mut h, "6", "90 deg");
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"dialog:Alignment:Center"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Alignment:Flip direction"}})).unwrap();
+    let d = h.app.dialog.clone().unwrap();
+    let params = &apply_commands(&h.app, &d).unwrap()[0].1;
+    assert_eq!(params["count"], json!(6));
+    assert_eq!(params["angle"], json!(90.));
+    assert_eq!(params["alignment"], json!("center"));
+    assert_eq!(params["reversed"], json!(true));
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    let sid = h.app.session.active_sketch.unwrap();
+    let id = {
+        let state = h.app.session.world_state();
+        let pattern = &state.sketch(sid).unwrap().sketch.patterns[0];
+        assert!(matches!(pattern.kind, SketchPatternKind::Circular { alignment: PatternAlignment::Center, reversed: true, .. }));
+        pattern.id.clone()
+    };
+    assert!(crate::sketch_modify_ui::edit_pattern(&mut h.app, &id));
+    assert!(matches!(
+        h.app.dialog.as_ref().unwrap().kind,
+        Kind::SketchModify(Mod::PatternCirc { alignment: PatternAlignment::Center, reversed: true, .. })
+    ));
+    h.frames(3);
+    h.step(&json!({"click":{"handle":"dialog:Alignment:Center"}})).unwrap();
+    let d = h.app.dialog.clone().unwrap();
+    let params = &apply_commands(&h.app, &d).unwrap()[0].1;
+    assert_eq!(params["alignment"], json!("right"));
+    assert_eq!(params["reversed"], json!(true));
 }
 
 /// The same lesson as upstream #218: `num` reads a JSON number only, and `sketch.pattern.circular`

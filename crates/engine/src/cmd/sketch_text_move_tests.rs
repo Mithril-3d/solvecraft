@@ -214,3 +214,160 @@ fn text_style_parameters_are_checked() {
     let LinkSource::Text { style, .. } = &s.doc.sketch(1).unwrap().link(&link).unwrap().source else { panic!() };
     assert!(style.italic && style.letter_spacing == 1.5);
 }
+
+/// `base` with the keys of `extra` set (a null `extra` value is sent as null).
+fn with(mut base: Value, extra: &Value) -> Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
+}
+
+const AT: &str = "`at` must be the baseline start [x, y]";
+const HEIGHT: &str = "`height` must be a length in mm";
+const ANGLE: &str = "`angle` must be an angle in degrees";
+const TEXT: &str = "`text` must be a string";
+
+/// Inputs of `sketch.text` and `sketch.edit_text` that were once read as "not given": a height of
+/// "H" drew the text 5 mm high, `at: ["H", 25]` put it at the origin. Each with its message.
+fn not_understood() -> Vec<(Value, &'static str)> {
+    vec![
+        // A string is an expression now: one naming no parameter is refused as such.
+        (json!({"height":"H"}), "unknown parameter `H`"),
+        (json!({"height":true}), HEIGHT),
+        (json!({"height":[10]}), HEIGHT),
+        (json!({"height":1e10}), HEIGHT),
+        (json!({"height":0}), "`height` must be positive"),
+        (json!({"height":-3}), "`height` must be positive"),
+        (json!({"angle":"A"}), "unknown parameter `A`"),
+        (json!({"angle":[15]}), ANGLE),
+        (json!({"angle":1e10}), ANGLE),
+        (json!({"at":["H",25]}), "unknown parameter `H`"),
+        (json!({"at":[1]}), AT),
+        (json!({"at":[1,2,3]}), AT),
+        (json!({"at":[1,null]}), AT),
+        (json!({"at":[1e10,0]}), AT),
+        (json!({"at":"origin"}), AT),
+        (json!({"at":7}), AT),
+        (json!({"text":5}), TEXT),
+        (json!({"text":true}), TEXT),
+        (json!({"text":["I"]}), TEXT),
+    ]
+}
+
+#[test]
+fn sketch_text_refuses_inputs_it_does_not_understand() {
+    let (mut s, _, _) = setup();
+    let before = s.doc.to_json();
+    let undo = s.undo.len();
+    let base = json!({"text":"I","at":[0,0],"height":10});
+    let mut cases = not_understood();
+    // `at` is required: left out or null is refused too (null no longer means the origin).
+    cases.push((json!({"at":null}), AT));
+    for (extra, error) in cases {
+        let params = with(base.clone(), &extra);
+        let e = s.execute("sketch.text", &params).unwrap_err().to_string();
+        assert!(e.contains(error), "{params}: {e}");
+        assert_eq!(s.doc.to_json(), before, "{params}");
+        assert_eq!(s.undo.len(), undo, "{params}");
+    }
+    let e = s.execute("sketch.text", &json!({"text":"I","height":10})).unwrap_err().to_string();
+    assert!(e.contains(AT), "{e}");
+    // No text at all is still the empty-text error.
+    let e = s.execute("sketch.text", &json!({"at":[0,0]})).unwrap_err().to_string();
+    assert!(e.contains("`text` must not be empty"), "{e}");
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn sketch_edit_text_refuses_inputs_it_does_not_understand() {
+    let (mut s, link, _) = setup();
+    let before = s.doc.to_json();
+    let undo = s.undo.len();
+    for (extra, error) in not_understood() {
+        let params = with(json!({"link":link}), &extra);
+        for live in [false, true] {
+            let params = with(params.clone(), &json!({"live":live}));
+            let e = s.execute("sketch.edit_text", &params).unwrap_err().to_string();
+            assert!(e.contains(error), "{params}: {e}");
+            assert_eq!(s.doc.to_json(), before, "{params}");
+            assert_eq!(s.undo.len(), undo, "{params}");
+        }
+    }
+}
+
+fn text_source_of(s: &Session, link: &str) -> (String, Vec2, f64, f64) {
+    let LinkSource::Text { text, at, height, angle, .. } = &s.doc.sketch(1).unwrap().link(link).unwrap().source else { panic!() };
+    (text.clone(), *at, *height, *angle)
+}
+
+#[test]
+fn sketch_text_inputs_left_out_or_null_keep_their_defaults() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    // Optional inputs left out, or null: the defaults (5 mm, no angle). `at` as {x, y} is fine.
+    for (params, at) in [
+        (json!({"text":"I","at":[4,6]}), Vec2::new(4.0, 6.0)),
+        (json!({"text":"I","at":{"x":4,"y":6},"height":null,"angle":null,"font":null}), Vec2::new(4.0, 6.0)),
+    ] {
+        let t = run(&mut s, "sketch.text", params);
+        let (text, got, height, angle) = text_source_of(&s, t["link"].as_str().unwrap());
+        assert_eq!((text.as_str(), height, angle), ("I", 5.0, 0.0));
+        assert!(got.dist(at) < 1e-12, "{got:?}");
+    }
+    // Given values are used, an angle of 0 and a negative position among them.
+    let t = run(&mut s, "sketch.text", json!({"text":"I","at":[-4.5,6],"height":12.5,"angle":0}));
+    let (_, at, height, angle) = text_source_of(&s, t["link"].as_str().unwrap());
+    assert!(at.dist(Vec2::new(-4.5, 6.0)) < 1e-12 && height == 12.5 && angle == 0.0, "{at:?} {height} {angle}");
+    let t = run(&mut s, "sketch.text", json!({"text":"I","at":[0,0],"angle":90}));
+    assert!((text_source_of(&s, t["link"].as_str().unwrap()).3 - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+
+    // An edit keeps what it leaves out, or sends as null, and changes what it gives.
+    let (mut s, link, _) = setup();
+    let old = text_source_of(&s, &link);
+    run(&mut s, "sketch.edit_text", json!({"link":link,"text":null,"at":null,"height":null,"angle":null}));
+    assert_eq!(text_source_of(&s, &link), old);
+    run(&mut s, "sketch.edit_text", json!({"link":link,"height":20,"angle":0}));
+    let (text, at, height, angle) = text_source_of(&s, &link);
+    assert_eq!((text.as_str(), height, angle), ("II", 20.0, 0.0));
+    assert!(at.dist(Vec2::new(3.0, 4.0)) < 1e-12, "{at:?}");
+}
+
+/// A text set on a spline stands on it, its descenders below it: the spline becomes
+/// construction, so it doesn't cut the letters into pieces. Every profile is then the text's
+/// alone (picking the text picks letters, not pieces of letters and curve), and one undo puts
+/// the text and the curve back as they were.
+#[test]
+fn a_text_on_a_spline_turns_its_path_into_a_guide() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    let spline = run(&mut s, "sketch.spline.fit_point", json!({"points":[[0,0],[30,15],[60,0],[90,10]]}))["created"]["curves"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let construction = |s: &Session| {
+        let sk = s.doc.sketch(s.active_sketch.unwrap()).unwrap();
+        sk.curves.iter().find(|c| c.id == spline).unwrap().construction
+    };
+    let t = run(&mut s, "sketch.text", json!({"text":"Phago","at":[0,0],"height":10,"path":spline}));
+    assert_eq!(t["guide"], json!(spline));
+    assert!(construction(&s));
+    let state = s.world_state();
+    let ss = state.sketch(s.active_sketch.unwrap()).unwrap();
+    for (i, p) in ss.profiles.iter().enumerate() {
+        let alone = p.curve_ids().iter().all(|id| ss.sketch.curves.iter().any(|c| &c.id == id && c.link.is_some()));
+        assert!(alone, "profile {i} is bounded by the spline too");
+    }
+    // Taken off the curve, the text leaves it a guide; set on it again, nothing changes.
+    let link = t["link"].as_str().unwrap().to_string();
+    run(&mut s, "sketch.edit_text", json!({"link":link,"path":""}));
+    assert!(construction(&s));
+    assert_eq!(run(&mut s, "sketch.edit_text", json!({"link":link,"path":spline}))["guide"], json!(null));
+    // One undo for each step, back to the text's first state, then to before it.
+    for _ in 0..3 {
+        run(&mut s, "edit.undo", json!({}));
+    }
+    assert!(!construction(&s), "undoing the text gives the curve back");
+}

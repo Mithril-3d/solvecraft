@@ -188,3 +188,24 @@ fn identifiers_and_json_reject_unsafe_or_unsupported_input() {
         assert!(serde_json::from_str::<RenderRequest>(text).is_err());
     }
 }
+
+#[test]
+fn fit_scales_both_axes_into_dimension_pixel_and_scratch_limits() {
+    let limits = RenderLimits::default();
+    assert_eq!(limits.fit(1920, 1080, None), Some((1920, 1080)));
+    assert_eq!(limits.fit(4096, 4096, None), Some((2048, 2048)));
+    assert_eq!(limits.fit(0, 1080, None), None);
+    // One long side: the dimension limit binds first.
+    assert_eq!(limits.fit(8192, 16, None), Some((4096, 8)));
+    for (w, h) in [(3840, 2160), (5120, 2880), (7680, 4320), (2160, 3840)] {
+        let (fw, fh) = limits.fit(w, h, None).unwrap();
+        assert!(fw <= 4096 && fh <= 4096 && fw * fh <= limits.max_pixels, "{w}x{h} -> {fw}x{fh}");
+        // Same aspect (within a pixel) and close to the budget.
+        assert!((fw as f64 / fh as f64 - w as f64 / h as f64).abs() < 2.0 / fh.min(fw) as f64, "{fw}x{fh}");
+        assert!(fw * fh > limits.max_pixels * 99 / 100, "{fw}x{fh}");
+    }
+    // A scratch layout tighter than the pixel limit binds instead.
+    let scratch = ScratchLayout { sample_scale: 1, sample_bytes_per_pixel: 128, output_bytes_per_pixel: 8, encoding_bytes_per_pixel: 0 };
+    let (fw, fh) = limits.fit(3840, 2160, Some(scratch)).unwrap();
+    assert!(scratch.estimate(fw, fh).unwrap() <= limits.max_scratch_bytes && fw * fh < limits.max_pixels, "{fw}x{fh}");
+}

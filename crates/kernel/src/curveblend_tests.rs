@@ -8,6 +8,54 @@ use crate::blend::plane_normal;
 use crate::issue_851_tests::planned_volume;
 use crate::{Body, BoolOp, boolean, cylinder, fillet};
 
+#[test]
+fn issue_1303_chamfer_open_rim_after_end_chamfer() {
+    use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2};
+    let rim = Region2 {
+        outer: Loop2 {
+            segs: vec![
+                Seg2::Line { a: Vec2::new(31.0, -15.0), b: Vec2::new(31.0, -11.75) },
+                Seg2::Line { a: Vec2::new(31.0, -11.75), b: Vec2::new(0.0, -11.75) },
+                Seg2::Arc { center: Vec2::ZERO, radius: 11.75, start: -std::f64::consts::FRAC_PI_2, sweep: -std::f64::consts::PI },
+                Seg2::Line { a: Vec2::new(0.0, 11.75), b: Vec2::new(31.0, 11.75) },
+                Seg2::Line { a: Vec2::new(31.0, 11.75), b: Vec2::new(31.0, 15.0) },
+                Seg2::Line { a: Vec2::new(31.0, 15.0), b: Vec2::new(0.0, 15.0) },
+                Seg2::Arc { center: Vec2::ZERO, radius: 15.0, start: std::f64::consts::FRAC_PI_2, sweep: std::f64::consts::PI },
+                Seg2::Line { a: Vec2::new(0.0, -15.0), b: Vec2::new(31.0, -15.0) },
+            ],
+        },
+        holes: vec![],
+    };
+    let mut body = crate::extrude(&Plane::XY, &[rim], 0.0, 13.0).unwrap().pop().unwrap();
+    // Exact local end bevels, meeting at the four-face vertices (30, +/-11.75, 13).
+    body = crate::blend_corner::chamfer(
+        &body,
+        &[Vec3::new(31.0, 13.375, 13.0), Vec3::new(31.0, -13.375, 13.0), Vec3::new(31.0, 11.75, 8.0), Vec3::new(31.0, -11.75, 8.0)],
+        1.0,
+    )
+    .unwrap();
+    let picks = [Vec3::new(-11.75, 0.0, 13.0), Vec3::new(15.0, 11.75, 13.0), Vec3::new(15.0, -11.75, 13.0)];
+    let result = crate::chamfer(&body, &picks, 1.0).unwrap();
+    assert!(result.validity().is_empty(), "{:?}", result.validity());
+    assert_eq!(result.crossed_face_loops().unwrap(), 0);
+    // At height 12 + u, the removed half-ring area is pi/2 * (2*r*u + u^2).
+    // The straight strips end at min(31-u, 30+v), 0 <= v <= u. Their integral
+    // over 0 <= u <= 1 is 30 + 1/6; this includes both split end sections.
+    let expected = 30.0 + 1.0 / 6.0 + std::f64::consts::PI * (11.75 / 2.0 + 1.0 / 6.0);
+    let volume = |b: &Body| b.tessellate_with(0.0001, true).unwrap().measure().volume;
+    let removed = volume(&body) - volume(&result);
+    assert!((removed - expected).abs() < 0.02, "removed {removed}, expected {expected}");
+    for p in [Vec3::new(30.5, 12.25, 12.5), Vec3::new(30.5, -12.25, 12.5)] {
+        assert!(result.solid.vertex_iter().any(|v| from_p3(v.point()).dist(p) < 1e-6));
+    }
+    for selection in [vec![picks[0]], picks.into_iter().rev().collect()] {
+        let other = crate::chamfer(&body, &selection, 1.0).unwrap();
+        assert!(other.validity().is_empty(), "{:?}", other.validity());
+        assert!((volume(&body) - volume(&other) - expected).abs() < 0.02);
+    }
+    assert!(crate::chamfer(&body, &picks, 4.0).is_err());
+}
+
 fn tee(scale: f64, origin: Vec3) -> Body {
     let main = cylinder(origin + Vec3::new(-40.0, 0.0, 0.0) * scale, Vec3::X, 15.0 * scale, 80.0 * scale).unwrap();
     let branch = cylinder(origin, Vec3::Z, 10.0 * scale, 35.0 * scale).unwrap();
@@ -644,4 +692,40 @@ fn chamfer_a_chain_of_a_line_and_an_arc_into_a_slanted_end() {
     let want = 40.0 + arc;
     let got = volume(&body) - volume(&made);
     assert!((got - want).abs() < want * 1e-3, "removed {got} vs {want}");
+}
+
+/// #1667: an R1 round around the end of a long bar whose four long edges are R5. The chain is
+/// 290 mm lines and quarter turns of 7.85 mm, so the lines' sections are spaced far wider than
+/// the turns'; borrowing the turns' sections for the lines' ends made their strips overshoot and
+/// fold back past the joints, the strips' meshes folded with them, and the measured volume came
+/// out thousands of mm³ off. The R1 pipe is exact: the corner's section, `1 - π/4`, along the
+/// lines, and round each turn's axis at the section's centroid (Pappus).
+#[test]
+fn round_along_long_lines_and_small_turns_measures_its_volume() {
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+    let (w, d, h) = (300.0, 60.0, 40.0);
+    let bar = crate::build::box_solid(Vec3::new(-w / 2.0, 0.0, 0.0), Vec3::new(w / 2.0, d, h)).unwrap();
+    let long = [Vec3::new(-w / 2.0, d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, 0.0), Vec3::new(-w / 2.0, d / 2.0, h), Vec3::new(w / 2.0, d / 2.0, h)];
+    let rounded = fillet(&bar, &long, 5.0).unwrap();
+    // The rolling ball along the end face's loop (the exact blends would take this loop; a
+    // loop next to free-form faces, as in the issue, comes here).
+    let ids: Vec<mt::EdgeID> = crate::body::Body::unique_edges(&rounded.solid)
+        .into_iter()
+        .filter(|e| [e.front(), e.back()].iter().all(|v| crate::blend::vtx(v).y.abs() < 1e-9))
+        .map(|e| e.id())
+        .collect();
+    assert_eq!(ids.len(), 8);
+    let (solid, _) = crate::guard("test", || curve_blend(&rounded.solid, &ids, rounded.size(), 1.0, true)).unwrap();
+    let body = Body::new(solid).unwrap();
+    assert!(body.validity().is_empty(), "{:?}", body.validity());
+    let section = 1.0 - FRAC_PI_4;
+    // The section's centroid lies this far from its corner along each side.
+    let inset = (5.0 / 6.0 - FRAC_PI_4) / section;
+    let lines = 2.0 * (w - 10.0) + 2.0 * (h - 10.0);
+    let turns = 4.0 * FRAC_PI_2 * (5.0 - inset);
+    let want = w * d * h - 4.0 * 25.0 * section * d - section * (lines + turns);
+    let m = crate::measure(&body).unwrap();
+    assert!((m.volume - want).abs() < 1e-5 * want, "{} vs {want}", m.volume);
+    // Centred across the bar, as the part is.
+    assert!(m.centroid.x.abs() < 1e-3, "centre of mass x {}", m.centroid.x);
 }

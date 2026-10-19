@@ -102,10 +102,71 @@ fn driven_by(s: &Session, name: &str) -> Vec<String> {
     sk(s).constraints.iter().filter(|c| c.param.as_deref() == Some(name)).map(|c| c.id.clone()).collect()
 }
 
+#[test]
+fn fully_defined_rectangles_keep_their_size_when_all_corners_are_filleted() {
+    for center in [false, true] {
+        for square in [false, true] {
+            let mut s = new_sketch();
+            let height = if square { 40.0 } else { 20.0 };
+            let r = if center {
+                run(&mut s, "sketch.rectangle.center", json!({"center": [0, 0], "corner": [20, height / 2.0]}))
+            } else {
+                run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, height]}))
+            };
+            let anchor = if center { "p5" } else { "p1" };
+            run(&mut s, "sketch.constraint.coincident", json!({"a": anchor, "b": "origin"}));
+            let width = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 40}));
+            if square {
+                run(&mut s, "sketch.constraint.equal", json!({"a": "l1", "b": "l2"}));
+            } else {
+                run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "value": height}));
+            }
+            let info = run(&mut s, "sketch.inspect", json!({}));
+            assert_eq!(info["dof"], 0, "{info}");
+            let points: Vec<Value> = ["bottom_left", "bottom_right", "top_right", "top_left"].iter().map(|name| r["corners"][name].clone()).collect();
+            for (i, point) in points.iter().enumerate() {
+                let f = run(&mut s, "sketch.fillet", json!({"point": point, "radius": 3}));
+                assert_eq!(f["sketch"]["solved"], true, "center={center}, square={square}: {f}");
+                assert_eq!(f["sketch"]["dof"], 0, "center={center}, square={square}: {f}");
+                let expected = 40.0 * height - (i + 1) as f64 * (9.0 - std::f64::consts::PI * 9.0 / 4.0);
+                assert!((area(&s) - expected).abs() < 1e-5, "corner={i}, center={center}, square={square}: {} != {expected}", area(&s));
+            }
+            let expected = 40.0 * height - 4.0 * (9.0 - std::f64::consts::PI * 9.0 / 4.0);
+            assert!((area(&s) - expected).abs() < 1e-5, "center={center}, square={square}: {} != {expected}", area(&s));
+            run(&mut s, "parameters.change", json!({"name": width["param"], "expression": "50 mm"}));
+            assert!(solved(&s));
+            let expected = 50.0 * if square { 50.0 } else { height } - 4.0 * (9.0 - std::f64::consts::PI * 9.0 / 4.0);
+            assert!((area(&s) - expected).abs() < 1e-5, "center={center}, square={square}: {} != {expected}", area(&s));
+            let id = s.active_sketch.unwrap();
+            let saved = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+            assert_eq!(saved.sketch(id).unwrap(), s.doc.sketch(id).unwrap());
+            run(&mut s, "edit.undo", json!({}));
+            run(&mut s, "edit.redo", json!({}));
+            assert!((area(&s) - expected).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn filleting_a_side_keeps_its_original_midpoint() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-20, 0], "p1": [20, 30]}));
+    run(&mut s, "sketch.constraint.midpoint", json!({"point": "origin", "line": "l1"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 40}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "value": 30}));
+    for point in ["p1", "p2"] {
+        let f = run(&mut s, "sketch.fillet", json!({"point": point, "radius": 3}));
+        assert_eq!(f["sketch"]["solved"], true, "{f}");
+        assert_eq!(f["sketch"]["dof"], 0, "{f}");
+        let (lo, hi) = sk(&s).bounds().unwrap();
+        assert!((lo.x + 20.0).abs() < 1e-6 && (hi.x - 20.0).abs() < 1e-6, "{lo:?} {hi:?}");
+    }
+}
+
 /// The spout of a basin: a vertical riser and a horizontal top, the top's length dimensioned
 /// to the corner and the corner's height dimensioned from the origin. Filleting the corner used
 /// to drop the height and leave the length on the shortened straight part, so the top came out
-/// a fillet radius too long. Like Fusion, the corner now stays as a virtual sharp corner (a point
+/// a fillet radius too long. The corner now stays as a virtual sharp corner (a point
 /// on both lines' extensions) and the dimensions measure to it.
 #[test]
 fn a_fillet_keeps_the_dimensions_of_its_corner_on_a_virtual_sharp() {

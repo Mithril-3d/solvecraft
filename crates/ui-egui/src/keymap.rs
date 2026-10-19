@@ -13,8 +13,39 @@ use crate::SolveApp;
 use crate::theme::Tokens;
 
 /// Keys the application handles before any command shortcut.
-pub const RESERVED: &[&str] =
-    &["Escape", "S", "V", "F2", "F6", "Delete", "Backspace", "Ctrl+Z", "Ctrl+Y", "Ctrl+S", "Ctrl+N", "Ctrl+O", "Ctrl+Comma"];
+pub const RESERVED: &[&str] = &[
+    "Escape",
+    "S",
+    "V",
+    "F2",
+    "F6",
+    "Delete",
+    "Backspace",
+    "Ctrl+Z",
+    "Ctrl+Y",
+    "Ctrl+S",
+    "Ctrl+N",
+    "Ctrl+O",
+    "Ctrl+Comma",
+    "Ctrl+Shift+A",
+    "Ctrl+C",
+    "Ctrl+X",
+    "Ctrl+V",
+    // View keys (`navigation::view_key`).
+    "Left",
+    "Right",
+    "Up",
+    "Down",
+    "Shift+Left",
+    "Shift+Right",
+    "Shift+Up",
+    "Shift+Down",
+    "Ctrl+Left",
+    "Ctrl+Right",
+    "Ctrl+Up",
+    "Ctrl+Down",
+    "Ctrl+8",
+];
 
 #[derive(Default)]
 pub struct Keymap {
@@ -256,18 +287,21 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
         Some((_, "reset_all")) => reset(app, None),
         Some((_, "export")) => {
             let text = crate::toolbar_custom::export(app).to_string();
-            if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("SolidCraft shortcuts.json", &["json"])) {
-                app.keymap.message = std::fs::write(&path, text).err().map(|e| format!("export: {e}"));
-            }
+            app.pick_save("SolidCraft shortcuts.json", &["json"], move |app, path| {
+                if let Some(path) = path {
+                    app.keymap.message = std::fs::write(&path, text).err().map(|e| format!("export: {e}"));
+                }
+            });
         }
         Some((_, "import")) => {
-            if let Some(path) = app.services.pick_open.as_ref().and_then(|f| f()) {
+            app.pick_open(|app, path| {
+                let Some(path) = path else { return };
                 let r = std::fs::read_to_string(&path)
                     .map_err(|e| e.to_string())
                     .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string()))
                     .and_then(|v| crate::toolbar_custom::import(app, &v));
                 app.keymap.message = r.err().map(|e| format!("import: {e}"));
-            }
+            });
         }
         Some((pair, "replace")) => {
             if let Some((id, key)) = pair.split_once('\n') {

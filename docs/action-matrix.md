@@ -9,11 +9,21 @@ The test is [`apps/solidcraft-cli/tests/action_matrix.rs`](../apps/solidcraft-cl
 ## Running it
 
 - **Every CI run** (pull requests too) checks a fixed sample, one action in 40 by a stable hash of
-  its name, on every design except the seven slowest to build (`action_matrix_sample`, under a
-  minute).
-- **Nightly** (and by hand, Run workflow), the "Action matrix" job runs the whole matrix in four
-  parts (`action_matrix_full_1` to `_4`).
-- **Locally**: `cargo xtask action-matrix` runs it whole (about 22 minutes with six designs at a time on a 16-core machine). Add `--bless` to
+  its name, on every design except the slowest to build (the `SLOW` list, and any design that
+  takes more than 8 s to load in costs.json; `action_matrix_sample`, a few minutes).
+- **Nightly** (and by hand, Run workflow), the "Action matrix" jobs run the whole matrix in 16
+  shards (`action_matrix_shard` with `ACTION_MATRIX_SHARD=k/16`) of about equal cost, cut by
+  [`tests/action_matrix/costs.json`](../tests/action_matrix/costs.json): what each design took on a
+  runner. A design that takes more than ten minutes is split into slices (actions by a hash of their name, each
+  slice loading the design again), and the pieces go largest first to the shard with the least
+  work. A design not in costs.json yet counts as two minutes. Each shard uploads its outcomes and
+  timings (artifact `action-matrix-k`); with all sixteen in one folder,
+  `cargo xtask action-matrix --from DIR --bless` writes the baseline and costs.json from them
+  without running anything. `ACTION_MATRIX_SHARD=k/n ACTION_MATRIX_SHARD_LIST=1` prints the plan.
+- **Determinism** (nightly, "Action matrix determinism"): `action_matrix_determinism` runs one
+  action in 8 of every design that takes at most five minutes twice on one runner and lists every action whose outcome changed; it fails when a
+  family of pieces passes a different number of times.
+- **Locally**: `cargo xtask action-matrix` runs it whole (a few hours on one machine now; the nightly shards' artifacts and `--from` are quicker). Add `--bless` to
   rewrite the baseline after a fix (newly passing actions are listed when you don't), and
   `--results FILE` to keep every outcome with its message and the command that was sent.
   `ACTION_MATRIX_FILTER=oracle/23` runs only the designs whose name contains it;
@@ -28,7 +38,9 @@ The test is [`apps/solidcraft-cli/tests/action_matrix.rs`](../apps/solidcraft-cl
   (from `apps/solidcraft-cli`).
 
 Each design runs in its own process, so an action that hangs (90 s without a result) or aborts is
-recorded as `timeout` or `crash` and the rest of the design still runs. Loading a design, before
+recorded as `timeout` or `crash` and the rest of the design still runs. An action that passes in the baseline and
+times out is listed but not judged (and stays passing when blessed): the slowest actions take 40 to
+80 s on a busy runner and land either side of the limit from night to night. Loading a design, before
 its first action, may take up to 300 s (the largest take several times longer on a loaded CI
 runner than here). None did in this run.
 
@@ -245,7 +257,7 @@ resolves; it is recorded as `<action>+edit`.
 
 ## Causes
 
-Every failure, grouped by cause (5025 in all). Faces that can't take an attached sketch fail four
+Every failure, grouped by cause (5013 in all). Faces that can't take an attached sketch fail four
 actions each (`face.sketch`, `face.offset_plane`, and `face.press_pull` and `face.extrude`, which
 make a legacy face sketch there).
 
@@ -271,7 +283,6 @@ make a legacy face sketch there).
 | 56 | #563 | Draft and tapered Extrude drop the faces' sources | `face.extrude` 14, `face.offset_plane` 14, `face.press_pull` 14, `face.sketch` 14 | 3 | oracle/05-taper-extrude `Frustum/F2:start` |
 | 48 | #564 | The rim a Shell leaves has no source | `face.extrude` 12, `face.offset_plane` 12, `face.press_pull` 12, `face.sketch` 12 | 8 | demo/pi-case `Body1/F2:top` |
 | 18 | #567 | Axis or tangent plane on a drill tip: no face at NaN | `curved.axis` 9, `curved.tangent_plane` 9 | 3 | oracle/18-hole-features `Plate/F5:face:15` |
-| 12 | #565 | Split Body and Combine Intersect drop the faces' sources | `face.offset_plane` 4, `face.sketch` 4, `face.extrude` 2, `face.press_pull` 2 | 1 | oracle/22-split-body `Cyl (1)/F2:bottom` |
 | 9 | #568 | Construction geometry on model edges, faces and vertices is lost when a parameter moves it | `vertex.plane_three_points+edit` 5, `edge.normal_plane+edit` 2, `face.midplane+edit` 1, `face.shell+edit` 1 | 4 | demo/enclosure_steps `Enclosure/v[F2:top & F4:inner:F2:side:l4 & F4:inner:F3:blend:F2:side:l` |
 | 9 |  | Axis through a face the kernel sees as a cylinder that the command doesn't (sensor enclosure slot ends; not filed yet) | `curved.axis` 9 | 1 | examples/sensor_enclosure `Lid/F15:blend:F14:side:l2\|F14:side:l3` |
 | 7 |  | Other failures in the edit round: the hole cut and blend sizes above, and an extrude from the M0 box's top face whose profile isn't found again (not filed yet) | `face.hole+edit` 3, `face.extrude+edit` 1, `face.press_pull+edit` 1, `edge.chamfer+edit` 1 | 4 | corpus/m0-box-fillet-hole `Body1/F2:top` |
@@ -285,5 +296,6 @@ chamfers, pattern and mirror copies, sides a Join merged, revolves, lofts, sweep
 shell rims, the plastic features' faces and the faces around them, and pieces of a split face (by
 the piece's own name where Offset Face moved it off the others' plane). Sheet metal panels, their
 rims and the flat ends of bends attach by name. What still refuses a sketch is what makes faces
-without recording their history (some cuts, Split Body, Intersect): press-pull and
-extrude-from-face then fall back to a legacy face sketch found again by a point.
+without recording their history (some cuts, the face a Split Body cuts with another body's
+face): press-pull and extrude-from-face then fall back to a legacy face sketch found again by a
+point.

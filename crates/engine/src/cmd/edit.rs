@@ -12,11 +12,13 @@ use crate::{EngineError, Result, Sel, Session, Snapshot};
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("edit.undo", "Undo", undo).icon("undo").key("Ctrl+Z").noundo().doc_only(),
     CommandSpec::new("edit.redo", "Redo", redo).icon("redo").key("Ctrl+Y").noundo().doc_only(),
-    CommandSpec::new("edit.checkpoint", "Checkpoint", checkpoint)
+    CommandSpec::new("edit.checkpoint", "Checkpoint", checkpoint).icon("checkpoint")
         .noundo()
+        .doc_only()
         .params("→ {checkpoint: id}: remember the design, active sketch and undo history (restore with edit.restore_checkpoint)"),
-    CommandSpec::new("edit.restore_checkpoint", "Restore Checkpoint", restore_checkpoint)
+    CommandSpec::new("edit.restore_checkpoint", "Restore Checkpoint", restore_checkpoint).icon("restore")
         .noundo()
+        .doc_only()
         .params("checkpoint: id; forget?: bool (true = drop it without going back). Goes back to it, undo history included"),
     CommandSpec::new("timeline.compute_all", "Compute All", compute_all).at("SOLID", "MODIFY").icon("compute").noundo(),
     CommandSpec::new("timeline.delete", "Delete", delete)
@@ -24,48 +26,48 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("delete")
         .key("Delete")
         .params("features: [id or name] (a sketch takes its dependent features with it) → deleted: [ids]; failing?: [{feature, error}] (later features that worked and now fail)"),
-    CommandSpec::new("timeline.rename", "Rename", rename).params("feature: id|name, name (references to it follow)"),
+    CommandSpec::new("timeline.rename", "Rename", rename).icon("rename").params("feature: id|name, name (references to it follow)"),
     CommandSpec::new("timeline.group", "New Feature Folder", group)
         .icon("folder")
         .doc_only()
         .params("name?; features?: [id|name]; parent?: folder id (features leave any other timeline folder)"),
-    CommandSpec::new("timeline.ungroup", "Remove Feature Folders", ungroup)
+    CommandSpec::new("timeline.ungroup", "Remove Feature Folders", ungroup).icon("folder")
         .doc_only()
         .params("group: id | groups: [ids] (features remain in the timeline)"),
-    CommandSpec::new("timeline.rename_group", "Rename Feature Folder", rename_group).doc_only().params("group: id, name"),
-    CommandSpec::new("timeline.move_to_group", "Move Features to Folder", move_to_group)
+    CommandSpec::new("timeline.rename_group", "Rename Feature Folder", rename_group).icon("rename").doc_only().params("group: id, name"),
+    CommandSpec::new("timeline.move_to_group", "Move Features to Folder", move_to_group).icon("folder")
         .doc_only()
         .params("features?: [id|name], groups?: [ids], group?: id (omit or null to move to the timeline root)"),
-    CommandSpec::new("timeline.move_many", "Move Timeline Items", move_many).params(
+    CommandSpec::new("timeline.move_many", "Move Timeline Items", move_many).icon("reorder").params(
         "features?: [id|name], groups?: [folder ids], group?: folder id, position: insertion slot; atomically changes folder membership and moves all selected contents as one block",
     ),
-    CommandSpec::new("timeline.rollback", "Move Timeline Marker", rollback).params("position: number of features to keep active (omit = end)"),
-    CommandSpec::new("timeline.roll_to", "Roll History Marker", rollback)
+    CommandSpec::new("timeline.rollback", "Move Timeline Marker", rollback).icon("rollback").params("position: number of features to keep active (omit = end)"),
+    CommandSpec::new("timeline.roll_to", "Roll History Marker", rollback).icon("rollback")
         .params("position: number of features to keep active (omit = end) | feature: id|name (the marker goes right after it)"),
-    CommandSpec::new("timeline.reorder", "Reorder Feature", reorder)
+    CommandSpec::new("timeline.reorder", "Reorder Feature", reorder).icon("reorder")
         .params("feature: id|name, position: its new index; refused when a feature that worked would fail"),
-    CommandSpec::new("timeline.reorder_many", "Reorder Features", reorder_many).params(
+    CommandSpec::new("timeline.reorder_many", "Reorder Features", reorder_many).icon("reorder").params(
         "features: [id|name], position: insertion slot in the current history; selected features keep their relative order; refused when a feature that worked would fail",
     ),
-    CommandSpec::new("timeline.redefine", "Edit Feature", redefine)
+    CommandSpec::new("timeline.redefine", "Edit Feature", redefine).icon("edit")
         .params("feature: id|name, command: the feature's command id, params: its parameters (the feature is rebuilt in place)"),
-    CommandSpec::new("timeline.dependents", "Feature Dependents", dependents)
+    CommandSpec::new("timeline.dependents", "Feature Dependents", dependents).icon("graph")
         .noundo()
         .params("feature: id|name → features deleted with it, and features that would fail without it"),
-    CommandSpec::new("timeline.suppress", "Suppress Feature", suppress).params("feature: id|name, suppressed?: bool (default toggles)"),
-    CommandSpec::new("timeline.edit", "Edit Feature", edit_feature).params(
+    CommandSpec::new("timeline.suppress", "Suppress Feature", suppress).icon("suppress").params("feature: id|name, suppressed?: bool (default toggles)"),
+    CommandSpec::new("timeline.edit", "Edit Feature", edit_feature).icon("edit").params(
         "feature: id|name, set: {fields to change, merged into the feature's definition as timeline.inspect returns it, \
          e.g. {\"extent\": {\"distance\": \"30\"}} (extrude), {\"angle\": \"90 deg\"} (revolve); \
          expressions are text} → recomputed: features rebuilt, restored: features whose earlier result for the same inputs was reused",
     ),
-    CommandSpec::new("timeline.inspect", "Inspect Feature", inspect_feature).noundo().params(
+    CommandSpec::new("timeline.inspect", "Inspect Feature", inspect_feature).icon("inspect").noundo().params(
         "feature: id|name → type, definition (the fields timeline.edit's set changes, with their current values), \
          inputs: [{label, param, expression, unit}] (named inputs parameters.change can also set), error, warning",
     ),
-    CommandSpec::new("select.set", "Select", select_set)
+    CommandSpec::new("select.set", "Select", select_set).icon("select")
         .noundo()
         .params("items: [{type: body|edge|face|feature|sketch_curve|sketch_point|profile, …}], add?: bool"),
-    CommandSpec::new("select.clear", "Clear Selection", select_clear).noundo(),
+    CommandSpec::new("select.clear", "Clear Selection", select_clear).icon("select").noundo(),
 ];
 
 fn undo(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -544,6 +546,129 @@ fn merge(dst: &mut Value, src: &Value, depth: usize) {
     }
 }
 
+/// One step of a path into a feature's JSON definition.
+#[derive(Clone)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn path_text(path: &[Step]) -> String {
+    let mut t = String::new();
+    for s in path {
+        match s {
+            Step::Key(k) if t.is_empty() => t.push_str(k),
+            Step::Key(k) => t.push_str(&format!(".{k}")),
+            Step::Index(i) => t.push_str(&format!("[{i}]")),
+        }
+    }
+    t
+}
+
+fn at_path<'a>(v: &'a Value, path: &[Step]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |v, s| match s {
+        Step::Key(k) => v.get(k),
+        Step::Index(i) => v.get(i),
+    })
+}
+
+/// Does the stored feature read the field at `path` of `merged` (a feature's JSON with the edit
+/// merged in)? serde skips a field it doesn't know whatever its value, but no field type takes a
+/// flag, a text and nested lists alike.
+fn reads_field(merged: &Value, path: &[Step]) -> bool {
+    let Some((last, parent)) = path.split_last() else { return true };
+    [json!(true), json!("\u{1}"), json!([[[]]])].into_iter().any(|probe| {
+        let mut v = merged.clone();
+        let slot = parent.iter().try_fold(&mut v, |v, s| match s {
+            Step::Key(k) => v.get_mut(k),
+            Step::Index(i) => v.get_mut(*i),
+        });
+        match (slot, last) {
+            (Some(Value::Object(o)), Step::Key(k)) => {
+                o.insert(k.clone(), probe);
+            }
+            (Some(Value::Array(a)), Step::Index(i)) => match a.get_mut(*i) {
+                Some(x) => *x = probe,
+                None => return false,
+            },
+            _ => return false,
+        }
+        serde_json::from_value::<Feature>(v).is_err()
+    })
+}
+
+/// The first field of `set` that the feature's definition doesn't have. A field the definition
+/// shows before or after the edit is known; one it leaves out (an unset option, a value at its
+/// default) is known when the stored feature reads it. Setting an absent field to `null`
+/// changes nothing either way and passes.
+fn unknown_field(
+    set: &Value,
+    before: Option<&Value>,
+    after: Option<&Value>,
+    merged: &Value,
+    path: &mut Vec<Step>,
+    depth: usize,
+) -> Option<Vec<Step>> {
+    if depth > 16 {
+        return None;
+    }
+    let check = |step: Step, v: &Value, path: &mut Vec<Step>| {
+        let one = [step];
+        let (b, a) = (before.and_then(|x| at_path(x, &one)), after.and_then(|x| at_path(x, &one)));
+        let [step] = one;
+        path.push(step);
+        let found = if b.is_none() && a.is_none() && !v.is_null() && !reads_field(merged, path) {
+            Some(path.clone())
+        } else {
+            unknown_field(v, b, a, merged, path, depth + 1)
+        };
+        path.pop();
+        found
+    };
+    match set {
+        Value::Object(o) => o.iter().find_map(|(k, v)| check(Step::Key(k.clone()), v, path)),
+        Value::Array(items) => items.iter().enumerate().take(10_000).find_map(|(i, v)| check(Step::Index(i), v, path)),
+        _ => None,
+    }
+}
+
+/// "unknown field `offset`; ConstructionPlane has `plane.base.name`, `plane.distance`…": the
+/// editable fields where it was given, as paths.
+fn unknown_field_message(field: &[Step], def: &Value, type_name: &str) -> String {
+    fn leaves(v: &Value, prefix: &str, top: bool, depth: usize, out: &mut Vec<String>) {
+        match v {
+            Value::Object(o) if depth < 4 && !o.is_empty() => {
+                for (k, x) in o {
+                    if top && NOT_EDITABLE.contains(&k.as_str()) {
+                        continue;
+                    }
+                    let at = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    leaves(x, &at, false, depth + 1, out);
+                }
+            }
+            _ if !prefix.is_empty() => out.push(format!("`{prefix}`")),
+            _ => {}
+        }
+    }
+    let parent = field.split_last().map(|(_, p)| p).unwrap_or_default();
+    let mut known = Vec::new();
+    if let Some(at) = at_path(def, parent) {
+        leaves(at, &path_text(parent), parent.is_empty(), 0, &mut known);
+    }
+    const SHOWN: usize = 40;
+    let more = known.len().saturating_sub(SHOWN);
+    known.truncate(SHOWN);
+    let mut list = known.join(", ");
+    if more > 0 {
+        list.push_str(&format!(" and {more} more"));
+    }
+    let field = path_text(field);
+    if list.is_empty() {
+        return format!("unknown field `{field}`; timeline.inspect lists {type_name}'s fields");
+    }
+    format!("unknown field `{field}`; {type_name} has {list} (timeline.inspect shows them with their values)")
+}
+
 /// `profiles` (also a loft section's) given as the feature commands take it (`"all"`,
 /// `[index]`, `[{curves}]`, `[{point}]`...) becomes the stored form; the stored form passes.
 fn command_profiles(set: &Value, cmd: &str) -> Result<Value> {
@@ -622,13 +747,27 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
     let mut v = serde_json::to_value(&f).map_err(|e| EngineError::Other(e.to_string()))?;
     let set = &command_profiles(set, cmd)?;
     merge(&mut v, set, 0);
-    let mut nf: Feature = serde_json::from_value(v).map_err(|e| bad(cmd, format!("invalid feature: {e}")))?;
+    let mut nf: Feature = serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("invalid feature: {e}")))?;
     nf.id = f.id;
+    if let (FeatureKind::Extrude { extent: old, .. }, FeatureKind::Extrude { extent: new, .. }) = (&f.kind, &mut nf.kind)
+        && old.direction != solidcraft_doc::Direction::Symmetric
+        && new.direction == solidcraft_doc::Direction::Symmetric
+        && set.get("extent").and_then(|e| e.get("convention")).is_none()
+    {
+        new.convention = solidcraft_doc::ExtrudeConvention::TotalDistance;
+    }
     if std::mem::discriminant(&nf.kind) != std::mem::discriminant(&f.kind) {
         return Err(bad(cmd, "the feature type cannot change"));
     }
+    // serde drops fields the definition doesn't have without a word: refuse them, or a typo
+    // would report success and change nothing.
+    let after = serde_json::to_value(&nf).map_err(|e| EngineError::Other(e.to_string()))?;
+    let before = serde_json::to_value(&f).map_err(|e| EngineError::Other(e.to_string()))?;
+    if let Some(field) = unknown_field(set, Some(&before), Some(&after), &v, &mut Vec::new(), 0) {
+        return Err(bad(cmd, unknown_field_message(&field, &before, f.kind.type_name())));
+    }
     if let FeatureKind::BodyTransfer { bodies, from, to, transform } = &nf.kind {
-        solidcraft_doc::validate_body_transfer(&s.doc, bodies, *from, *to, transform)?;
+        solidcraft_doc::validate_body_transfer(&s.doc, &solidcraft_doc::plain(bodies), *from, *to, transform)?;
         nf.component = *to;
     }
     if let (FeatureKind::Sketch { sketch: a, .. }, FeatureKind::Sketch { sketch: b, .. }) = (&nf.kind, &f.kind)
@@ -644,22 +783,22 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
         && a != b
     {
         let before = s.model.state_before(id);
-        nf.edge_refs = solidcraft_doc::edge_refs(&before, body, a);
-        nf.edge_names = solidcraft_doc::edge_names_for(&before, body, a);
+        nf.edge_refs = solidcraft_doc::edge_refs(&before, body, &solidcraft_doc::plain(a));
+        nf.edge_names = solidcraft_doc::edge_names_for(&before, body, &solidcraft_doc::plain(a));
     }
     // New or reordered flange edges: their names now, so each edge's own angle and height stay
     // with the edge they were given for.
     if let (FeatureKind::SheetFlange { edges: a, .. }, FeatureKind::SheetFlange { edges: b, .. }) = (&nf.kind, &f.kind) {
         let points = |e: &[solidcraft_doc::FlangeEdge]| e.iter().map(|x| x.point).collect::<Vec<_>>();
         if points(a) != points(b) {
-            nf.edge_names = solidcraft_doc::sheet::sheet_edge_names(&s.model.state_before(id), &points(a));
+            nf.edge_names = solidcraft_doc::sheet::sheet_edge_names(&s.model.state_before(id), &solidcraft_doc::plain(&points(a)));
         }
     }
     // New bend edges for a conversion: the names of the body's edges there now.
     if let (FeatureKind::SheetConvert { bends: a, body, .. }, FeatureKind::SheetConvert { bends: b, body: was, .. }) = (&nf.kind, &f.kind)
         && (a != b || body != was)
     {
-        nf.edge_names = solidcraft_doc::sheet::bend_edge_names(&s.model.state_before(id), body, a);
+        nf.edge_names = solidcraft_doc::sheet::bend_edge_names(&s.model.state_before(id), body, &solidcraft_doc::plain(a));
     }
     // Profiles picked by index or point are kept by their curves, as when the feature was made.
     if nf.kind.clone().profile_sels_mut() != f.kind.clone().profile_sels_mut() {
@@ -839,11 +978,13 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
         .chain(super::features_more::COMMANDS)
         .chain(super::construct::COMMANDS)
         .chain(super::surface::COMMANDS)
+        .chain(super::surface_boundary::COMMANDS)
         .any(|candidate| candidate.id == spec.id)
         || matches!(
             spec.id,
             "sheet.flange"
                 | "sheet.hem"
+                | "sheet.perforate"
                 | "sheet.fold"
                 | "sheet.unfold"
                 | "sheet.refold"
@@ -859,6 +1000,17 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
     let mut params = p.get("params").cloned().unwrap_or_else(|| json!({}));
     let idx = s.doc.feature_index(id).ok_or_else(|| bad(cmd, "feature"))?;
     let old = s.doc.feature(id).cloned().ok_or_else(|| bad(cmd, "feature"))?;
+    if let FeatureKind::Extrude { extent, .. } | FeatureKind::SurfaceExtrude { extent, .. } = &old.kind
+        && matches!(cid, "solid.extrude" | "surface.extrude")
+        && let Some(parameters) = params.as_object_mut()
+    {
+        let convention = if cid == "surface.extrude" || extent.direction == solidcraft_doc::Direction::Symmetric {
+            extent.convention
+        } else {
+            solidcraft_doc::ExtrudeConvention::TotalDistance
+        };
+        parameters.entry("convention").or_insert_with(|| json!(convention));
+    }
     if let FeatureKind::Revolve { convention, .. } = &old.kind
         && cid == "solid.revolve"
         && let Some(parameters) = params.as_object_mut()
@@ -894,11 +1046,14 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
         && before.body == after.body
         && before.path == after.path
         && before.author_path == after.author_path
-        && before.at.dist(after.at) < 1e-8
+        && before.at.dist(after.at.0) < 1e-8
     {
         *after = before.clone();
     }
-    if std::mem::discriminant(&new.kind) != std::mem::discriminant(&old.kind) {
+    // A boundary surface's loop of sketch curves and its curve network are one command's two
+    // forms: an edit may turn one into the other.
+    let boundary = |k: &FeatureKind| matches!(k, FeatureKind::SurfaceBoundary { .. } | FeatureKind::SurfaceNetwork { .. });
+    if std::mem::discriminant(&new.kind) != std::mem::discriminant(&old.kind) && !(boundary(&new.kind) && boundary(&old.kind)) {
         return Err(bad(cmd, format!("{} is not a {} feature", old.name, cid)));
     }
     // Optional inputs can move other inputs' positions (e.g. Distance 2 goes before Taper).

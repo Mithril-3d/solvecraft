@@ -36,10 +36,11 @@ Work the part out as numbers first. Then build it in a few large `batch` calls, 
   - expression fields such as `solid.cylinder base:["w/2-6","d/2-6","wall"]`
 
   A plain number never follows a parameter.
-- **Repeats:** `solid.pattern.rectangular` takes expression spacing; `solid.mirror` takes `XY`/`XZ`/`YZ`, a construction plane or `{origin, normal}`. A mirror or pattern feature cannot be mirrored or patterned again.
+- **Repeats:** `solid.pattern.rectangular` takes expression spacing; `solid.mirror` takes `XY`/`XZ`/`YZ`, a construction plane or `{origin, normal}` (origin coordinates may be length expressions such as `["half", 0, 0]`). A mirror or pattern feature cannot be mirrored or patterned again.
 - **Edge and face picks** snap to the nearest edge or face. There is no distance limit and no error, so compute the exact midpoint from your geometry (the vertical corner edge of a centred box is `[w/2, d/2, h/2]`).
   - Picks must be plain numbers.
   - A pick is resolved once and then follows its edge when parameters change.
+  - A face can be given by name instead of a point (`faces:["F1:+z"]`, the `face` of `sheet.convert`). `body_topology` lists each face's `name`, a `point` that lies on it (the centroid of a face with a hole is in the hole) and, for a cylinder, `{origin, axis, radius}`.
 - **Profiles:** extrude takes every region by default. For a ring or a boss with a hole, pass `profiles`.
 - **Order:** fillet the outside edges before you shell, so the shell follows the fillets. An edge of the face the shell removes, such as the rim of an open box, is the exception: round it after the shell, because the shell can fail on it.
 

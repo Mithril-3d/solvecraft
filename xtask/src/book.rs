@@ -2,7 +2,7 @@
 //!
 //! The command reference (`docs/book/src/reference/commands.md`) comes from
 //! `solidcraft-cli commands`, so it can't drift from the registry. The screenshots in
-//! `docs/book/src/generated/` are CPU renders by `solidcraft-cli snapshot` of `examples/*.json`
+//! `docs/book/src/generated/` are GPU renders by `solidcraft-cli snapshot` of `examples/*.json`
 //! and `docs/book/scripts/*.json`, plus the app screenshot from `docs/screenshots/`. Both are
 //! gitignored and attributed in ATTRIBUTION.md. The book itself is built by `mdbook` (a separate
 //! tool, not a dependency) into `target/book`.

@@ -29,6 +29,8 @@ pub enum Kind {
     Insert,
     /// Open a design an earlier run autosaved before it closed.
     Recover { id: String, dir: Option<String> },
+    /// Export a snapshot of the current design without adopting the worker's session.
+    ExportDxf,
 }
 
 pub struct Request {
@@ -37,21 +39,33 @@ pub struct Request {
     pub kind: Kind,
     /// A control-channel caller waiting for the command's reply.
     pub reply: Option<Sender<ControlResponse>>,
+    /// The folders that caller's agent may use: the worker reads the file inside them.
+    pub scope: Option<solidcraft_engine::io::vfs::PathScope>,
+    /// What that caller asked of a STEP import besides its path (`up`, `names`): the command
+    /// gets them as given.
+    pub options: serde_json::Map<String, Value>,
 }
 
 impl Request {
     pub fn new(path: &str, kind: Kind) -> Self {
-        Request { path: path.into(), kind, reply: None }
+        Request { path: path.into(), kind, reply: None, scope: None, options: Default::default() }
     }
     fn insert(&self) -> bool {
         self.kind == Kind::Insert
     }
+    /// The command's parameters: the path and the caller's import options.
+    fn params(&self) -> Value {
+        let mut params = self.options.clone();
+        params.insert("path".into(), json!(self.path));
+        Value::Object(params)
+    }
     fn command(&self) -> (&'static str, Value) {
         match &self.kind {
-            Kind::Open => ("doc.open", json!({"path": self.path})),
+            Kind::Open => ("doc.open", self.params()),
             Kind::Insert if solidcraft_engine::io::is_mesh_path(&self.path) => ("file.insert_mesh", json!({"path": self.path})),
-            Kind::Insert => ("file.insert_step", json!({"path": self.path})),
+            Kind::Insert => ("file.insert_step", self.params()),
             Kind::Recover { id, dir } => ("doc.recover", json!({"id": id, "dir": dir})),
+            Kind::ExportDxf => ("file.export_view_dxf", Value::Object(self.options.clone())),
         }
     }
     fn answer(&self, r: Result<Value, String>) {
@@ -80,6 +94,57 @@ struct Running {
     progress: Arc<Progress>,
     preview_rx: Option<Receiver<egui::ColorImage>>,
     preview: Option<egui::TextureHandle>,
+    /// Pictures of the model as far as it is built (the picture, features built).
+    partial_rx: Option<Receiver<(egui::ColorImage, usize)>>,
+    /// The picture shown is of the first this many features (`None`: the saved preview).
+    built: Option<usize>,
+    /// A STEP file read a piece per frame on this thread (the web app), instead of on a worker.
+    staged: Option<Staged>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.request.kind == Kind::ExportDxf {
+            self.progress.cancel();
+        }
+    }
+}
+
+/// A STEP import done a piece per frame, for the web app: it has one thread, which must keep
+/// drawing (and offer Cancel) while a large file comes in. The file is parsed in one frame,
+/// then its solids are converted a few at a time, each frame for about [`STAGED_FRAME_MS`];
+/// the import is then cached, and the command that inserts or opens the file finds it read.
+struct Staged {
+    tx: Sender<Job>,
+    session: Option<Session>,
+    command: &'static str,
+    params: Value,
+    reading: Option<solidcraft_engine::kernel::StepReading>,
+    /// The command's result once it has run; then the bodies' meshes are made, a few a frame,
+    /// so the first frame that draws the design doesn't make them all at once.
+    ran: Option<Value>,
+    /// Bodies meshed so far, and their triangles.
+    warmed: usize,
+    triangles: usize,
+    /// The overlay has been drawn once (the first frame does no work, so it shows at once).
+    shown: bool,
+}
+
+/// Designs up to this many triangles get a thumbnail (a picture of more takes a while).
+const STAGED_THUMBNAIL_TRIANGLES: usize = 1_000_000;
+
+/// How long a frame spends on a staged STEP import.
+const STAGED_FRAME_MS: f64 = 30.0;
+
+/// Files read in stages: STEP (not IGES, FreeCAD or Rhino, which are first restated as STEP) to
+/// insert or open.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn staged_kind(request: &Request) -> bool {
+    let p = &request.path;
+    matches!(request.kind, Kind::Insert | Kind::Open)
+        && solidcraft_engine::io::is_step_path(p)
+        && !solidcraft_engine::io::is_iges_path(p)
+        && !solidcraft_engine::io::is_native_cad_path(p)
 }
 
 impl Running {
@@ -98,6 +163,9 @@ pub struct FileLoad {
     /// Tests: the next load waits before this feature until cancelled.
     #[cfg(test)]
     pub hold_at: Option<usize>,
+    /// Tests: report the worker thread, then wait for the window's explicit release.
+    #[cfg(test)]
+    pub worker_gate: Option<(Sender<std::thread::ThreadId>, Receiver<()>)>,
 }
 
 impl FileLoad {
@@ -132,6 +200,11 @@ pub fn begin(app: &mut SolveApp, path: &str, insert: bool) {
 pub fn begin_request(app: &mut SolveApp, request: Request) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     {
+        if staged_kind(&request) {
+            app.file_load.queued.push_back(request);
+            start_staged(app);
+            return Ok(());
+        }
         let r = match &request.kind {
             Kind::Insert => {
                 app.insert_path(&request.path);
@@ -146,6 +219,14 @@ pub fn begin_request(app: &mut SolveApp, request: Request) -> Result<(), String>
                 let r = app.run(command, params);
                 if r.is_ok() {
                     recovered(app, &request);
+                }
+                r
+            }
+            Kind::ExportDxf => {
+                let (command, params) = request.command();
+                let r = app.run(command, params);
+                if r.is_ok() && !request.path.is_empty() {
+                    app.set_status(crate::i18n::format("ui.saved_to", &[("path", &request.path)]), false);
                 }
                 r
             }
@@ -177,11 +258,42 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
     let kind = match command {
         Some("doc.open") => Kind::Open,
         Some("file.insert_step" | "file.insert_mesh") => Kind::Insert,
+        Some("file.export_view_dxf") => Kind::ExportDxf,
         _ => return Some(req),
     };
-    let Some(path) = req.params.get("params").and_then(|p| p.get("path")).and_then(Value::as_str) else { return Some(req) };
-    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()) });
+    let params = req.params.get("params");
+    let path = match params.and_then(|p| p.get("path")).and_then(Value::as_str) {
+        Some(path) => path,
+        None if kind == Kind::ExportDxf => "",
+        None => return Some(req),
+    };
+    let scope = match crate::control::request_scope(app, &req.params) {
+        Ok(scope) => scope,
+        Err(e) => {
+            let _ = req.reply.send(json!({"ok": false, "error": e}));
+            return None;
+        }
+    };
+    let options = if kind == Kind::ExportDxf {
+        params.and_then(Value::as_object).cloned().unwrap_or_default()
+    } else {
+        ["up", "names"].iter().filter_map(|k| Some((k.to_string(), params?.get(*k).filter(|v| !v.is_null())?.clone()))).collect()
+    };
+    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope, options });
     None
+}
+
+/// An autosave that failed to load goes back in the recovery list, so it can be discarded (or
+/// left for later) instead of coming back unasked.
+fn reoffer(app: &mut SolveApp, id: &str, dir: Option<&str>) {
+    let dir = dir.map(std::path::PathBuf::from).or_else(|| app.autosave.as_ref().map(|a| a.dir.clone()));
+    let Some(dir) = dir else { return };
+    if app.recoverable.iter().any(|e| e.id == id) {
+        return;
+    }
+    if let Some(e) = solidcraft_engine::recovery::orphans(&dir).into_iter().find(|e| e.id == id) {
+        app.recoverable.insert(0, e);
+    }
 }
 
 /// A recovered design is ours now: autosave it under this app's entry before the old one goes.
@@ -200,7 +312,10 @@ fn start(app: &mut SolveApp) {
         return;
     }
     let Some(request) = app.file_load.queued.pop_front() else { return };
-    if !request.insert() && app.docs.count() >= crate::documents::MAX_OPEN && !crate::documents::active_is_blank(app) {
+    if matches!(request.kind, Kind::Open | Kind::Recover { .. })
+        && app.docs.count() >= crate::documents::MAX_OPEN
+        && !crate::documents::active_is_blank(app)
+    {
         let e = "too many open designs; close a tab before opening another";
         app.set_status(e, true);
         request.answer(Err(e.into()));
@@ -208,7 +323,7 @@ fn start(app: &mut SolveApp) {
     }
     let insert = request.insert();
     let before = if insert { app.session.world_state().bodies.iter().map(|b| b.name.clone()).collect() } else { Vec::new() };
-    let mut scratch = if insert { app.session.scratch() } else { Session::default() };
+    let mut scratch = if insert || request.kind == Kind::ExportDxf { app.session.scratch() } else { Session::default() };
     if insert {
         scratch.selection = app.session.selection.clone();
     }
@@ -225,8 +340,50 @@ fn start(app: &mut SolveApp) {
     let (tx, rx) = std::sync::mpsc::channel();
     let (preview_tx, preview_rx) = std::sync::mpsc::channel();
     let (command, params) = request.command();
+    let scope = request.scope.clone();
     let thumbnail = request.kind == Kind::Open;
+    // While a design rebuilds, a picture of what is built so far (a large design takes a while).
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let partial_rx = (command == "doc.open" || command == "doc.recover").then(|| {
+        progress.want_partial();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let (watch, finished) = (progress.clone(), finished.clone());
+        let _ = std::thread::Builder::new().name("file-load-picture".into()).spawn(move || {
+            let stop = || finished.load(Ordering::Relaxed) || watch.is_cancelled();
+            while !stop() {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let Some(partial) = watch.take_partial() else { continue };
+                let began = std::time::Instant::now();
+                let picture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| partial_picture(&partial.world, &stop))).ok().flatten();
+                if solidcraft_engine::geom::env::var_os("PROFILE_OPEN").is_some() {
+                    eprintln!(
+                        "SolidCraft partial picture: features={} bodies={} drawn={} ms={:.1}",
+                        partial.features,
+                        partial.world.bodies.len(),
+                        picture.is_some(),
+                        began.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                if let Some(picture) = picture.filter(|_| !stop()) {
+                    let _ = partial_tx.send((picture, partial.features));
+                }
+            }
+        });
+        partial_rx
+    });
+    let worker_finished = finished;
+    #[cfg(test)]
+    let worker_gate = app.file_load.worker_gate.take();
     let spawned = std::thread::Builder::new().name("file-load".into()).spawn(move || {
+        #[cfg(test)]
+        if let Some((started, release)) = worker_gate {
+            let _ = started.send(std::thread::current().id());
+            if release.recv_timeout(std::time::Duration::from_secs(60)).is_err() {
+                worker_finished.store(true, Ordering::Relaxed);
+                let _ = tx.send(Err("test file worker was not released".into()));
+                return;
+            }
+        }
         let preview_began = std::time::Instant::now();
         if command == "doc.open" {
             let progress = worker_progress.clone();
@@ -243,15 +400,29 @@ fn start(app: &mut SolveApp) {
                 }
             }));
         }
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute(scratch, command, &params, thumbnail, &worker_phase, &worker_progress)))
-                .unwrap_or_else(|_| Err("the file operation failed; the current design is unchanged".into()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute(scratch, command, &params, scope, thumbnail, &worker_phase, &worker_progress)
+        }))
+        .unwrap_or_else(|_| Err("the file operation failed; the current design is unchanged".into()));
+        worker_finished.store(true, Ordering::Relaxed);
         let _ = tx.send(result);
     });
     match spawned {
         Ok(_) => {
-            app.file_load.running =
-                Some(Running { request, base, base_revision, before, rx, phase, progress, preview_rx: Some(preview_rx), preview: None })
+            app.file_load.running = Some(Running {
+                request,
+                base,
+                base_revision,
+                before,
+                rx,
+                phase,
+                progress,
+                preview_rx: Some(preview_rx),
+                preview: None,
+                partial_rx,
+                built: None,
+                staged: None,
+            })
         }
         Err(e) => {
             let e = format!("could not start file operation: {e}");
@@ -259,6 +430,176 @@ fn start(app: &mut SolveApp) {
             app.set_status(e, true);
         }
     }
+}
+
+/// Start the next queued STEP file as a [`Staged`] import (see [`step_staged`]).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn start_staged(app: &mut SolveApp) {
+    if app.file_load.running.is_some() {
+        return;
+    }
+    let Some(request) = app.file_load.queued.pop_front() else { return };
+    let insert = request.insert();
+    let before = if insert { app.session.world_state().bodies.iter().map(|b| b.name.clone()).collect() } else { Vec::new() };
+    let mut session = if insert { app.session.scratch() } else { Session::default() };
+    if insert {
+        session.selection = app.session.selection.clone();
+    }
+    let (command, params) = request.command();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = Arc::new(Progress::default());
+    #[cfg(test)]
+    if let Some(i) = app.file_load.hold_at.take() {
+        progress.hold_at(i);
+    }
+    app.file_load.running = Some(Running {
+        base: app.session.doc.clone(),
+        base_revision: app.session.revision,
+        before,
+        rx,
+        phase: Arc::new(AtomicU8::new(0)),
+        progress,
+        preview_rx: None,
+        preview: None,
+        partial_rx: None,
+        built: None,
+        staged: Some(Staged { tx, session: Some(session), command, params, reading: None, ran: None, warmed: 0, triangles: 0, shown: false }),
+        request,
+    });
+}
+
+/// One frame of a staged STEP import: parse the file, or convert solids for a frame's worth of
+/// time, or, once every solid is in, run the command (which finds the file read) and hand its
+/// result to [`tick`] as a worker would.
+fn step_staged(running: &mut Running) {
+    let Some(staged) = running.staged.as_mut() else { return };
+    let progress = running.progress.clone();
+    let scope = running.request.scope.clone();
+    let path = running.request.path.clone();
+    let send = |staged: &mut Staged, job: Job| {
+        let _ = staged.tx.send(job);
+        staged.session = None;
+        staged.reading = None;
+    };
+    if staged.session.is_none() {
+        return;
+    }
+    if progress.is_cancelled() {
+        send(staged, Err("file operation cancelled".into()));
+        return;
+    }
+    if !staged.shown {
+        staged.shown = true;
+        return;
+    }
+    let began = web_time::Instant::now();
+    let in_budget = || began.elapsed().as_secs_f64() * 1000.0 < STAGED_FRAME_MS;
+    if staged.ran.is_some() {
+        let Some(session) = staged.session.as_ref() else { return };
+        let world = session.world_state();
+        while staged.warmed < world.bodies.len() && in_budget() {
+            if let Some(body) = world.bodies.get(staged.warmed) {
+                staged.triangles += body.mesh().triangles.len();
+            }
+            staged.warmed += 1;
+        }
+        if staged.warmed < world.bodies.len() {
+            return;
+        }
+        let (Some(session), Some(result)) = (staged.session.take(), staged.ran.take()) else { return };
+        let thumbnail = staged.command == "doc.open" && staged.triangles <= STAGED_THUMBNAIL_TRIANGLES;
+        let image = if thumbnail { crate::home::remember(&session) } else { None };
+        send(staged, Ok(Made { session, result, image }));
+        return;
+    }
+    let Some(reading) = staged.reading.as_mut() else {
+        // Parse and walk the file. The reading keeps the watch: its steps report progress and
+        // stop on Cancel.
+        let read = solidcraft_engine::io::vfs::scoped(scope, || {
+            let bytes = solidcraft_engine::io::vfs::read(&path, solidcraft_engine::io::MAX_STEP_BYTES).map_err(|e| format!("{path}: {e}"))?;
+            // The same text the import command makes of the bytes, so it finds this reading.
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            solidcraft_engine::doc::progress::watch(progress.clone(), || solidcraft_engine::kernel::StepReading::new(&text))
+                .map_err(|e| format!("{path}: {e}"))
+        });
+        match read {
+            Ok(reading) => staged.reading = Some(reading),
+            Err(e) => send(staged, Err(e)),
+        }
+        return;
+    };
+    while in_budget() {
+        if !reading.step() {
+            break;
+        }
+    }
+    let (done, total) = reading.progress();
+    if done < total && !progress.is_cancelled() {
+        return;
+    }
+    let Some(reading) = staged.reading.take() else { return };
+    // Held until the command has read the file from the cache.
+    let import = reading.finish_shared();
+    let import = match import {
+        _ if progress.is_cancelled() => Err("file operation cancelled".to_string()),
+        Ok(import) => Ok(import),
+        Err(e) => Err(format!("{path}: {e}")),
+    };
+    let (Some(mut session), Ok(import)) = (staged.session.take(), import.clone()) else {
+        send(staged, Err(import.err().unwrap_or_else(|| "file operation cancelled".into())));
+        return;
+    };
+    let (command, params) = (staged.command, staged.params.clone());
+    let result = solidcraft_engine::io::vfs::scoped(running.request.scope.clone(), || {
+        solidcraft_engine::doc::progress::watch(progress.clone(), || session.execute(command, &params))
+    });
+    drop(import);
+    match result {
+        Ok(result) => {
+            // Next frames: the meshes ("Preparing the view").
+            running.phase.store(1, Ordering::Relaxed);
+            staged.session = Some(session);
+            staged.ran = Some(result);
+        }
+        Err(e) => send(staged, Err(e.to_string())),
+    }
+}
+
+/// A small picture of the bodies built so far (their display meshes, made here and kept for
+/// the finished model), or `None` when there is nothing to show yet, too much to draw, or the
+/// load ended meanwhile (`stop`).
+#[cfg(not(target_arch = "wasm32"))]
+fn partial_picture(world: &solidcraft_engine::doc::ModelState, stop: &dyn Fn() -> bool) -> Option<egui::ColorImage> {
+    use solidcraft_engine::{
+        geom::Aabb3,
+        render::{Camera, Rgb, Scene, SceneMesh, StandardView},
+    };
+    let mut scene = Scene::default();
+    let mut bounds = Aabb3::EMPTY;
+    let mut triangles = 0usize;
+    for body in &world.bodies {
+        if stop() {
+            return None;
+        }
+        let mesh = body.mesh();
+        triangles += mesh.triangles.len();
+        if triangles > 4_000_000 {
+            return None;
+        }
+        bounds = bounds.union(&mesh.bounds());
+        scene.meshes.push(SceneMesh { mesh, color: Rgb(176, 186, 199), face_colors: Vec::new() });
+    }
+    if bounds.is_empty() {
+        return None;
+    }
+    let mut camera = Camera::default();
+    camera.set_view(StandardView::Iso);
+    camera.fit(&bounds);
+    scene.radius = bounds.diagonal();
+    if stop() || !preview_work_fits(&scene, &camera) {
+        return None;
+    }
+    preview_image(&scene, &camera)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -304,12 +645,24 @@ fn saved_picture(preview: solidcraft_engine::io::DesignPreview) -> Option<egui::
     if !preview_work_fits(&scene, &camera) {
         return None;
     }
-    let canvas = solidcraft_engine::render::render(&scene, &camera, 320, 200);
-    Some(egui::ColorImage::from_rgba_unmultiplied([320, 200], &canvas.rgba))
+    preview_image(&scene, &camera)
 }
 
-/// Bound raster work as well as file size: repeated full-screen triangles must
-/// not monopolize the file worker. Match the rasterizer's 2x sampling rectangles.
+/// The preview picture, drawn on the GPU by the renderer the app installs (none: no picture).
+#[cfg(not(target_arch = "wasm32"))]
+fn preview_image(scene: &solidcraft_engine::render::Scene, camera: &solidcraft_engine::render::Camera) -> Option<egui::ColorImage> {
+    match solidcraft_engine::capture::rgba(scene, camera, 320, 200) {
+        Ok(picture) => Some(egui::ColorImage::from_rgba_unmultiplied([320, 200], &picture.rgba)),
+        Err(e) => {
+            log::warn!("no preview picture: {e}");
+            None
+        }
+    }
+}
+
+/// Bound drawing work as well as file size: repeated full-screen triangles (a hostile file) must
+/// not monopolize the file worker or a software GPU. Counts each triangle's pixel box at twice the
+/// picture's size.
 #[cfg(not(target_arch = "wasm32"))]
 fn preview_work_fits(scene: &solidcraft_engine::render::Scene, camera: &solidcraft_engine::render::Camera) -> bool {
     let mut pixels = 0.0;
@@ -351,15 +704,31 @@ fn preview_work_fits(scene: &solidcraft_engine::render::Scene, camera: &solidcra
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn compute(mut session: Session, command: &str, params: &Value, thumbnail: bool, phase: &AtomicU8, progress: &Arc<Progress>) -> Job {
+fn compute(
+    mut session: Session,
+    command: &str,
+    params: &Value,
+    scope: Option<solidcraft_engine::io::vfs::PathScope>,
+    thumbnail: bool,
+    phase: &AtomicU8,
+    progress: &Arc<Progress>,
+) -> Job {
     let profile = solidcraft_engine::geom::env::var_os("PROFILE_OPEN").is_some();
     let began = std::time::Instant::now();
     let cancelled = || Err("file operation cancelled".to_string());
     if progress.is_cancelled() {
         return cancelled();
     }
-    // The timeline's rebuild reports each feature and stops at the next one after Cancel.
-    let result = solidcraft_engine::doc::progress::watch(progress.clone(), || session.execute(command, params)).map_err(|e| e.to_string())?;
+    // The timeline's rebuild reports each feature and stops at the next one after Cancel. An
+    // agent's scope is per thread, so it is set again here.
+    let result =
+        solidcraft_engine::io::vfs::scoped(scope, || solidcraft_engine::doc::progress::watch(progress.clone(), || session.execute(command, params)))
+            .map_err(|e| e.to_string())?;
+    if command == "file.export_view_dxf" {
+        // A successful export has already published its complete file. A Cancel arriving
+        // after that commit must not turn a completed save into a misleading cancellation.
+        return Ok(Made { session, result, image: None });
+    }
     if progress.is_cancelled() {
         return cancelled();
     }
@@ -391,9 +760,20 @@ fn compute(mut session: Session, command: &str, params: &Value, thumbnail: bool,
 
 pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     if let Some(running) = &mut app.file_load.running {
+        step_staged(running);
+    }
+    if let Some(running) = &mut app.file_load.running {
         if !running.cancelled() && running.matches(&app.session) {
             if let Some(image) = running.preview_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
                 running.preview = Some(ctx.load_texture("opening-preview", image, egui::TextureOptions::LINEAR));
+                running.built = None;
+            }
+            // The model as far as it is built, unless the file's saved picture (all of it) is up.
+            if let Some((image, built)) = running.partial_rx.as_ref().and_then(|rx| rx.try_iter().last())
+                && (running.preview.is_none() || running.built.is_some())
+            {
+                running.preview = Some(ctx.load_texture("opening-preview", image, egui::TextureOptions::LINEAR));
+                running.built = Some(built);
             }
         } else {
             running.preview = None;
@@ -409,6 +789,12 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     {
         let request = &running.request;
         match job {
+            Ok(made) if request.kind == Kind::ExportDxf => {
+                if !request.path.is_empty() {
+                    app.set_status(crate::i18n::format("ui.saved_to", &[("path", &request.path)]), false);
+                }
+                request.answer(Ok(made.result));
+            }
             _ if running.cancelled() => request.answer(Err("file operation cancelled".into())),
             Ok(made) if running.matches(&app.session) => {
                 if request.insert() {
@@ -423,8 +809,9 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 app.home.open = false;
                 app.fit_view();
-                if request.kind == Kind::Open || request.insert() {
-                    crate::stand_up::offer(app, &request.path, &running.before);
+                // A caller that said which way is up has been answered: no offer to stand the part up.
+                if (request.kind == Kind::Open || request.insert()) && !request.options.contains_key("up") {
+                    crate::stand_up::offer(app, &request.path, &running.before, Some(&made.result));
                 }
                 let warnings = made.result.get("warnings").and_then(Value::as_array);
                 if let Kind::Recover { .. } = request.kind {
@@ -448,12 +835,19 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
             }
             Err(e) => {
                 request.answer(Err(e.clone()));
-                app.set_status(e, true);
+                if let Kind::Recover { id, dir } = &request.kind {
+                    reoffer(app, id, dir.as_deref());
+                    app.set_status(format!("could not recover {}: {e}. Discard it or choose Later", request.path), true);
+                } else {
+                    app.set_status(e, true);
+                }
             }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     start(app);
+    #[cfg(target_arch = "wasm32")]
+    start_staged(app);
     if app.file_load.busy() {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -475,7 +869,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let phase = r.phase.load(Ordering::Relaxed);
     let (done, total) = r.progress.features();
     // Long work inside one feature (a large STEP file) has progress of its own.
-    let work = r.progress.work().filter(|(_, d, t)| phase == 0 && d < t);
+    let export = r.request.kind == Kind::ExportDxf;
+    let work = r.progress.work().filter(|(_, d, t)| export || (phase == 0 && d < t));
     let screen = ctx.content_rect();
     // Leave the title bar to the window. The resize edges are a foreground layer above this.
     let cover = egui::Rect::from_min_max(egui::pos2(screen.left(), screen.top() + crate::toolbar::APP_BAR_HEIGHT), screen.max);
@@ -510,20 +905,23 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             ui.set_width(width - 16.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(if cancelled {
+                    egui::RichText::new(if cancelled && export {
+                        crate::i18n::tr_label("dxf.cancelling")
+                    } else if cancelled {
                         "Waiting for file operation"
                     } else {
                         match r.request.kind {
                             Kind::Insert => "Inserting geometry",
                             Kind::Open => "Opening design",
                             Kind::Recover { .. } => "Recovering design",
+                            Kind::ExportDxf => crate::i18n::tr_label("dxf.exporting"),
                         }
                     })
                     .strong()
                     .size(14.0),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let b = ui.button("Cancel");
+                    let b = ui.button(crate::i18n::tr("ui.cancel"));
                     crate::scenario::publish_handle("file_loading:cancel", b.rect.center());
                     cancel |= b.clicked();
                 });
@@ -532,15 +930,22 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             if let Some(preview) = r.preview.as_ref().filter(|_| !cancelled) {
                 let w = ui.available_width().min(320.0);
                 ui.image((preview.id(), egui::vec2(w, w * 200.0 / 320.0)));
-                ui.label(egui::RichText::new(crate::i18n::tr_label("Saved preview. Geometry is being checked before editing.")).small().weak());
+                let note = match r.built {
+                    Some(built) => format!("Built so far: {built} of {total} features."),
+                    None => crate::i18n::tr_label("Saved preview. Geometry is being checked before editing.").to_string(),
+                };
+                ui.label(egui::RichText::new(note).small().weak());
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(if cancelled {
+                ui.label(if cancelled && export {
+                    crate::i18n::tr_label("dxf.cancel_wait").to_string()
+                } else if cancelled {
                     "Waiting for the previous operation to stop...".to_string()
                 } else {
                     match (phase, work) {
+                        (_, work) if r.request.kind == Kind::ExportDxf => crate::dialogs_view_dxf::progress_text(work),
                         (_, Some(("reading", d, t))) => format!("Reading the file... {}%", d * 100 / t.max(1)),
                         (_, Some((_, d, t))) => format!("Converting solid {} of {t}", d + 1),
                         (1, _) => "Preparing the view...".into(),
@@ -570,13 +975,84 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         // import to overlap it in memory. The rebuild stops at its next feature and the
         // current design stays as it was.
         app.file_load.cancel();
-        app.set_status("file operation cancelled", false);
+        app.set_status(if export { crate::i18n::tr_label("dxf.cancelled") } else { "file operation cancelled" }, false);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dxf_export_progress_keeps_frames_alive_and_never_adopts_a_worker_document() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+        h.frames(3);
+        let base = h.app.session.doc.clone();
+        let undo = h.app.session.undo.len();
+        let cam = h.app.cam;
+        let progress = Arc::new(Progress::default());
+        solidcraft_engine::doc::progress::watch(progress.clone(), || {
+            solidcraft_engine::kernel::watch::current().unwrap().progress("dxf_occlusion", 64, 128);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.file_load.running = Some(Running {
+            request: Request::new("drawing.dxf", Kind::ExportDxf),
+            base: base.clone(),
+            base_revision: h.app.session.revision,
+            before: Vec::new(),
+            rx,
+            phase: Arc::new(AtomicU8::new(0)),
+            progress: progress.clone(),
+            preview_rx: None,
+            preview: None,
+            partial_rx: None,
+            built: None,
+            staged: None,
+        });
+        // No worker result is available: drawing a frame must not wait for one.
+        h.frames(4);
+        assert!(h.app.file_load.busy());
+        let at = crate::scenario::handle_at("file_loading:cancel").unwrap();
+        let (request, _reply) = crate::control::ControlRequest::new("ui.click", json!({"x":at.x,"y":at.y}));
+        let _ = crate::control::handle(&mut h.app, &h.ctx, &request);
+        h.frames(4);
+        assert!(progress.is_cancelled());
+        tx.send(Err("DXF export cancelled".into())).unwrap();
+        h.frames(2);
+        assert!(h.app.file_load.idle());
+        assert!(Arc::ptr_eq(&base, &h.app.session.doc));
+        assert_eq!(h.app.session.undo.len(), undo);
+        assert_eq!(h.app.cam, cam);
+
+        // The success path is equally read-only, even if the worker has another session.
+        let mut other = Session::default();
+        other.execute("file.new", &json!({"name":"Worker must not replace the current design"})).unwrap();
+        let mut request = Request::new("drawing.dxf", Kind::ExportDxf);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        request.reply = Some(reply_tx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.file_load.running = Some(Running {
+            request,
+            base: base.clone(),
+            base_revision: h.app.session.revision,
+            before: Vec::new(),
+            rx,
+            phase: Arc::new(AtomicU8::new(0)),
+            progress: Arc::new(Progress::default()),
+            preview_rx: None,
+            preview: None,
+            partial_rx: None,
+            built: None,
+            staged: None,
+        });
+        tx.send(Ok(Made { session: other, result: json!({"visible":12}), image: None })).unwrap();
+        h.frames(2);
+        assert_eq!(reply_rx.try_recv().unwrap()["result"]["visible"], 12);
+        assert!(Arc::ptr_eq(&base, &h.app.session.doc));
+        assert_eq!(h.app.session.undo.len(), undo);
+        assert_eq!(h.app.cam, cam);
+    }
 
     #[test]
     fn opening_result_and_preview_cannot_overwrite_a_newer_design() {
@@ -596,6 +1072,9 @@ mod tests {
                 progress: Arc::new(Progress::default()),
                 preview_rx: Some(preview_rx),
                 preview: None,
+                partial_rx: None,
+                built: None,
+                staged: None,
             });
             if change_document {
                 app.session.execute("file.new", &serde_json::json!({"name":"Newer design"})).unwrap();
@@ -616,6 +1095,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn provisional_picture_renders_without_adopting_cached_meshes() {
+        if !crate::gpu::test_picture_renderer() {
+            return;
+        }
         let preview = solidcraft_engine::io::DesignPreview {
             meshes: vec![solidcraft_engine::doc::MeshData {
                 name: "Saved triangle".into(),
@@ -631,7 +1113,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn repeated_large_preview_triangles_are_a_cache_miss_before_rasterization() {
+    fn repeated_large_preview_triangles_are_a_cache_miss_before_drawing() {
         let preview = solidcraft_engine::io::DesignPreview {
             meshes: vec![solidcraft_engine::doc::MeshData {
                 name: "Hostile overdraw".into(),
@@ -658,6 +1140,9 @@ mod tests {
             progress: Arc::new(Progress::default()),
             preview_rx: None,
             preview: None,
+            partial_rx: None,
+            built: None,
+            staged: None,
         });
         tick(&mut app, &egui::Context::default());
         assert!(Arc::ptr_eq(&app.session.doc, &old));
@@ -681,6 +1166,9 @@ mod tests {
             progress,
             preview_rx: None,
             preview: None,
+            partial_rx: None,
+            built: None,
+            staged: None,
         });
         assert!(!app.file_load.busy());
         assert!(app.file_load.running.is_some());
@@ -690,5 +1178,62 @@ mod tests {
         tick(&mut app, &egui::Context::default());
         assert!(app.file_load.running.is_none());
         assert!(Arc::ptr_eq(&old, &app.session.doc));
+    }
+
+    /// #1376: the web app reads a STEP file a piece per frame. The first frame only shows the
+    /// overlay, the next parses, and the solids follow, frame by frame, until the insert
+    /// lands as a worker's would; Cancel between frames leaves the design as it was.
+    #[test]
+    fn a_staged_step_import_lands_over_frames_and_cancels_between_them() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-staged-step-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("boxes.step").to_string_lossy().into_owned();
+        let mut part = Session::default();
+        for i in 0..6 {
+            part.execute("solid.box", &serde_json::json!({"length": 10, "width": 10, "height": 10, "corner": [i * 20, 0, 0]})).unwrap();
+        }
+        part.execute("file.export", &serde_json::json!({"path": path})).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = SolveApp::new(Session::default(), Default::default());
+        let bodies = |app: &SolveApp| app.session.world_state().bodies.len();
+        assert!(staged_kind(&Request::new(&path, Kind::Insert)) && staged_kind(&Request::new(&path, Kind::Open)));
+        assert!(!staged_kind(&Request::new("part.igs", Kind::Insert)) && !staged_kind(&Request::new("part.solidcraft", Kind::Open)));
+        app.file_load.queued.push_back(Request::new(&path, Kind::Insert));
+        start_staged(&mut app);
+        tick(&mut app, &ctx);
+        assert!(app.file_load.busy() && bodies(&app) == 0, "the first frame only shows the overlay");
+        tick(&mut app, &ctx);
+        let reading = app.file_load.running.as_ref().and_then(|r| r.staged.as_ref()).is_some_and(|s| s.reading.is_some());
+        assert!(reading, "the next frame parses the file");
+        let mut frames = 2;
+        while app.file_load.running.is_some() && frames < 1000 {
+            tick(&mut app, &ctx);
+            frames += 1;
+        }
+        assert_eq!(bodies(&app), 6, "{:?}", app.status);
+        assert!(app.status.as_ref().is_some_and(|s| s.0.contains("Insert done")), "{:?}", app.status);
+        // Cancelled after the parse: nothing is inserted, and nothing waits.
+        let before = app.session.doc.clone();
+        app.file_load.queued.push_back(Request::new(&path, Kind::Insert));
+        start_staged(&mut app);
+        tick(&mut app, &ctx);
+        tick(&mut app, &ctx);
+        app.file_load.cancel();
+        tick(&mut app, &ctx);
+        assert!(app.file_load.running.is_none() && !app.file_load.busy());
+        assert!(Arc::ptr_eq(&before, &app.session.doc));
+        assert_eq!(bodies(&app), 6);
+        // A file that isn't STEP fails like the worker's would, and the design stays.
+        let junk = dir.join("junk.step").to_string_lossy().into_owned();
+        std::fs::write(&junk, "not a step file").unwrap();
+        app.file_load.queued.push_back(Request::new(&junk, Kind::Insert));
+        start_staged(&mut app);
+        for _ in 0..4 {
+            tick(&mut app, &ctx);
+        }
+        assert!(app.file_load.running.is_none());
+        assert!(app.status.as_ref().is_some_and(|s| s.2 && s.0.contains("junk.step")), "{:?}", app.status);
+        assert!(Arc::ptr_eq(&before, &app.session.doc));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

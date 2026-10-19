@@ -140,7 +140,7 @@ where
     })?;
     let vec: Vec<_> = pre_faces
         .into_iter()
-        .map(|pre_face| {
+        .map(|pre_face| -> Option<_> {
             let surface = face.surface();
             let op = pre_face
                 .iter()
@@ -153,13 +153,14 @@ where
                 .into_iter()
                 .map(|chunk| chunk.wire.deref().clone())
                 .collect();
-            let mut new_face = Face::debug_new(wires, surface);
+            // SolidCraft: no panics (wasm can't catch them): a wire visiting a vertex twice gives up.
+            let mut new_face = crate::tr!(Face::try_new(wires, surface).ok(), "face of a wire visiting a vertex twice");
             if !face.orientation() {
                 new_face.invert();
             }
-            (new_face, status)
+            Some((new_face, status))
         })
-        .collect();
+        .collect::<Option<_>>()?;
     Some(vec)
 }
 

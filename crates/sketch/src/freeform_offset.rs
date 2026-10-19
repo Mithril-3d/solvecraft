@@ -137,7 +137,9 @@ impl H {
         let (points, weights) = match *seg {
             Seg2::Line { a, b } => (vec![a, b], vec![1.0; 2]),
             Seg2::Cubic { p0, p1, p2, p3 } => (vec![p0, p1, p2, p3], vec![1.0; 4]),
-            Seg2::Bezier { n, p } if (1..=7).contains(&n) => (p[..=usize::from(n)].to_vec(), vec![1.0; usize::from(n) + 1]),
+            Seg2::Bezier { n, p } if (1..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(&n) => {
+                (p[..=usize::from(n)].to_vec(), vec![1.0; usize::from(n) + 1])
+            }
             Seg2::Conic { a, apex, b, w } if w.is_finite() && w > 0.0 => (vec![a, apex, b], vec![1.0, w, 1.0]),
             _ => return Err(bad("unsupported exact free-form offset piece")),
         };
@@ -584,6 +586,35 @@ impl Sketch {
         }
         *self = candidate;
         Ok(())
+    }
+
+    /// Give every other curve that took a generated offset node (a line drawn from an open
+    /// offset's end) its own point there, coincident with the node: the output keeps sole
+    /// ownership of its nodes, and the curve follows the offset when its source moves.
+    /// Returns the ids of the constraints added.
+    pub fn detach_offset_points(&mut self) -> Result<Vec<String>> {
+        if self.freeform_offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let outputs: std::collections::BTreeSet<&str> = self.freeform_offsets.iter().map(|o| o.output.as_str()).collect();
+        let nodes: std::collections::BTreeSet<usize> =
+            self.curves.iter().filter(|c| outputs.contains(c.id.as_str())).flat_map(|c| c.kind.point_ids()).collect();
+        let taken: Vec<(usize, usize)> = self
+            .curves
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !outputs.contains(c.id.as_str()))
+            .flat_map(|(ci, c)| c.kind.point_ids().into_iter().filter(|p| nodes.contains(p)).map(move |p| (ci, p)))
+            .collect();
+        let mut added = Vec::new();
+        for (ci, node) in taken {
+            let at = self.points.get(node).map(|p| p.pos).ok_or_else(|| bad("offset output point vanished"))?;
+            let own = self.add_point(at, None)?;
+            let curve = self.curves.get_mut(ci).ok_or_else(|| bad("offset neighbour curve vanished"))?;
+            curve.kind.map_points(&|p| if p == node { own } else { p });
+            added.push(self.add_constraint(crate::ConstraintKind::Coincident { p: node, q: own }, None)?);
+        }
+        Ok(added)
     }
 }
 

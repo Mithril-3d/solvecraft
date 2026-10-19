@@ -1,7 +1,7 @@
 // Display tessellation: surface points and normals at each vertex's (u, v).
 //
 // The GPU twin of solidcraft_geom::tess::EvalSurface::{derivs, eval}: the same surface forms,
-// the same algorithms (The NURBS Book A2.1 span search, A2.3 basis functions and first
+// the same algorithms (The NURBS Book A2.1 span search, A2.2 basis functions, A2.3 first
 // derivatives, the rational quotient rule), in f32.
 
 const PLANE: u32 = 0u;
@@ -60,11 +60,6 @@ struct Derivs {
     ok: bool,
 };
 
-struct Basis {
-    n0: array<f32, 8>,
-    n1: array<f32, 8>,
-};
-
 fn vec3_at(o: u32) -> vec3<f32> {
     return vec3<f32>(data[o], data[o + 1u], data[o + 2u]);
 }
@@ -101,42 +96,58 @@ fn span_of(k0: u32, p: u32, n: u32, t: f32) -> u32 {
     return lo;
 }
 
-// Non-zero basis functions of degree p on span `span` and their first derivatives (A2.3, n = 1).
-fn basis(k0: u32, span: u32, p: u32, t: f32) -> Basis {
-    var ndu: array<array<f32, 8>, 8>;
-    var left: array<f32, 8>;
-    var right: array<f32, 8>;
-    ndu[0][0] = 1.0;
+// The arrays below are one-dimensional locals, written by loop counters and returned whole:
+// D3D12's older shader compiler (FXC) must unroll a loop that writes an array inside a struct
+// (or a two-dimensional one) by a counter, and it cannot unroll loops whose trip count is only
+// known at run time, so such a loop fails to compile there ("unable to unroll loop").
+
+// The non-zero basis functions of degree p on span `span` (The NURBS Book A2.2).
+fn basis_funs(k0: u32, span: u32, p: u32, t: f32) -> array<f32, W> {
+    var n: array<f32, W>;
+    n[0] = 1.0;
     for (var j = 1u; j <= p; j = j + 1u) {
-        left[j] = t - data[k0 + span + 1u - j];
-        right[j] = data[k0 + span + j] - t;
         var saved = 0.0;
         for (var r = 0u; r < j; r = r + 1u) {
-            ndu[j][r] = right[r + 1u] + left[j - r];
+            // right[r + 1] and left[j - r] of A2.2 (span ≥ p ≥ j, so no underflow).
+            let right = data[k0 + span + r + 1u] - t;
+            let left = t - data[k0 + span + 1u + r - j];
+            let den = right + left;
             var temp = 0.0;
-            if (ndu[j][r] != 0.0) {
-                temp = ndu[r][j - 1u] / ndu[j][r];
+            if (den != 0.0) {
+                temp = n[r] / den;
             }
-            ndu[r][j] = saved + right[r + 1u] * temp;
-            saved = left[j - r] * temp;
+            n[r] = saved + right * temp;
+            saved = left * temp;
         }
-        ndu[j][j] = saved;
+        n[j] = saved;
     }
-    var b: Basis;
-    for (var j = 0u; j <= p; j = j + 1u) {
-        b.n0[j] = ndu[j][p];
+    return n;
+}
+
+// Their first derivatives, from the degree p - 1 functions on the same span (A2.3, n = 1).
+fn basis_ders(k0: u32, span: u32, p: u32, t: f32) -> array<f32, W> {
+    var d: array<f32, W>;
+    if (p == 0u) {
+        return d;
     }
+    let lower = basis_funs(k0, span, p - 1u, t);
     for (var r = 0u; r <= p; r = r + 1u) {
-        var d = 0.0;
-        if (r >= 1u && ndu[p][r - 1u] != 0.0) {
-            d = d + ndu[r - 1u][p - 1u] / ndu[p][r - 1u];
+        var x = 0.0;
+        if (r >= 1u) {
+            let den = data[k0 + span + r] - data[k0 + span + r - p];
+            if (den != 0.0) {
+                x = x + lower[r - 1u] / den;
+            }
         }
-        if (r < p && ndu[p][r] != 0.0) {
-            d = d - ndu[r][p - 1u] / ndu[p][r];
+        if (r < p) {
+            let den = data[k0 + span + r + 1u] - data[k0 + span + r + 1u - p];
+            if (den != 0.0) {
+                x = x - lower[r] / den;
+            }
         }
-        b.n1[r] = d * f32(p);
+        d[r] = x * f32(p);
     }
-    return b;
+    return d;
 }
 
 // Point and derivative of a rational function from its homogeneous value and derivative.
@@ -152,17 +163,19 @@ fn nurbs(s: Surface, u: f32, v: f32) -> Derivs {
     var r: Derivs;
     let su = span_of(s.knots_u, s.pu, s.nu, u);
     let sv = span_of(s.knots_v, s.pv, s.nv, v);
-    let bu = basis(s.knots_u, su, s.pu, u);
-    let bv = basis(s.knots_v, sv, s.pv, v);
+    let bu0 = basis_funs(s.knots_u, su, s.pu, u);
+    let bu1 = basis_ders(s.knots_u, su, s.pu, u);
+    let bv0 = basis_funs(s.knots_v, sv, s.pv, v);
+    let bv1 = basis_ders(s.knots_v, sv, s.pv, v);
     var a = vec4<f32>(0.0);
     var au = vec4<f32>(0.0);
     var av = vec4<f32>(0.0);
     for (var j = 0u; j <= s.pv; j = j + 1u) {
         for (var i = 0u; i <= s.pu; i = i + 1u) {
             let c = ctrl_at(s.ctrl + 4u * ((sv + j - s.pv) * s.nu + su + i - s.pu));
-            a = a + bu.n0[i] * bv.n0[j] * c;
-            au = au + bu.n1[i] * bv.n0[j] * c;
-            av = av + bu.n0[i] * bv.n1[j] * c;
+            a = a + bu0[i] * bv0[j] * c;
+            au = au + bu1[i] * bv0[j] * c;
+            av = av + bu0[i] * bv1[j] * c;
         }
     }
     r.ok = abs(a.w) > 0.0;
@@ -189,13 +202,14 @@ fn revolved(s: Surface, u: f32, v: f32) -> Derivs {
     }
     // The profile curve: a one-row B-spline.
     let span = span_of(s.knots_u, s.pu, s.nu, t);
-    let b = basis(s.knots_u, span, s.pu, t);
+    let b0 = basis_funs(s.knots_u, span, s.pu, t);
+    let b1 = basis_ders(s.knots_u, span, s.pu, t);
     var c = vec4<f32>(0.0);
     var dc = vec4<f32>(0.0);
     for (var i = 0u; i <= s.pu; i = i + 1u) {
         let h = ctrl_at(s.ctrl + 4u * (span + i - s.pu));
-        c = c + b.n0[i] * h;
-        dc = dc + b.n1[i] * h;
+        c = c + b0[i] * h;
+        dc = dc + b1[i] * h;
     }
     r.ok = abs(c.w) > 0.0;
     if (!r.ok) {
@@ -263,9 +277,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!(length(n) > 1e-6 * scale) || !d.ok) {
         // A degenerate point (a pole): the normal from a step inside.
         let h = 1e-4 * (1.0 + max(abs(vert.u), abs(vert.v)));
-        let steps = array<vec2<f32>, 4>(vec2<f32>(h, h), vec2<f32>(-h, h), vec2<f32>(h, -h), vec2<f32>(-h, -h));
+        // Steps (h, h), (-h, h), (h, -h), (-h, -h), without an array indexed by k (FXC).
         for (var k = 0u; k < 4u; k = k + 1u) {
-            let e = derivs(s, vert.u + steps[k].x, vert.v + steps[k].y);
+            let du = select(h, -h, (k & 1u) != 0u);
+            let dv = select(h, -h, (k & 2u) != 0u);
+            let e = derivs(s, vert.u + du, vert.v + dv);
             let m = oriented(s, cross(e.du, e.dv));
             if (e.ok && length(m) > 0.0) {
                 n = m;

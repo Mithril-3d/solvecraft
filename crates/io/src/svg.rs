@@ -498,6 +498,42 @@ pub fn read_svg(text: &str) -> Result<Vec<Geom2>> {
 mod tests {
     use super::*;
 
+    /// The parser recurses over groups and reads numbers out of a document the user did not write,
+    /// so none of these may panic: `catch_unwind` turns one into a failed test, the way
+    /// `hostile_files_never_panic` does for STEP (solidcraft#469).
+    #[test]
+    fn hostile_svg_never_panics() {
+        let good = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+            <g transform="translate(10 5)"><rect x="1" y="2" width="3" height="4"/><path d="M0 0 L5 5 Z"/></g>
+        </svg>"#;
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "<svg".into(),
+            "<svg><".into(),
+            "<svg><path d=".into(),
+            "<svg><path d='M 1 1 L'/></svg>".into(),
+            "<svg><path d='M nan nan L inf inf'/></svg>".into(),
+            "<svg><path d='M 1e400 1e400 L 1 1'/></svg>".into(),
+            "<svg><rect width='-1' height='-1'/></svg>".into(),
+            "<svg><use href='#a'/><g id='a'><use href='#a'/></g></svg>".into(),
+            format!("<svg>{}{}</svg>", "<g>".repeat(300), "</g>".repeat(300)),
+            format!("<svg>{}</svg>", "<g>".repeat(300)),
+            "<svg><![CDATA[<g>]]></svg>".into(),
+            "<?xml version='1.0'?><!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><svg>&x;</svg>".into(),
+            format!("<svg><path d='{}'/></svg>", "L 1 1 ".repeat(20_000)),
+        ];
+        for cut in (0..good.len()).step_by(13) {
+            cases.push(good.get(..cut).unwrap_or("").to_string());
+        }
+        for (from, to) in [("10mm", "-10mm"), ("0 0 100 50", "0 0 0 0"), ("<g ", "<x "), ("rect", "rectx")] {
+            cases.push(good.replacen(from, to, 3));
+        }
+        for c in &cases {
+            let r = std::panic::catch_unwind(|| read_svg(c));
+            assert!(r.is_ok(), "panicked on {:?}", c.get(..c.len().min(200)));
+        }
+    }
+
     #[test]
     fn shapes_paths_and_units() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">

@@ -492,3 +492,33 @@ fn timeline_folders_can_nest_and_reject_cycles() {
     run(&mut s, "timeline.ungroup", json!({"group": root}));
     assert_eq!(s.doc.timeline_groups.iter().find(|group| group.id == child).unwrap().parent, None, "deleting a folder promotes its children");
 }
+
+/// A field the feature's definition doesn't have is refused with the fields it does have,
+/// instead of reporting success and changing nothing (#1491).
+#[test]
+fn edit_refuses_unknown_fields() {
+    let mut s = Session::default();
+    run(&mut s, "construct.plane.offset", json!({"base": "XZ", "offset": 50, "name": "P"}));
+    let e = s.execute("timeline.edit", &json!({"feature": "P", "set": {"offset": "-50"}})).unwrap_err().to_string();
+    assert!(e.contains("unknown field `offset`") && e.contains("`plane.distance`"), "{e}");
+    let e = s.execute("timeline.edit", &json!({"feature": "P", "set": {"plane": {"dist": "-50"}}})).unwrap_err().to_string();
+    assert!(e.contains("unknown field `plane.dist`") && e.contains("`plane.distance`"), "{e}");
+    let def = run(&mut s, "timeline.inspect", json!({"feature": "P"}))["definition"].clone();
+    assert_eq!(def["plane"]["distance"], json!("50"), "nothing changed: {def}");
+    // The field it does have edits as before.
+    run(&mut s, "timeline.edit", json!({"feature": "P", "set": {"plane": {"distance": "-50"}}}));
+    let def = run(&mut s, "timeline.inspect", json!({"feature": "P"}))["definition"].clone();
+    assert_eq!(def["plane"]["distance"], json!("-50"), "{def}");
+
+    // Fields the definition leaves out at their default are still fields: `combine: false`
+    // and `bodies: []` aren't shown on a feature mirror, and set them as they are.
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "name": "Base"}));
+    run(&mut s, "solid.mirror", json!({"features": ["Base"], "plane": "YZ", "name": "Twin"}));
+    run(&mut s, "timeline.edit", json!({"feature": "Twin", "set": {"combine": false, "bodies": []}}));
+    run(&mut s, "timeline.edit", json!({"feature": "Twin", "set": {"combine": true}}));
+    // An unknown field next to known ones refuses the whole edit.
+    let e = s.execute("timeline.edit", &json!({"feature": "Twin", "set": {"combine": false, "flip": true}})).unwrap_err().to_string();
+    assert!(e.contains("unknown field `flip`") && e.contains("`combine`") && e.contains("`plane.name`"), "{e}");
+    let def = run(&mut s, "timeline.inspect", json!({"feature": "Twin"}))["definition"].clone();
+    assert_eq!(def["combine"], json!(true), "{def}");
+}

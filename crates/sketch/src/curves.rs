@@ -153,7 +153,7 @@ pub fn spline_point(p: &[Vec2], control: bool, degree: u8, t: f64) -> Vec2 {
         return p.first().copied().unwrap_or_default();
     }
     if control {
-        return bspline_at(p, degree.clamp(1, 7) as usize, t);
+        return bspline_at(p, degree.clamp(1, solidcraft_geom::MAX_BEZIER_DEGREE as u8) as usize, t);
     }
     let spans = fit_spans(p);
     let n = spans.len().max(1);
@@ -292,7 +292,7 @@ pub fn spline_polyline(p: &[Vec2], control: bool, degree: u8) -> Vec<Vec2> {
         return p.to_vec();
     }
     if control {
-        return bspline_polyline(p, degree.clamp(1, 7) as usize);
+        return bspline_polyline(p, degree.clamp(1, solidcraft_geom::MAX_BEZIER_DEGREE as u8) as usize);
     }
     let mut out = Vec::new();
     for (p0, p1, t0, t1) in fit_spans(p) {

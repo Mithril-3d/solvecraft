@@ -11,6 +11,8 @@ use super::CommandSpec;
 use crate::params::{bad, bool_, str_, string_list, vec3};
 use crate::{Result, Session};
 
+#[path = "component_matrix.rs"]
+pub(super) mod matrix;
 #[path = "component_properties.rs"]
 pub(super) mod properties;
 #[path = "component_transfer.rs"]
@@ -29,24 +31,31 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("component.from_bodies", "Create Components from Bodies", from_bodies)
         .icon("component")
         .params("bodies: [names] → one new component per body, named after it"),
-    CommandSpec::new("component.activate", "Activate Component", activate).noundo().params("component: id or name (0 or \"root\" for the design); occurrence?, path?: exact placement used to author shared geometry"),
-    CommandSpec::new("component.list", "List Components", list).noundo(),
+    CommandSpec::new("component.activate", "Activate Component", activate).icon("activate").noundo().params("component: id or name (0 or \"root\" for the design); occurrence?, path?: exact placement used to author shared geometry"),
+    CommandSpec::new("component.list", "List Components", list).icon("list").noundo().params(
+        "compact?: bool (counts of bodies, features, sketches and construction planes instead of their names; occurrences leave out \
+         identity transforms; children as occurrence ids); bodies?: bool (with compact: body names, not their count)",
+    ),
     CommandSpec::new("component.properties", "Component Physical Properties", properties::component)
         .icon("measure").noundo()
         .params("component?: id or name (default active); descendants?: bool (default true). Measures the first placement, or all placements for root, including pending moves; material-aware mass and center of mass in world coordinates"),
     CommandSpec::new("occurrence.properties", "Occurrence Physical Properties", properties::occurrence)
         .icon("measure").noundo()
         .params("occurrence: id or name; path?: [occurrence ids] (required if nested under multiple instances); descendants?: bool (default true). Physical properties of this placement in world coordinates, including pending moves"),
-    CommandSpec::new("component.rename", "Rename Component", rename).params("component, name"),
-    CommandSpec::new("component.delete", "Delete Component", delete).params("component: deletes it, its subcomponents, occurrences and features"),
-    CommandSpec::new("component.move_bodies", "Move Bodies to Component", move_bodies).params("bodies: [names], component"),
-    CommandSpec::new("component.move_sketches", "Move Sketches to Component", move_sketches).params("sketches: [ids or names], component"),
-    CommandSpec::new("occurrence.copy", "Paste (Instance)", copy_occurrence)
+    CommandSpec::new("component.rename", "Rename Component", rename).icon("rename").params("component, name"),
+    CommandSpec::new("component.delete", "Delete Component", delete).icon("delete").params("component: deletes it, its subcomponents, occurrences and features"),
+    CommandSpec::new("component.unlock", "Unlock Contents", unlock).icon("rigid_group").params(
+        "component: removes the rigid joints that hold its contents together (an imported assembly's rigid group), so its parts \
+         move and take joints one by one → joints (the ids removed)",
+    ),
+    CommandSpec::new("component.move_bodies", "Move Bodies to Component", move_bodies).icon("move").params("bodies: [names], component"),
+    CommandSpec::new("component.move_sketches", "Move Sketches to Component", move_sketches).icon("move").params("sketches: [ids or names], component"),
+    CommandSpec::new("occurrence.copy", "Paste (Instance)", copy_occurrence).icon("copy")
         .params("component (or occurrence): what to place again; path?: validates selected occurrence; parent?: component (default: the same parent); translate?: [x,y,z]. Copies the selected effective transform, including pending moves"),
-    CommandSpec::new("component.paste_new", "Paste New", paste_new).params("component: independently copy its nested definition graph and history, materials and styles; occurrence?, path?: selected source placement; translate?: [x,y,z]. Reassigned external bodies become base geometry; retained external links and omitted boundary joints are reported"),
-    CommandSpec::new("occurrence.move", "Move Occurrence", move_occurrence)
-        .params("occurrence; path?: exact placement; space?: local|world (default local); translate?: [x,y,z]; axis?: [x,y,z], angle?: radians or \"30 deg\", origin?: [x,y,z]; capture?: bool (default true; false keeps it pending until Capture Position). Nested occurrence definitions remain shared"),
-    CommandSpec::new("occurrence.ground", "Ground", ground).params("occurrence; grounded?: bool (default toggles)"),
+    CommandSpec::new("component.paste_new", "Paste New", paste_new).icon("paste").params("component: independently copy its nested definition graph and history, materials and styles; occurrence?, path?: selected source placement; translate?: [x,y,z]. Reassigned external bodies become base geometry; retained external links and omitted boundary joints are reported"),
+    CommandSpec::new("occurrence.move", "Move Occurrence", move_occurrence).icon("move")
+        .params("occurrence; path?: exact placement; space?: local|world (default local); translate?: [x,y,z]; axis?: [x,y,z], angle?: radians or \"30 deg\", origin?: [x,y,z]; matrix?: [12 or 16 numbers] (instead of translate/axis/angle/origin: a rigid move as a row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows; one that is a rotation only up to rounding is orthonormalised, a scale, shear or mirror is refused); tolerance?: largest accepted |RᵀR − I| (default 1e-9, at most 1e-3); capture?: bool (default true; false keeps it pending until Capture Position). Nested occurrence definitions remain shared"),
+    CommandSpec::new("occurrence.ground", "Ground", ground).icon("ground").params("occurrence; grounded?: bool (default toggles)"),
     CommandSpec::new("component.capture_position", "Capture Position", capture).at("SOLID", "POSITION").icon("capture").params("keeps pending occurrence moves"),
     CommandSpec::new("component.revert_position", "Revert Position", revert).at("SOLID", "POSITION").icon("revert").noundo().params("occurrences?: [ids] (default all); drops selected pending occurrence moves"),
 ];
@@ -156,9 +165,23 @@ fn activate(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "active": id }))
 }
 
-fn list(s: &mut Session, _p: &Value) -> Result<Value> {
+fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.model.state();
     let doc = &s.doc;
+    // Compact: what a large assembly needs to be found around in, without every name and matrix.
+    let compact = bool_(p, "compact").unwrap_or(false);
+    let names = |v: Vec<&str>| if compact { json!(v.len()) } else { json!(v) };
+    let body_names = !compact || bool_(p, "bodies").unwrap_or(false);
+    let placement = |o: &Occurrence| {
+        if !compact {
+            return json!(o);
+        }
+        let mut v = json!({"id": o.id, "name": o.name, "parent": o.parent, "grounded": o.grounded});
+        if o.transform.iter().flatten().zip(solidcraft_doc::IDENTITY.iter().flatten()).any(|(a, b)| (a - b).abs() > 1e-12) {
+            v["transform"] = json!(o.transform);
+        }
+        v
+    };
     let node = |id: u64, name: &str, parent: Option<u64>| {
         let bodies: Vec<&str> = st.bodies.iter().filter(|b| doc.model_body_component(b) == id).map(|b| b.name.as_str()).collect();
         let features: Vec<&str> = doc
@@ -175,10 +198,11 @@ fn list(s: &mut Session, _p: &Value) -> Result<Value> {
             .filter(|f| f.component == id && matches!(f.kind, FeatureKind::ConstructionPlane { .. }))
             .map(|f| f.name.as_str())
             .collect();
-        let occurrences: Vec<&Occurrence> = doc.occurrences.iter().filter(|o| o.component == id).collect();
-        let children: Vec<&Occurrence> = doc.occurrences.iter().filter(|o| o.parent == id).collect();
-        json!({"id": id, "name": name, "parent": parent, "bodies": bodies, "features": features, "sketches": sketches,
-            "construction": construction, "occurrences": occurrences, "children": children})
+        let occurrences: Vec<Value> = doc.occurrences.iter().filter(|o| o.component == id).map(placement).collect();
+        let children: Vec<Value> = doc.occurrences.iter().filter(|o| o.parent == id).map(|o| if compact { json!(o.id) } else { json!(o) }).collect();
+        let bodies = if body_names { json!(bodies) } else { json!(bodies.len()) };
+        json!({"id": id, "name": name, "parent": parent, "bodies": bodies, "features": names(features), "sketches": names(sketches),
+            "construction": names(construction), "occurrences": occurrences, "children": children})
     };
     let mut out = vec![node(0, &doc.name, None)];
     for c in &doc.components {
@@ -192,10 +216,18 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     let id = component(s, p, "component", cmd)?;
     let name =
         str_(p, "name").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128).ok_or_else(|| bad(cmd, "`name` must be 1…128 characters"))?;
+    let d = s.doc_mut();
     if id == 0 {
-        s.doc_mut().name = name.to_string();
-    } else if let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == id) {
-        c.name = name.to_string();
+        d.name = name.to_string();
+    } else if let Some(c) = d.components.iter_mut().find(|c| c.id == id) {
+        let old = std::mem::replace(&mut c.name, name.to_string());
+        // Placements still named after the component ("Old:2") follow it (#1665); others keep theirs.
+        for o in d.occurrences.iter_mut().filter(|o| o.component == id) {
+            let k = o.name.strip_prefix(old.as_str()).and_then(|r| r.strip_prefix(':'));
+            if let Some(k) = k.filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())) {
+                o.name = format!("{name}:{k}");
+            }
+        }
     }
     Ok(json!({"component": id, "name": name}))
 }
@@ -231,6 +263,23 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
         s.active_component = 0;
     }
     Ok(json!({"deleted": gone, "features": feats}))
+}
+
+fn unlock(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "component.unlock";
+    let id = component(s, p, "component", cmd)?;
+    if id == 0 {
+        return Err(bad(cmd, "pick a component, not the design"));
+    }
+    let gone = s.contents_joints(id);
+    if gone.is_empty() {
+        return Err(bad(cmd, "nothing holds this component's contents together"));
+    }
+    let doc = s.doc_mut();
+    doc.assembly.joints.retain(|j| !gone.contains(&j.id));
+    doc.assembly.links.retain(|l| !gone.contains(&l.a) && !gone.contains(&l.b));
+    s.visibility.hidden_joints.retain(|h| !gone.contains(h));
+    Ok(json!({"component": id, "joints": gone}))
 }
 
 fn move_bodies(s: &mut Session, p: &Value) -> Result<Value> {
@@ -358,21 +407,39 @@ fn move_occurrence(s: &mut Session, p: &Value) -> Result<Value> {
     if o.grounded {
         return Err(bad(cmd, format!("{} is grounded", o.name)));
     }
-    let t = move_vector(p, "translate", Vec3::ZERO, true, cmd)?;
-    let axis = move_vector(p, "axis", Vec3::Z, false, cmd)?;
-    let angle = match p.get("angle") {
-        Some(Value::String(e)) => s.doc.eval(e, solidcraft_doc::expr::Kind::Angle).map_err(|e| bad(cmd, e.to_string()))?,
-        None => 0.0,
-        Some(value) => value.as_f64().ok_or_else(|| bad(cmd, "angle must be a number or angle expression"))?,
+    if let Some(mut group) = s.held_by_rigid_group(id) {
+        // The outermost component the group holds it in moves it.
+        for _ in 0..64 {
+            match s.doc.occurrence_of(group).and_then(|o| s.held_by_rigid_group(o.id)) {
+                Some(up) => group = up,
+                None => break,
+            }
+        }
+        let name = s.doc.components.iter().find(|c| c.id == group).map(|c| c.name.clone()).unwrap_or_default();
+        return Err(bad(cmd, format!("{} is held in {name} by a rigid group: move {name}, or Unlock Contents (component.unlock) first", o.name)));
+    }
+    let delta = if let Some(m) = p.get("matrix") {
+        if let Some(k) = ["translate", "axis", "angle", "origin"].into_iter().find(|k| p.get(*k).is_some()) {
+            return Err(bad(cmd, format!("give either matrix or {k}, not both")));
+        }
+        matrix::rigid(m, matrix::tolerance(p, cmd)?, cmd)?
+    } else {
+        let t = move_vector(p, "translate", Vec3::ZERO, true, cmd)?;
+        let axis = move_vector(p, "axis", Vec3::Z, false, cmd)?;
+        let angle = match p.get("angle") {
+            Some(Value::String(e)) => s.doc.eval(e, solidcraft_doc::expr::Kind::Angle).map_err(|e| bad(cmd, e.to_string()))?,
+            None => 0.0,
+            Some(value) => value.as_f64().ok_or_else(|| bad(cmd, "angle must be a number or angle expression"))?,
+        };
+        if !(t.is_finite() && axis.is_finite() && angle.is_finite()) {
+            return Err(bad(cmd, "non-finite move"));
+        }
+        if angle != 0.0 && axis.normalized().is_none() {
+            return Err(bad(cmd, "rotation axis must have a finite nonzero length"));
+        }
+        let origin = move_vector(p, "origin", Vec3::ZERO, true, cmd)?;
+        solidcraft_doc::rigid(t, origin, axis, angle)
     };
-    if !(t.is_finite() && axis.is_finite() && angle.is_finite()) {
-        return Err(bad(cmd, "non-finite move"));
-    }
-    if angle != 0.0 && axis.normalized().is_none() {
-        return Err(bad(cmd, "rotation axis must have a finite nonzero length"));
-    }
-    let origin = move_vector(p, "origin", Vec3::ZERO, true, cmd)?;
-    let delta = solidcraft_doc::rigid(t, origin, axis, angle);
     let space = match p.get("space") {
         None => "local",
         Some(Value::String(space)) => space.as_str(),

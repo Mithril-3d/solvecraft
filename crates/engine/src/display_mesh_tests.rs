@@ -71,7 +71,7 @@ fn a_large_sheet_shows_its_small_bends_and_holes_round() {
     let (mut bends, mut walls) = (0, 0);
     for face in 0..b.body.face_count() {
         let Some(FaceSurface::Cylinder { origin, axis, radius }) = face_surface(&b.body, face) else { continue };
-        let (steps, widest) = steps_around(&m, face, origin, axis);
+        let (steps, widest) = steps_around(&m, face, origin, *axis);
         assert!(widest <= DISPLAY_ANGLE * 1.001, "radius {radius}: a facet spans {} degrees", widest.to_degrees());
         if (radius - 2.0).abs() < 1e-6 {
             // Half of a hole's wall.

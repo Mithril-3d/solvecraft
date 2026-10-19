@@ -148,10 +148,10 @@ fn transferred_thread_follows_body_frame_without_changing_world_axis() {
     run(&mut s, "component.move_bodies", json!({"component":to,"bodies":["Shaft"]}));
     let after = s.world_state().threads[0].clone();
     assert!(after.axis_point.dist(before.axis_point) < 1e-6);
-    assert!(after.axis.dist(before.axis) < 1e-6);
+    assert!(after.axis.dist(*before.axis) < 1e-6);
     let mut reopened = Session { doc: solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap().into(), ..Session::default() };
     reopened.refresh();
-    assert!(reopened.world_state().threads[0].axis.dist(before.axis) < 1e-6);
+    assert!(reopened.world_state().threads[0].axis.dist(*before.axis) < 1e-6);
 }
 
 #[test]
@@ -159,7 +159,10 @@ fn inherited_component_appearance_and_legacy_assignment_survive_transfer() {
     let mut s = Session::default();
     let source = run(&mut s, "component.create", json!({"name":"Source"}))["component"].as_u64().unwrap();
     run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Block"}));
-    s.doc_mut().appearances.components.insert(source, solidcraft_doc::appearance::Look { name: "Green".into(), color: [0, 150, 0], opacity: 0.7 });
+    s.doc_mut()
+        .appearances
+        .components
+        .insert(source, solidcraft_doc::appearance::Look { name: "Green".into(), color: [0, 150, 0], opacity: 0.7, pbr: None });
     s.refresh();
     let look = s.doc.model_body_look(s.model.state().body("Block").unwrap()).unwrap();
     run(&mut s, "component.move_bodies", json!({"component":0,"bodies":["Block"]}));

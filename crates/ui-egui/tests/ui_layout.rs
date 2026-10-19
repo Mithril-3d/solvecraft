@@ -3,7 +3,7 @@
 //! every window it opens fits on screen.
 
 use serde_json::{Value, json};
-use solidcraft_ui_egui::scenario::{Harness, check};
+use solidcraft_ui_egui::scenario::{Harness, check, rect_of};
 
 /// A box body (its sketch finished) to give feature dialogs something to work on.
 fn harness() -> Harness {
@@ -21,7 +21,6 @@ fn harness() -> Harness {
 }
 
 #[test]
-#[ignore = "pending: the exploded view dialog opens 635 px wide (solidcraft-ui)"]
 fn every_dialog_opens_docked_within_its_width_limits() {
     let mut bad = Vec::new();
     let mut seen = 0;
@@ -36,7 +35,7 @@ fn every_dialog_opens_docked_within_its_width_limits() {
             seen += 1;
             // Command dialogs are 260–380 px (plus their 1 px border), the few with tables
             // (motion study, configurations) 480–560.
-            let w = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_dialog"))).map_or(0.0, |r| r.width());
+            let w = rect_of("dialog:outer").map_or(0.0, |r| r.width());
             let limits = if w > 400.0 { json!({"min": 480, "max": 562}) } else { json!({"min": 260, "max": 382}) };
             if let Err(e) = check(&mut h, &json!({ "dialog_docked": limits })) {
                 bad.push(format!("{}: {e}", spec.id));

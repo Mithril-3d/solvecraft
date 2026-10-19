@@ -41,6 +41,8 @@ fn pixel_preview_temporary_curves_match_committed_geometry_and_sampling() {
     let cases: Vec<(&str, Vec<[f64; 2]>, [f64; 2], Option<f64>, Option<f64>, Value)> = vec![
         ("sketch.circle.center", vec![[0., 0.]], [1., 0.], None, None, json!({"center":[0,0],"radius":1})),
         ("sketch.circle.two_point", vec![[-1., 0.]], [1., 0.], None, None, json!({"p0":[-1,0],"p1":[1,0]})),
+        // #1358: the whole line, both sides of the middle.
+        ("sketch.line.midpoint", vec![[0., 0.]], [1., 0.5], None, None, json!({"mid":[0,0],"end":[1,0.5]})),
         ("sketch.circle.three_point", vec![[1., 0.], [-1., 0.]], [0., 1.], None, None, json!({"p0":[1,0],"p1":[-1,0],"p2":[0,1]})),
         ("sketch.arc.three_point", vec![[1., 0.], [-1., 0.]], [0., -1.], None, None, json!({"start":[1,0],"end":[-1,0],"through":[0,-1]})),
         (

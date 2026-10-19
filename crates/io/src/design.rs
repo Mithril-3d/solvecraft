@@ -294,7 +294,11 @@ impl<R: Read + Seek> PackageReader<R> {
         if declared > MAX_ENTRIES || u16_at(4)? != 0 || u16_at(6)? != 0 || u16_at(8)? as usize != declared || end.len() != 22 + u16_at(20)? as usize {
             return Err(invalid("too many entries or unsupported ZIP directory"));
         }
-        let mut zip = zip::ZipArchive::new(source).map_err(invalid)?;
+        // A design file is a ZIP with nothing in front of it. Saying so skips zip's search for a
+        // prefix, which reads back through the stored parts and would load a large embedded
+        // source before the preview can be shown.
+        let config = zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) };
+        let mut zip = zip::ZipArchive::with_config(config, source).map_err(invalid)?;
         if u16_at(4)? != 0
             || u16_at(6)? != 0
             || u16_at(8)? as usize != zip.len()
@@ -307,7 +311,7 @@ impl<R: Read + Seek> PackageReader<R> {
         let mut total = 0u64;
         for i in 0..zip.len() {
             let part = zip.by_index_raw(i).map_err(invalid)?;
-            let name = part.name();
+            let name = part.name().map_err(invalid)?.into_owned();
             if name.is_empty()
                 || name.contains('\\')
                 || name.split('/').any(|c| c.is_empty() || c == "." || c == "..")
@@ -640,7 +644,8 @@ mod tests {
     fn seekable_preview_defers_large_source_blob_until_document_read() {
         let mut doc = Document::new("Deferred source");
         let step = "ISO-10303-21;".repeat(200_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         let preview = DesignPreview { meshes: vec![mesh()] };
         let bytes = write_design_container_with_preview(&doc, DesignCompression::Fast, Some(&preview)).unwrap();
         let count = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -699,7 +704,8 @@ mod tests {
     fn native_cache_round_trip_and_preview_defer_original_sources() {
         let mut doc = Document::new("Native cache");
         let step = "ISO-10303-21;".repeat(200_000);
-        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "large.step".into(), step: step.clone().into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         let bodies = native_geometry();
         let bytes = write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&bodies)).unwrap();
         let entries = parts(&bytes);
@@ -766,7 +772,7 @@ mod tests {
         let doc = document();
         let preview = DesignPreview { meshes: vec![mesh()] };
         let bytes = write_design_container_with_preview(&doc, DesignCompression::Fast, Some(&preview)).unwrap();
-        let offset = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap().by_name("document.json").unwrap().data_start() as usize;
+        let offset = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap().by_name("document.json").unwrap().data_start().unwrap() as usize;
         let bytes = Rc::new(RefCell::new(bytes));
         let mut reader = DesignContainerReader::new(Shared { bytes: bytes.clone(), position: 0 }).unwrap();
         assert!(reader.preview().is_some());
@@ -811,7 +817,12 @@ mod tests {
         let mut doc = Document::new("Payloads");
         for _ in 0..2 {
             doc.add_feature(
-                FeatureKind::Import { file: "example.step".into(), step: "ISO-10303-21;\nEND-ISO-10303-21;".into(), components: Vec::new() },
+                FeatureKind::Import {
+                    file: "example.step".into(),
+                    step: "ISO-10303-21;\nEND-ISO-10303-21;".into(),
+                    components: Vec::new(),
+                    skip: Vec::new(),
+                },
                 None,
             )
             .unwrap();
@@ -843,7 +854,7 @@ mod tests {
         (0..zip.len())
             .map(|i| {
                 let mut entry = zip.by_index(i).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes).unwrap();
                 (name, bytes)
@@ -1128,7 +1139,17 @@ mod tests {
         doc.units = "in".into();
         doc.named_views.push(solidcraft_doc::NamedView { name: "View".into(), ..Default::default() });
         doc.param_comments.insert("test".into(), "metadata".into());
+        let setup = solidcraft_doc::render_settings::RenderSetup { exposure_ev: 1.5, ..Default::default() };
+        std::sync::Arc::make_mut(&mut doc.render).setups.insert("Studio".into(), setup);
+        // Design properties and other tools' data (#1015), kept as they are in both forms.
+        doc.metadata = serde_json::from_value(json!({
+            "author": 42,
+            "revision": "B",
+            "com.acme.description": {"shop_id": 88123, "list": [1, 2.5, null, true, "x", {"deep": []}]},
+        }))
+        .unwrap();
         let expected = crate::read_design(&crate::write_design(&doc)).unwrap();
+        assert_eq!(expected, doc);
         assert_eq!(crate::read_design(&write_design_container(&doc).unwrap()).unwrap(), expected);
     }
 
@@ -1157,7 +1178,8 @@ mod tests {
             .collect();
         let step = solidcraft_kernel::step_export(&bodies.iter().collect::<Vec<_>>(), "SolidCraft storage benchmark").unwrap();
         let mut doc = Document::new("Generated STEP benchmark");
-        doc.add_feature(FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new() }, None).unwrap();
+        doc.add_feature(FeatureKind::Import { file: "generated.step".into(), step: step.into(), components: Vec::new(), skip: Vec::new() }, None)
+            .unwrap();
         measure_storage(&doc, "step");
     }
 

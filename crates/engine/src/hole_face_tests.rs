@@ -322,3 +322,55 @@ fn sketch_floating_in_the_gap_touching_neither_still_drills_down() {
     near(base - volume(&mut s), pi() * 25.0 * 4.0);
     assert!(!solid_at(&s, 20.0, 20.0, 4.0) && solid_at(&s, 20.0, 20.0, 16.0));
 }
+
+/// #2387: a drill point crossing the sloping back of a wall must leave a real hole.
+#[test]
+fn drilled_sketch_points_break_through_a_sloping_back_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, 1]}, "name": "Wall"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [15, 0], [15, 30], [7.5, 30], [0, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Wall", "distance": 40, "direction": "negative"}));
+    run(&mut s, "sketch.create", json!({"plane": {"origin": [15, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}, "name": "Pts"}));
+    run(&mut s, "sketch.line", json!({"points": [[5, 16], [10, 16]], "ids": ["l10"]}));
+    run(&mut s, "sketch.point", json!({"point": [30, 16], "id": "p12"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"sketch": "Pts", "points": ["l10.end", "p12"], "depth": "10 mm", "diameter": "5 mm", "type": "drilled", "tip_angle": "118 deg", "name": "H"}),
+    );
+    let id = s.doc.find_feature("H").unwrap().id;
+    let result = s.model.result(id).unwrap();
+    assert!(result.error.is_none());
+    assert!(result.boolean_diagnostics.unverified().is_none());
+    // The cylindrical bore and cone, less the oblique conical cap outside x = z/4.
+    let r = 2.5;
+    let k = 59f64.to_radians().tan();
+    let tip = r / k;
+    let outside = 4.0 - (5.0 - tip);
+    let cap = pi() * k * k * outside.powi(3) / (3.0 * (1.0 - (k / 4.0).powi(2)).powf(1.5));
+    let expected = 2.0 * (pi() * r * r * (10.0 + tip / 3.0) - cap);
+    let left = volume(&mut s);
+    // The measured curved faces are tessellated; 0.05 mm³ is 0.013% of the removed material.
+    assert!((13_500.0 - left - expected).abs() < 0.05, "removed {} vs {expected}", 13_500.0 - left);
+    assert_eq!(s.model.state().bodies.len(), 1);
+    for b in &s.model.state().bodies {
+        assert!(b.body.validity().is_empty());
+        assert_eq!(b.body.shell_count(), 1);
+    }
+    for y in [10.0, 30.0] {
+        assert!(!solid_at(&s, 10.0, y, 16.0), "bore at y = {y}");
+        assert!(!solid_at(&s, 4.2, y, 16.0), "tip breaks through at y = {y}");
+        assert!(solid_at(&s, 10.0, y + 3.0, 16.0), "material beside the bore at y = {y}");
+    }
+    let saved = s.doc.to_json();
+    run(&mut s, "edit.undo", json!({}));
+    near(volume(&mut s), 13_500.0);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), saved);
+    near(volume(&mut s), left);
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+    assert!(reopened.model.result(id).unwrap().error.is_none());
+    near(volume(&mut reopened), left);
+}

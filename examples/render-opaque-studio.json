@@ -1,0 +1,15 @@
+{
+  "commands": [
+    {"command":"file.new","params":{"name":"Original opaque surface study"}},
+    {"command":"solid.sphere","params":{"body_name":"Nonmetal smooth","radius":10,"center":[-36,0,12]}},
+    {"command":"solid.sphere","params":{"body_name":"Nonmetal rough","radius":10,"center":[-12,0,12]}},
+    {"command":"solid.sphere","params":{"body_name":"Metal smooth","radius":10,"center":[12,0,12]}},
+    {"command":"solid.sphere","params":{"body_name":"Metal rough","radius":10,"center":[36,0,12]}},
+    {"command":"appearance.assign","params":{"bodies":["Nonmetal smooth"],"appearance":"Original nonmetal smooth","color":"#b47846","pbr":{"metallic":0,"roughness":0.2,"dielectric_ior":1.5}}},
+    {"command":"appearance.assign","params":{"bodies":["Nonmetal rough"],"appearance":"Original nonmetal rough","color":"#b47846","pbr":{"metallic":0,"roughness":0.65,"dielectric_ior":1.5}}},
+    {"command":"appearance.assign","params":{"bodies":["Metal smooth"],"appearance":"Original metal smooth","color":"#b47846","pbr":{"metallic":1,"roughness":0.2,"dielectric_ior":1.5}}},
+    {"command":"appearance.assign","params":{"bodies":["Metal rough"],"appearance":"Original metal rough","color":"#b47846","pbr":{"metallic":1,"roughness":0.65,"dielectric_ior":1.5}}},
+    {"command":"solid.box","params":{"body_name":"Study base","corner":[-49,-14,0],"length":98,"width":28,"height":2}},
+    {"command":"appearance.assign","params":{"bodies":["Study base"],"color":"#ccd0d4"}}
+  ]
+}

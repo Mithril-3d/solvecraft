@@ -75,3 +75,82 @@ fn faces_with_room_are_pushed_apart() {
     let (added, lumps, how) = change(&block, &pad, BoolOp::Union);
     assert!((added - 30_000.0).abs() < 1e-6 && lumps == 1 && used(&how, BooleanStrategy::CoplanarSeparation), "{added}, {how:?}");
 }
+
+/// A disc joined into a round hole it fills (issue: "boolean Union: no result" for a 1 mm
+/// floor extruded into a through hole of a part that isn't a prism). The disc's wall lies on
+/// the hole's, and at either end its face lies in the block's bottom or top face: it adds its
+/// own volume, the block stays one piece, and the hole is closed where the disc is.
+#[test]
+fn a_disc_joined_into_the_hole_it_fills() {
+    let hole = cylinder(Vec3::new(150.0, 50.0, -1.0), Vec3::Z, 20.0, 22.0).unwrap();
+    let drilled = boolean(&block(200.0, 100.0, 20.0), &hole, BoolOp::Cut).unwrap().unwrap();
+    for (z0, z1) in [(0.0, 1.0), (5.0, 8.0), (19.0, 20.0)] {
+        let disc = cylinder(Vec3::new(150.0, 50.0, z0), Vec3::Z, 20.0, z1 - z0).unwrap();
+        let want = measure(&disc).unwrap().volume;
+        let (r, how) = capture_boolean_diagnostics(|| boolean(&drilled, &disc, BoolOp::Union));
+        let r = r.unwrap().unwrap();
+        let added = measure(&r).unwrap().volume - measure(&drilled).unwrap().volume;
+        assert!((added - want).abs() < want * 1e-3, "{z0}..{z1}: {added} vs {want}, {how:?}");
+        assert!(r.lumps().unwrap().len() == 1 && r.validity().is_empty(), "{z0}..{z1}: {:?}", r.validity());
+        // Exact: nothing of the tool is moved.
+        assert!(used(&how, BooleanStrategy::GrownBoss) && !used(&how, BooleanStrategy::ToolNudge), "{z0}..{z1}: {how:?}");
+    }
+}
+
+/// A hemisphere of radius `r` standing on the plane z = 0.
+fn hemisphere(r: f64) -> Body {
+    let ball = sphere(Vec3::ZERO, r).unwrap();
+    let below = box_solid(Vec3::new(-2.0 * r, -2.0 * r, -2.0 * r), Vec3::new(2.0 * r, 2.0 * r, 0.0)).unwrap();
+    boolean(&ball, &below, BoolOp::Cut).unwrap().unwrap()
+}
+
+/// A hemisphere (r 20) and a block (x 5 to 35, y -30 to 30, z 0 to 25) that both stand on z = 0, the block's foot over most of the
+/// hemisphere's flat face. The neighbour of that face is the sphere, which cannot be stretched, so its face is grown instead (a
+/// strip along its rim) and what the join leaves below the plane is cut off by editing faces. The block takes the part of the dome
+/// beyond x = 5, half of a cap 15 high: the union is the dome and the block less that part.
+#[test]
+fn a_block_flush_with_the_flat_face_of_a_hemisphere_joins_exactly() {
+    let (r, x0) = (20.0, 5.0);
+    let block = box_solid(Vec3::new(x0, -30.0, 0.0), Vec3::new(35.0, 30.0, 25.0)).unwrap();
+    let dome = hemisphere(r);
+    let h = r - x0;
+    let expected = 2.0 / 3.0 * std::f64::consts::PI * r.powi(3) - std::f64::consts::PI * h * h * (3.0 * r - h) / 6.0 + 30.0 * 60.0 * 25.0;
+    for (a, b) in [(&dome, &block), (&block, &dome)] {
+        let joined = crate::coplanar::boolean_grown(a, b, BoolOp::Union).expect("the route applies").unwrap().unwrap();
+        let v = measure(&joined).unwrap().volume;
+        assert!((v - expected).abs() < expected * 1e-4, "{v} against {expected}");
+        assert_eq!(joined.lumps().unwrap().len(), 1);
+        assert!(joined.validity().is_empty(), "{:?}", joined.validity());
+        // The flat faces are one plane again: nothing of the join stays below z = 0.
+        let mesh = joined.tessellate(0.05).unwrap();
+        let lowest = mesh.positions.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        assert!(lowest > -1e-6, "the join reaches down to z = {lowest}");
+    }
+}
+
+/// Growing the flat face of a dome past its plane and cutting what that adds off again gives the dome back: the same volume, the same
+/// faces, nothing below the plane.
+#[test]
+fn what_growing_a_face_adds_is_cut_off_again_exactly() {
+    let dome = hemisphere(20.0);
+    let measured = measure(&dome).unwrap().volume;
+    let grown = crate::coplanar::grow_faces_exact(&dome, -Vec3::Z, 0.0, 3.0).unwrap();
+    assert!(measure(&grown).unwrap().volume > measured + 3.0 * 300.0, "the stub adds volume");
+    let back = crate::coplanar::trim_exact(&grown, -Vec3::Z, 0.0).unwrap();
+    let v = measure(&back).unwrap().volume;
+    assert!((v - measured).abs() < measured * 1e-6, "{v} against {measured}");
+    assert_eq!(back.face_count(), dome.face_count());
+    assert!(back.validity().is_empty(), "{:?}", back.validity());
+    let lowest = back.tessellate(0.05).unwrap().positions.iter().map(|p| p.z).fold(f64::MAX, f64::min);
+    assert!(lowest > -1e-6, "the body reaches down to z = {lowest}");
+}
+
+/// A plane the body stands on has nothing beyond it, and one clear of the body is refused (nothing is cut off).
+#[test]
+fn trimming_at_a_plane_with_nothing_beyond_it() {
+    let dome = hemisphere(20.0);
+    let measured = measure(&dome).unwrap().volume;
+    let same = crate::coplanar::trim_exact(&dome, -Vec3::Z, 0.0).unwrap();
+    assert!((measure(&same).unwrap().volume - measured).abs() < measured * 1e-9);
+    assert!(crate::coplanar::trim_exact(&dome, -Vec3::Z, 5.0).is_err());
+}

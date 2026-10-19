@@ -61,9 +61,13 @@ pub fn fit_polyline(fit: &[Vec3]) -> Vec<Vec3> {
         return fit.to_vec();
     }
     let n = fit.len();
+    // A curve that ends where it starts is smooth through that point (its neighbours wrap).
+    let closed = n > 3 && fit[0].dist(fit[n - 1]) < 1e-9;
     let at = |i: isize| -> Vec3 {
         match usize::try_from(i) {
             Ok(i) if i < n => fit[i],
+            Ok(_) if closed => fit[1],
+            Err(_) if closed => fit[n - 2],
             // Mirrored end tangents.
             Ok(_) => fit[n - 1] * 2.0 - fit[n - 2],
             Err(_) => fit[0] * 2.0 - fit[1],
@@ -329,5 +333,21 @@ mod tests {
         assert!(sk.add_link_with_wires(LinkKind::Include, LinkSource::Origin, &[], &[vec![Vec3::ZERO; MAX_WIRE_POINTS + 1]]).is_err());
         assert_eq!(sk, before);
         sk.validate_wires().unwrap();
+    }
+
+    /// Through points around a circle that end where they start, the spline turns as smoothly at
+    /// the closing point as everywhere else; an open one keeps its mirrored end tangents.
+    #[test]
+    fn a_closed_spline_is_smooth_where_it_closes() {
+        let ring: Vec<Vec3> = (0..=12).map(|k| f64::from(k) * std::f64::consts::TAU / 12.0).map(|a| Vec3::new(a.cos(), a.sin(), 0.0)).collect();
+        let pts = fit_polyline(&ring);
+        let dir = |a: Vec3, b: Vec3| (b - a).normalized().unwrap();
+        let n = pts.len();
+        let (start, end) = (dir(pts[0], pts[1]), dir(pts[n - 2], pts[n - 1]));
+        let mid = |i: usize| dir(pts[i - 1], pts[i]).dot(dir(pts[i], pts[i + 1]));
+        assert!(start.dot(end) >= mid(SPAN_SAMPLES) - 1e-9, "turn at the close {}, at a fit point {}", start.dot(end), mid(SPAN_SAMPLES));
+        let open = fit_polyline(&ring[..12]);
+        assert_eq!(open.first(), ring.first());
+        assert_eq!(open.last(), ring.get(11));
     }
 }

@@ -4,6 +4,10 @@
 //! tinted, removed material as a translucent ghost. The last good preview stays up while the
 //! next one computes or when an input makes the feature fail (the error shows in the dialog).
 //! Nothing here touches the document or the undo history.
+//!
+//! A feature that adds or removes a tool body (join, cut, intersect) shows only its tool. That
+//! is all its preview builds: its boolean, which can take seconds (a text joined onto a part),
+//! runs once, on OK, and an error it finds shows then, the dialog staying open.
 
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -22,6 +26,8 @@ use crate::theme::Tokens;
 pub struct Colors {
     pub body: [u8; 4],
     pub added: [u8; 4],
+    /// A body the preview creates (New Body), so it doesn't look like a join.
+    pub new_body: [u8; 4],
     pub removed: [u8; 4],
     pub edge: [u8; 4],
 }
@@ -29,7 +35,7 @@ pub struct Colors {
 impl Colors {
     pub fn from_tokens(t: &Tokens) -> Colors {
         let c = |c: egui::Color32| c.to_srgba_unmultiplied();
-        Colors { body: c(t.body), added: c(t.preview_add), removed: c(t.preview_cut), edge: c(t.body_edge) }
+        Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge) }
     }
 }
 
@@ -53,6 +59,9 @@ pub struct Built {
     pub applied: Option<(f64, f64)>,
     /// The radius spline of each edge a fillet tapered (`fit: taper`), with a point on the edge.
     pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    /// The reply of a previewed drive that stopped short of the asked values (the dialog says
+    /// where and why, in the UI's language).
+    pub stopped: Option<serde_json::Value>,
 }
 
 type Job = Result<Built, String>;
@@ -62,8 +71,10 @@ pub struct PreviewState {
     /// Key of the commands whose result (or error) is shown.
     shown_key: Option<u64>,
     running: Option<(u64, Receiver<Job>)>,
-    /// Inputs of an in-flight joint preview, excluding only its driven values.
-    running_motion_key: Option<u64>,
+    /// The running job builds a tool alone (for a join, cut or intersect).
+    running_tool: bool,
+    /// Inputs of a joint or distance preview, excluding only its driven values.
+    running_stream_key: Option<u64>,
     /// Bodies the preview stands in for (hidden in the model scene).
     pub replaced: Vec<String>,
     /// The preview scene for the GPU and its key (changes whenever the scene does).
@@ -83,17 +94,23 @@ pub struct PreviewState {
     started: f64,
     /// The smallest and largest radius the previewed fillet used when it reduced the one asked for.
     pub applied: Option<(f64, f64)>,
+    /// The reply of a previewed drive that stopped short (see [`Built::stopped`]).
+    pub stopped: Option<serde_json::Value>,
     /// The radius splines the previewed fillet tapered its edges with.
     pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    straight: crate::extrude_preview::StraightPreview,
 }
 
 impl PreviewState {
     fn clear(&mut self) {
+        self.straight.clear();
         self.running = None;
-        self.running_motion_key = None;
+        self.running_tool = false;
+        self.running_stream_key = None;
         self.shown_key = None;
         self.error = None;
         self.applied = None;
+        self.stopped = None;
         self.tapered.clear();
         self.sketches.clear();
         self.busy = false;
@@ -103,6 +120,15 @@ impl PreviewState {
             self.replaced.clear();
             self.set_scene(GpuScene::default());
         }
+    }
+
+    /// Drop the preview of a design that leaves the window. Its scene goes too: the viewport
+    /// keeps drawing the last scene it took until the slot it reads hands it another, so a fresh
+    /// state (another slot, empty) would leave the old preview drawn over the next design.
+    pub fn reset(&mut self) {
+        let (slot, key) = (std::mem::take(&mut self.slot), self.key);
+        *self = PreviewState { slot, key, ..PreviewState::default() };
+        self.set_scene(GpuScene::default());
     }
 
     fn set_scene(&mut self, sc: GpuScene) {
@@ -123,6 +149,7 @@ impl PreviewState {
                 self.active = true;
                 self.error = b.error;
                 self.applied = b.applied;
+                self.stopped = b.stopped;
                 self.tapered = b.tapered;
                 self.set_scene(b.scene);
             }
@@ -130,6 +157,7 @@ impl PreviewState {
                 self.sketches.clear();
                 self.error = Some(e);
                 self.applied = None;
+                self.stopped = None;
                 self.tapered.clear();
             }
         }
@@ -137,7 +165,7 @@ impl PreviewState {
 
     /// Errors validate only the current inputs. Keep the last good geometry while
     /// computing new inputs, but never let an obsolete result block their Apply.
-    fn poll(&mut self, key: u64, motion_key: Option<u64>) {
+    fn poll(&mut self, key: u64, stream_key: Option<u64>) {
         if self.shown_key != Some(key) {
             self.sketches.clear();
             self.error = None;
@@ -151,11 +179,14 @@ impl PreviewState {
             };
             if let Some(job) = job {
                 self.running = None;
-                let intermediate = motion_key.is_some() && self.running_motion_key == motion_key && matches!(&job, Ok(b) if b.error.is_none());
-                self.running_motion_key = None;
-                // A held slider or animation may advance faster than the worker. Show
-                // completed poses from the same joint setup, then compute the latest.
-                // Errors and results from different setups still require an exact key.
+                let good = matches!(&job, Ok(b) if b.error.is_none());
+                let intermediate = good && (self.running_tool || stream_key.is_some() && self.running_stream_key == stream_key);
+                self.running_stream_key = None;
+                self.running_tool = false;
+                // A held slider, a dragged arrow or an animation may advance faster than the
+                // worker. Show completed joint/distance results from the same setup, and tools built for
+                // inputs since changed, then compute the latest. Errors still require an exact
+                // key.
                 if k == key || intermediate {
                     self.apply(k, job);
                 }
@@ -169,7 +200,20 @@ impl PreviewState {
 /// limits, feature dialog or document cannot reuse an obsolete pose.
 fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
     if !cmds.iter().any(|(c, p)| c == "joint.drive" || c == "joint.create" && p.get("values").is_some())
-        || !cmds.iter().all(|(c, _)| matches!(c.as_str(), "joint.drive" | "joint.create" | "joint.as_built" | "joint.edit" | "joint.limits"))
+        || !cmds.iter().all(|(c, _)| {
+            matches!(
+                c.as_str(),
+                "joint.drive"
+                    | "joint.create"
+                    | "joint.as_built"
+                    | "joint.edit"
+                    | "joint.limits"
+                    | "joint.gear"
+                    | "joint.rack_pinion"
+                    | "joint.screw"
+                    | "joint.cam"
+            )
+        })
     {
         return None;
     }
@@ -191,6 +235,41 @@ fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
     Some(h.finish())
 }
 
+/// Tool previews already stream in `poll`. New-body extrusions and face offsets instead
+/// build their full result; allow successful intermediate distances only within the same
+/// setup. Preserve selections, feature identity, extent mode, revision and colours. The
+/// exact job key still ensures the latest distance is computed and errors never go stale.
+fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
+    if let Some(key) = motion_key(cmds, revision, colors) {
+        return Some(key);
+    }
+    if cmds.is_empty() || as_new_body(cmds).is_some() {
+        return None;
+    }
+    let mut setup = cmds.to_vec();
+    for (command, params) in &mut setup {
+        let (command, params) = if command == "timeline.redefine" {
+            let command = params.get("command")?.as_str()?.to_string();
+            (command, params.get_mut("params")?)
+        } else {
+            (command.clone(), params)
+        };
+        let fields: &[&str] = match command.as_str() {
+            "solid.extrude" => &["distance", "distance2", "to_offset"],
+            "solid.offset_face" => &["distance"],
+            _ => return None,
+        };
+        let params = params.as_object_mut()?;
+        for field in fields {
+            // Keep presence: changing extent mode must not reuse the old result.
+            if let Some(value) = params.get_mut(*field) {
+                *value = Value::Null;
+            }
+        }
+    }
+    Some(job_key(&setup, revision, colors))
+}
+
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
@@ -208,19 +287,24 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
         }
     };
     let colors = Colors::from_tokens(&Tokens::get());
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(&cmds).unwrap_or_default().hash(&mut h);
-    app.session.revision.hash(&mut h);
-    format!("{colors:?}").hash(&mut h);
-    let key = h.finish();
-    let motion_key = motion_key(&cmds, app.session.revision, colors);
+    let key = job_key(&cmds, app.session.revision, colors);
+    let stream_key = stream_key(&cmds, app.session.revision, colors);
+    let tool = as_new_body(&cmds).is_some();
     let pv = &mut app.preview;
-    pv.poll(key, motion_key);
+    pv.poll(key, stream_key);
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
-        pv.running_motion_key = motion_key;
+        pv.running_stream_key = stream_key;
+        let mut straight = std::mem::take(&mut app.preview.straight);
+        let job = straight.compute(app, &cmds, colors);
+        app.preview.straight = straight;
+        if let Some(job) = job {
+            app.preview.apply(key, job);
+            app.preview.busy = false;
+            return;
+        }
         let scratch = app.session.scratch();
-        spawn(&mut app.preview, key, scratch, cmds, colors);
+        spawn(&mut app.preview, key, scratch, cmds, colors, tool);
     }
     app.preview.busy = app.preview.running.is_some();
     if app.preview.busy {
@@ -228,22 +312,36 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     }
 }
 
+/// What tells one preview computation from another: its commands, the document revision they
+/// run on and the colours.
+fn job_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(cmds).unwrap_or_default().hash(&mut h);
+    revision.hash(&mut h);
+    format!("{colors:?}").hash(&mut h);
+    h.finish()
+}
+
+/// Start computing the preview of `cmds`: for a tool feature (`tool`), only its tool.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors) {
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("preview".into()).spawn(move || {
-        let _ = tx.send(compute(&scratch, &cmds, colors));
+        let _ = tx.send(if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
     });
     match spawned {
-        Ok(_) => pv.running = Some((key, rx)),
+        Ok(_) => {
+            pv.running = Some((key, rx));
+            pv.running_tool = tool;
+        }
         Err(e) => pv.apply(key, Err(e.to_string())),
     }
 }
 
 /// No threads on the web: compute right away.
 #[cfg(target_arch = "wasm32")]
-fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors) {
-    pv.apply(key, compute(&scratch, &cmds, colors));
+fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, Value)>, colors: Colors, tool: bool) {
+    pv.apply(key, if tool { compute_tool(&scratch, &cmds, colors) } else { compute(&scratch, &cmds, colors) });
 }
 
 /// Evaluate the commands on the scratch session and build the preview scene.
@@ -253,8 +351,18 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if cmds.iter().any(|(command, params)| {
-        matches!(command.as_str(), "sketch.redefine" | "sketch.mirror" | "sketch.pattern.rectangular" | "sketch.pattern.circular" | "sketch.offset")
-            || command == "construct.plane.along_path"
+        matches!(
+            command.as_str(),
+            "sketch.redefine"
+                | "sketch.mirror"
+                | "sketch.pattern.rectangular"
+                | "sketch.pattern.circular"
+                | "sketch.offset"
+                | "sketch.fillet"
+                | "sketch.chamfer.equal_distance"
+                | "sketch.chamfer.two_distance"
+                | "sketch.chamfer.distance_angle"
+        ) || command == "construct.plane.along_path"
             || params.get("command").and_then(Value::as_str) == Some("construct.plane.along_path")
     }) {
         let preview = s.preview_visible_world(cmds).map_err(|error| error.to_string())?;
@@ -269,21 +377,16 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if let Some(job) = crate::dialogs_assembly::world_preview(s, cmds, colors) {
         return job;
     }
-    let real = s.preview(cmds);
-    let guard = |f: &dyn Fn() -> Built| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| "the preview failed".to_string());
     match as_new_body(cmds) {
-        Some((alt, op)) => {
-            let tool = match s.preview(&alt) {
-                Ok(t) => t,
-                Err(e) => return Err(real.err().map_or_else(|| e.to_string(), |r| r.to_string())),
-            };
-            let mut b = guard(&|| build_tool(&tool.before, &tool.after, colors, &op))?;
-            b.error = real.err().map(|e| e.to_string());
-            b.bounds = state_bounds(&tool.after);
+        Some(_) => {
+            let mut b = compute_tool(s, cmds, colors)?;
+            b.error = s.preview(cmds).err().map(|e| e.to_string());
             Ok(b)
         }
         None => {
-            let p = real.map_err(|e| e.to_string())?;
+            let p = s.preview(cmds).map_err(|e| e.to_string())?;
+            let guard =
+                |f: &dyn Fn() -> Built| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| "the preview failed".to_string());
             let mut b = guard(&|| build(&p.before, &p.after, colors))?;
             b.bounds = state_bounds(&p.after);
             // The radius a previewed fillet used when it reduced the one asked for (a new
@@ -294,6 +397,66 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
             Ok(b)
         }
     }
+}
+
+/// The tool body of a feature that adds or removes one, built on its own (as a new body): what
+/// its live preview shows, without the boolean. When even the tool fails, the feature's own
+/// error. Other features: their whole preview ([`compute`]).
+fn compute_tool(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
+    let Some((alt, op)) = as_new_body(cmds) else { return compute(s, cmds, colors) };
+    let tool = match s.preview(&alt) {
+        Ok(t) => t,
+        Err(e) => return Err(s.preview(cmds).err().map_or_else(|| e.to_string(), |r| r.to_string())),
+    };
+    let mut b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tool(&tool.before, &tool.after, colors, &op)))
+        .map_err(|_| "the preview failed".to_string())?;
+    b.bounds = state_bounds(&tool.after);
+    Ok(b)
+}
+
+fn extrusion_params<'a>(id: &str, params: &'a Value) -> Option<&'a Value> {
+    match id {
+        "solid.extrude" => Some(params),
+        "timeline.redefine" if params.get("command").and_then(Value::as_str) == Some("solid.extrude") => params.get("params"),
+        _ => None,
+    }
+}
+
+/// Check references without intersecting the tool with the target's geometry.
+pub(crate) fn extrusion_target_error(s: &Session, cmds: &[(String, Value)], before: &ModelState) -> Option<String> {
+    for (id, params) in cmds {
+        let params = extrusion_params(id, params)?;
+        let op = params.get("operation").and_then(Value::as_str).unwrap_or("new");
+        if op == "new" {
+            continue;
+        }
+        let targets = params
+            .get("targets")
+            .and_then(Value::as_array)
+            .filter(|targets| !targets.is_empty())
+            .or_else(|| params.get("participants").and_then(Value::as_array));
+        let mut found = false;
+        if let Some(targets) = targets.filter(|targets| !targets.is_empty()) {
+            for target in targets.iter().filter_map(Value::as_str) {
+                if target == "*" {
+                    found |= !before.bodies.is_empty();
+                } else if before.body(target).is_some() {
+                    found = true;
+                } else {
+                    return Some(format!("unknown body `{target}`"));
+                }
+            }
+        } else {
+            found = params.get("faces").and_then(|_| params.get("face_body")).and_then(Value::as_str).map_or_else(
+                || before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component),
+                |name| s.world_state().body(name).is_some(),
+            );
+        }
+        if !found && matches!(op, "cut" | "intersect") {
+            return Some("there is no body to cut or intersect".into());
+        }
+    }
+    None
 }
 
 fn state_bounds(st: &ModelState) -> Aabb3 {
@@ -327,7 +490,16 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
             }
         }
     }
-    Built { scene: sc, sketches: Vec::new(), replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+    Built {
+        scene: sc,
+        sketches: Vec::new(),
+        replaced: Vec::new(),
+        error: None,
+        bounds: Aabb3::EMPTY,
+        applied: None,
+        tapered: Vec::new(),
+        stopped: None,
+    }
 }
 
 /// The same commands making a new body instead of joining, cutting or intersecting, and the
@@ -396,7 +568,11 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
         let cut = old.as_ref().is_some_and(|bm| am.measure().volume < bm.measure().volume - 1e-6);
         for (t, f) in am.triangles.iter().zip(&am.tri_face) {
             let new = added.get(*f as usize).copied().unwrap_or(true);
-            let col = if new { c.added } else { c.body };
+            let col = match (new, old.is_some()) {
+                (false, _) => c.body,
+                (true, true) => c.added,
+                (true, false) => c.new_body,
+            };
             for k in t {
                 let i = *k as usize;
                 if let (Some(p), Some(n)) = (am.positions.get(i), am.normals.get(i)) {
@@ -464,7 +640,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
         })
         .collect();
-    Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+    Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new(), stopped: None }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -612,7 +788,7 @@ mod tests {
     use serde_json::json;
 
     fn colors() -> Colors {
-        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
+        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
     }
 
     #[test]
@@ -659,6 +835,7 @@ mod tests {
             bounds: Aabb3::EMPTY,
             applied: None,
             tapered: Vec::new(),
+            stopped: None,
         }
     }
 
@@ -671,7 +848,7 @@ mod tests {
         for (running, wanted) in [(1, 2), (2, 3), (3, 4)] {
             let (tx, rx) = std::sync::mpsc::channel();
             pv.running = Some((running, rx));
-            pv.running_motion_key = Some(42);
+            pv.running_stream_key = Some(42);
             pv.poll(wanted, Some(42));
             assert!(pv.running.is_some());
             tx.send(Ok(pose())).unwrap();
@@ -684,7 +861,7 @@ mod tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((4, rx));
-        pv.running_motion_key = Some(42);
+        pv.running_stream_key = Some(42);
         tx.send(Ok(pose())).unwrap();
         pv.poll(4, Some(42));
         assert_eq!(pv.shown_key, Some(4), "release catches up to the exact final pose");
@@ -699,7 +876,7 @@ mod tests {
             (Some(42), Err("old invalid value".into())),
             (Some(42), Ok(Built { error: Some("old tool preview error".into()), ..pose() })),
         ] {
-            let mut pv = PreviewState { running_motion_key: Some(42), ..PreviewState::default() };
+            let mut pv = PreviewState { running_stream_key: Some(42), ..PreviewState::default() };
             let (tx, rx) = std::sync::mpsc::channel();
             pv.running = Some((1, rx));
             tx.send(job).unwrap();
@@ -742,6 +919,24 @@ mod tests {
                 motion_key(&[(command.into(), json!({"joint": 1, "values": [90]}))], 7, colors()),
             );
         }
+        // A gear dialog playing its driving joint streams its poses too.
+        let gear = |angle: &str| {
+            vec![
+                ("joint.gear".to_string(), json!({"a": 1, "b": 2, "ra": 10, "rb": 20})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&gear("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&gear("0 deg"), 7, colors()), motion_key(&gear("90 deg"), 7, colors()));
+        // So does a cam dialog turning its cam.
+        let cam = |angle: &str| {
+            vec![
+                ("joint.cam".to_string(), json!({"a": 1, "b": 2, "profile": {"sketch": 3}})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&cam("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&cam("0 deg"), 7, colors()), motion_key(&cam("90 deg"), 7, colors()));
     }
 
     /// Combine previews its result (cut, join or intersect between existing bodies) without an
@@ -882,8 +1077,98 @@ mod tests {
         let b = compute(&s, &[("solid.extrude".into(), json!({"distance": "15 mm"}))], colors()).unwrap();
         assert!(b.replaced.is_empty());
         assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().body), 0);
+        // #1805: a new body has its own colour, not a join's.
+        assert!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().new_body) > 0);
+        assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().added), 0);
         assert!(b.scene.ghost.is_empty());
         assert!(compute(&s, &[("solid.extrude".into(), json!({"distance": "1 +"}))], colors()).is_err());
         assert!(s.model.state().bodies.is_empty());
     }
+
+    fn session_of(cmds: &[(&str, Value)]) -> Session {
+        let mut s = Session::default();
+        for (id, p) in cmds {
+            s.execute(id, p).unwrap();
+        }
+        s
+    }
+
+    /// A block and a two-letter text to cut into it.
+    fn text_on_block() -> (Session, Vec<(String, Value)>) {
+        let s = session_of(&[
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 20]})),
+            ("sketch.finish", json!({})),
+            ("solid.extrude", json!({"distance": 10})),
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.text", json!({"text": "AB", "at": [5, 5], "height": 10})),
+            ("sketch.finish", json!({})),
+        ]);
+        (s, vec![("solid.extrude".to_string(), json!({"distance": 2, "operation": "cut"}))])
+    }
+
+    /// A tool feature's live preview builds its tool without the boolean: a cut into nothing
+    /// shows its tool with no error (OK will report it), while the whole preview has the error.
+    #[test]
+    fn a_tool_preview_builds_the_tool_without_the_boolean() {
+        let s = session_of(&[
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]})),
+            ("sketch.finish", json!({})),
+        ]);
+        let cmds = vec![("solid.extrude".to_string(), json!({"distance": 2, "operation": "cut"}))];
+        let tool = compute_tool(&s, &cmds, colors()).unwrap();
+        assert!(tool.error.is_none() && !tool.scene.xray.is_empty(), "{:?}", tool.error);
+        let whole = compute(&s, &cmds, colors()).unwrap();
+        assert!(whole.error.as_deref().is_some_and(|e| e.contains("no body to cut")), "{:?}", whole.error);
+        assert_eq!(whole.scene.xray.len(), tool.scene.xray.len());
+    }
+
+    /// While an arrow is dragged the inputs change faster than a tool is built: a tool built
+    /// for inputs since changed is shown anyway (then the latest computed), an error only for
+    /// the inputs it belongs to.
+    #[test]
+    fn a_tool_for_inputs_since_changed_still_shows() {
+        let (s, cmds) = text_on_block();
+        let tool = compute_tool(&s, &cmds, colors()).unwrap();
+        let mut pv = PreviewState::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((1, rx));
+        pv.running_tool = true;
+        tx.send(Ok(tool)).unwrap();
+        pv.poll(2, None);
+        assert!(pv.running.is_none() && pv.active && pv.shown_key == Some(1), "shown, and key 2 still to compute");
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((3, rx));
+        pv.running_tool = true;
+        tx.send(Err("too far".into())).unwrap();
+        pv.poll(4, None);
+        assert!(pv.error.is_none() && pv.shown_key == Some(1), "an old error is dropped");
+    }
+
+    /// A design leaving the window (another tab) takes its preview off the viewport: an empty
+    /// scene in the slot the viewport reads, under a new key. A fresh slot left the fillet
+    /// preview of the old design drawn over the new tab's empty design.
+    #[test]
+    fn reset_hands_the_viewport_an_empty_scene() {
+        let mut pv = PreviewState::default();
+        let mut sc = GpuScene::default();
+        sc.xray_tri([0.0; 3], [0.0, 0.0, 1.0], [255; 4]);
+        pv.set_scene(sc);
+        pv.active = true;
+        pv.replaced = vec!["Body1".into()];
+        let slot = pv.slot.clone();
+        let key = pv.key;
+        // The viewport took the scene.
+        assert!(slot.lock().unwrap().take().is_some_and(|s| !s.xray.is_empty()));
+        pv.reset();
+        assert!(std::sync::Arc::ptr_eq(&slot, &pv.slot), "the slot the viewport reads");
+        assert_ne!(pv.key, key, "a new key: the viewport takes the slot again");
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|s| s.xray.is_empty() && s.blocks.is_empty()));
+        assert!(!pv.active && pv.replaced.is_empty());
+    }
 }
+
+#[cfg(test)]
+#[path = "preview_drag_tests.rs"]
+mod drag_tests;

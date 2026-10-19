@@ -1,4 +1,4 @@
-//! Drawing-time inference for the Line tool, like Fusion's: while the next point is placed the
+//! Drawing-time inference for the Line tool: while the next point is placed the
 //! cursor snaps to directions and places taken from the existing geometry (parallel or
 //! perpendicular to a line, on the extension of a line, tangent to a circle or arc). A dashed
 //! guide and a label show it; placing the point adds the matching constraint.

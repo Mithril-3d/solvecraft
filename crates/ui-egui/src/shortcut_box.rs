@@ -23,6 +23,10 @@ pub struct ShortcutBox {
     index: usize,
     /// What is typed.
     pub text: String,
+    /// Ask the field for focus on the next frame. Set when the box opens, then cleared.
+    /// Requesting focus on every frame restarts the text edit's held key, so a Wayland
+    /// repeat never sees the release and the key keeps repeating after the app loses focus (#724).
+    focus: bool,
     /// Most recent first.
     pub recent: Vec<String>,
     pub pinned: Vec<String>,
@@ -94,23 +98,63 @@ pub fn score(q: &str, s: &str) -> u32 {
     300u32.saturating_sub(gaps * 20).max(10)
 }
 
-/// Commands matching `q`, best first: (id, label, icon, where it lives on the toolbar). With an
-/// empty query, recent commands come first, then everything by name.
-pub fn search(app: &SolveApp, q: &str) -> Vec<(&'static str, &'static str, &'static str, String)> {
+/// A row of the box: the command id, its label, its icon, and where it lives on the toolbar
+/// (tab, panel; `None` off the toolbar), in the current language.
+pub type Row = (&'static str, &'static str, &'static str, Option<(&'static str, &'static str)>);
+
+/// Commands matching `q`, best first. With an empty query, recent commands come first, then
+/// everything by name.
+///
+/// The query matches the label, tab and panel in the current language and in English, and the
+/// id, so a name typed in either language, or an id, finds the command in every language.
+pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
     let q = q.trim().to_lowercase();
-    let mut v: Vec<(u32, &'static str, &'static str, &'static str, String)> = command_specs()
+    let mut v: Vec<(u32, Row)> = command_specs()
         .into_iter()
         .filter_map(|c| {
-            let place = if c.tab.is_empty() { String::new() } else { format!("{} › {}", c.tab, c.panel) };
-            let s = score(&q, c.label).max(score(&q, c.id) * 9 / 10).max(score(&q, c.tab) / 3).max(score(&q, c.panel) / 3);
+            let (label, tab, panel) = (crate::i18n::tr_label(c.label), crate::i18n::tr_label(c.tab), crate::i18n::tr_label(c.panel));
+            let place = (!c.tab.is_empty()).then_some((tab, panel));
+            let s = score(&q, label)
+                .max(score(&q, c.label))
+                .max(score(&q, c.id) * 9 / 10)
+                .max(score(&q, tab).max(score(&q, c.tab)) / 3)
+                .max(score(&q, panel).max(score(&q, c.panel)) / 3);
             let recent = app.sbox.recent.iter().position(|r| r == c.id).map_or(0, |i| 2000 - i as u32);
             // Commands that can run now come before those that can't.
             let usable = if c.info(&app.session).enabled { 150 } else { 0 };
-            (s > 0).then_some((s + usable + if q.is_empty() { recent } else { recent / 20 }, c.id, c.label, c.icon, place))
+            (s > 0).then_some((s + usable + if q.is_empty() { recent } else { recent / 20 }, (c.id, label, c.icon, place)))
         })
         .collect();
-    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
-    v.into_iter().map(|(_, id, label, icon, place)| (id, label, icon, place)).collect()
+    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.1.cmp(b.1.1)));
+    v.into_iter().map(|(_, row)| row).collect()
+}
+
+/// A row's right-hand side, ending at `at`: the shortcut, then where the command lives
+/// ("Sketch › Create"). The separator is drawn, centred on the ink of the panel's name: a
+/// font's "›", or one centred on the row, sits low beside Japanese or Chinese words.
+fn paint_key_and_place(painter: &egui::Painter, at: Pos2, key: &str, place: Option<(&str, &str)>, color: egui::Color32) {
+    let font = FontId::proportional(10.5);
+    // One piece of text ending at `x`, centred on the row: its left edge and the middle of its ink.
+    let piece = |x: f32, text: &str| -> (f32, f32) {
+        let galley = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+        let pos = pos2(x - galley.size().x, at.y - galley.size().y / 2.0);
+        let ink = galley
+            .rows
+            .first()
+            .filter(|r| r.row.visuals.mesh_bounds.is_positive())
+            .map_or(galley.size().y / 2.0, |r| r.pos.y + r.row.visuals.mesh_bounds.center().y);
+        painter.galley(pos, galley, color);
+        (pos.x, pos.y + ink)
+    };
+    let mut x = at.x;
+    if let Some((tab, panel)) = place {
+        let (left, ink) = piece(x, panel);
+        icons::glyphs::breadcrumb(painter, pos2(left - 5.0, ink), color);
+        x = piece(left - 10.0, tab).0 - 14.0;
+    }
+    if !key.is_empty() {
+        piece(x, key);
+    }
 }
 
 /// Open the box at a point (the cursor), or at the middle of the window.
@@ -119,6 +163,7 @@ pub fn open(app: &mut SolveApp, at: Option<Pos2>) {
     app.sbox.at = at;
     app.sbox.index = 0;
     app.sbox.text.clear();
+    app.sbox.focus = true;
 }
 
 fn run(app: &mut SolveApp, id: &str) {
@@ -132,10 +177,15 @@ fn run(app: &mut SolveApp, id: &str) {
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if !app.ui.palette_open {
         app.sbox.at = None;
+        app.sbox.focus = false;
         return;
     }
     let t = Tokens::get();
     let screen = ctx.content_rect();
+    // Opened without `open` (a feature edit that falls through to the box): focus once.
+    if app.sbox.at.is_none() {
+        app.sbox.focus = true;
+    }
     let at = *app.sbox.at.get_or_insert_with(|| ctx.input(|i| i.pointer.latest_pos()).unwrap_or(screen.center()));
     let list = search(app, &app.sbox.text);
     let (up, down, enter, esc) = ctx.input(|i| {
@@ -168,7 +218,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             ui.painter().rect_filled(r, 4.0, t.hover);
                         }
                         icons::paint(ui.painter(), r.shrink(5.0), c.icon, t.icon, t.icon_fill, t.accent);
-                        if resp.on_hover_text(c.label).clicked() {
+                        if resp.on_hover_text(crate::i18n::tr_label(c.label)).clicked() {
                             picked = Some(c.id);
                         }
                     }
@@ -181,7 +231,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     .desired_width(W - 20.0)
                     .id(egui::Id::new("sc_sbox_text")),
             );
-            te.request_focus();
+            if std::mem::take(&mut app.sbox.focus) {
+                te.request_focus();
+            }
             if te.changed() {
                 app.sbox.index = 0;
             }
@@ -211,10 +263,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         t.accent,
                     );
                     let col = if enabled { t.text } else { t.text_dim };
-                    ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, *label, FontId::proportional(13.0), col);
+                    ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), col);
                     let key = crate::keymap::effective(app, id).unwrap_or_default();
-                    let right = if key.is_empty() { place.clone() } else { format!("{key}   {place}") };
-                    ui.painter().text(pos2(r.right() - 26.0, r.center().y), Align2::RIGHT_CENTER, right, FontId::proportional(10.5), t.text_dim);
+                    paint_key_and_place(ui.painter(), pos2(r.right() - 26.0, r.center().y), &key, *place, t.text_dim);
                     // The pin.
                     let pinned = app.sbox.pinned.iter().any(|p| p == id);
                     let pr = Rect::from_center_size(pos2(r.right() - 11.0, r.center().y), vec2(16.0, 16.0));
@@ -233,7 +284,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         }
                         ui.painter().add(egui::Shape::closed_line(pts, Stroke::new(1.0, if pinned { t.warning } else { t.text_dim })));
                     }
-                    if presp.on_hover_text(if pinned { "Unpin" } else { "Pin to the top of the S box" }).clicked() {
+                    if presp.on_hover_text(crate::i18n::tr(if pinned { "ui.sbox_unpin" } else { "ui.sbox_pin" })).clicked() {
                         pin = Some(id);
                     } else if resp.clicked() && enabled {
                         picked = Some(id);
@@ -281,6 +332,35 @@ mod tests {
         assert_eq!(score("xyz", "Extrude"), 0);
     }
 
+    fn frame(app: &mut SolveApp, ctx: &egui::Context) {
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), ..Default::default() };
+        let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    /// The field takes focus when the box opens and is not asked again on later frames: asking on
+    /// every frame restarts the text edit's held key, which kept a Wayland key repeat running (#724).
+    #[test]
+    fn the_search_field_asks_for_focus_once_per_opening() {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("sc_sbox_text");
+        open(&mut app, None);
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert!(ctx.memory(|m| m.has_focus(field)), "the field has focus once the box opens");
+        ctx.memory_mut(|m| m.surrender_focus(field));
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert!(!ctx.memory(|m| m.has_focus(field)), "the field asked for focus again while open");
+        app.ui.palette_open = false;
+        frame(&mut app, &ctx);
+        open(&mut app, None);
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert!(ctx.memory(|m| m.has_focus(field)), "reopening the box focuses the field again");
+    }
+
     #[test]
     fn search_finds_by_name_id_and_panel_and_puts_recent_first() {
         let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
@@ -295,5 +375,27 @@ mod tests {
         let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
         other.sbox.load(&app.sbox.prefs());
         assert_eq!((other.sbox.pinned.clone(), other.sbox.recent.len()), (vec!["solid.extrude".to_string()], 2));
+    }
+
+    /// The box shows each command's label and place in the current language, and finds a name
+    /// typed in that language, in English, or an id (#2544).
+    #[test]
+    fn search_shows_and_matches_the_current_language() {
+        let app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        let _ja = crate::i18n::scope("ja");
+        let ja = crate::i18n::Locale::for_language("ja");
+        let name = ja.text("cmd.sketch_rectangle_center");
+        assert_ne!(name, "Center Rectangle");
+        let place = Some((ja.label("SKETCH"), ja.label("CREATE")));
+        for query in [name, "長方形", "center rect", "sketch.rectangle.center"] {
+            let rows = search(&app, query);
+            let row = rows.iter().find(|r| r.0 == "sketch.rectangle.center").unwrap_or_else(|| panic!("{query:?} doesn't find it"));
+            assert_eq!((row.1, row.3), (name, place), "{query:?}");
+        }
+        assert_eq!(search(&app, name).first().map(|r| r.0), Some("sketch.rectangle.center"), "the exact name comes first");
+        // English is unchanged.
+        drop(_ja);
+        let row = search(&app, "center rect").into_iter().find(|r| r.0 == "sketch.rectangle.center").unwrap();
+        assert_eq!((row.1, row.3), ("Center Rectangle", Some(("SKETCH", "CREATE"))));
     }
 }

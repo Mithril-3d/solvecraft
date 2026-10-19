@@ -25,7 +25,7 @@ fn arrow(h: &Harness) -> (Vec3, Vec3) {
 
 fn last_hole_direction(h: &Harness) -> Vec3 {
     match &h.app.session.doc.features.last().unwrap().kind {
-        FeatureKind::Hole { direction, .. } => *direction,
+        FeatureKind::Hole { direction, .. } => direction.0,
         other => panic!("the last feature is not a hole: {}", other.type_name()),
     }
 }

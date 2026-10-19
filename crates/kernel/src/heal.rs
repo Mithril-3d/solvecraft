@@ -1,5 +1,5 @@
 //! Clean-up after operations: coplanar neighbouring faces become one face, and two straight
-//! edges meeting in line at a vertex nothing else uses become one edge (as Fusion keeps them).
+//! edges meeting in line at a vertex nothing else uses become one edge (they are kept as one).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -318,12 +318,13 @@ fn merge_collinear(shell: &mt::Shell, trace: &mut Trace) -> Option<mt::Shell> {
                     es.push(e.clone());
                     continue;
                 };
-                // The run's pieces become its joined edge, in this wire's direction.
-                if done.insert(r)
-                    && let Some((line, pos)) = joined.get(r)
-                {
+                // The run's pieces become its joined edge, in this wire's direction: once each
+                // way, as a seam runs along its wire both ways.
+                if let Some((line, pos)) = joined.get(r) {
                     let forward = pos.get(&e.front().id()) < pos.get(&e.back().id());
-                    es.push(if forward { line.clone() } else { line.inverse() });
+                    if done.insert((r, forward)) {
+                        es.push(if forward { line.clone() } else { line.inverse() });
+                    }
                 }
             }
             wires.push(mt::Wire::from(es));
@@ -416,7 +417,7 @@ fn exact_edges(shell: &mt::Shell, tol: f64, trace: &mut Trace) -> Option<mt::She
 
 /// Faces whose surface is flat but not a plane (a revolved line square to the axis, a swept
 /// line) get a real plane, so they merge with their coplanar neighbours and blend like planes.
-fn planar_surfaces(shell: &mt::Shell, tol: f64) -> Option<mt::Shell> {
+pub(crate) fn planar_surfaces(shell: &mt::Shell, tol: f64) -> Option<mt::Shell> {
     use mt::{BoundedCurve, ParametricCurve, ParametricSurface, ParametricSurface3D, SearchNearestParameter};
     let mut changed = false;
     let mut faces = Vec::new();
@@ -547,9 +548,9 @@ pub(crate) fn heal_traced(solid: Solid, size: f64, keep: &[Vec<Vec3>]) -> (Solid
     healed(solid, size, keep, true, false)
 }
 
-/// [`heal_traced`] that only merges coplanar neighbouring faces, leaving every edge, curve and
-/// surface as it is: for results whose geometry is already exact (a prism boolean's), where
-/// joining edges would change more than the faces split in pieces.
+/// [`heal_traced`] that only merges coplanar neighbouring faces and joins the straight edges
+/// they leave split in line (#1049), leaving every curve and surface as it is: for results
+/// whose geometry is already exact (a prism boolean's).
 pub(crate) fn merge_faces_traced(solid: Solid, size: f64, keep: &[Vec<Vec3>]) -> (Solid, Option<HealMap>) {
     healed(solid, size, keep, true, true)
 }
@@ -632,7 +633,9 @@ fn heal_shells(solid: &Solid, size: f64, keep: &[Vec<Vec3>], traced: bool, faces
             from = groups.iter().map(|g| g.iter().filter_map(|i| from.get(*i)).flatten().copied().collect()).collect();
             changed = true;
         }
-        if !faces_only && let Some(m) = merge_collinear(&cur, &mut trace) {
+        // Straight edges the merged pieces leave split at vertices nothing else uses join
+        // into one, after any boolean (#1049): later features meet one edge, not the pieces.
+        if let Some(m) = merge_collinear(&cur, &mut trace) {
             cur = m;
             changed = true;
         }

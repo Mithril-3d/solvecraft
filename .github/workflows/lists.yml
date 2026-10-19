@@ -1,0 +1,33 @@
+# Files many pull requests add to are kept so that additions don't conflict: one file per change
+# or one sorted line per item (CONTRIBUTING.md, "Lists many changes add to"). Fast, no build.
+# Pull requests get the same checks in CI's "Format and repository checks" job (one runner slot
+# per PR instead of three); this copy keeps main honest.
+name: Lists
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  format-changes:
+    name: Design format changes merge cleanly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-format-pending.sh
+
+  sorted:
+    name: Lists are sorted one item per line
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lists
+      - run: cargo xtask lists

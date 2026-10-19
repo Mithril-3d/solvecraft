@@ -677,3 +677,24 @@ fn every_flat_face_of_one_sketch_extruded_up_and_down_takes_an_attached_sketch()
     assert_eq!(sketch_and_extrude_on_every_flat_face(&logo, &dir, "logo"), 12);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A face given next to `plane` instead of inside it was ignored and the sketch went to XY:
+/// it is refused, with where it belongs, and nothing is added. Inside `plane` it attaches.
+#[test]
+fn a_face_next_to_plane_is_refused_not_ignored() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 10}));
+    let features = s.doc.features.len();
+    for p in [
+        json!({"face": [10, 10, 10]}),
+        json!({"plane": "XY", "face": [10, 10, 10]}),
+        json!({"origin": [0, 0, 5], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}),
+    ] {
+        let e = s.execute("sketch.create", &p).unwrap_err().to_string();
+        assert!(e.contains("belongs inside `plane`"), "{p}: {e}");
+    }
+    assert_eq!(s.doc.features.len(), features);
+    assert!(s.active_sketch.is_none());
+    let r = run(&mut s, "sketch.create", json!({"plane": {"face": [10, 10, 10]}}));
+    assert_eq!(r["attachment"], "exact_face", "{r}");
+}

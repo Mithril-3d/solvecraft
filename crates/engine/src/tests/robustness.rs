@@ -232,7 +232,7 @@ fn shell_of_a_filleted_box() {
 
 /// The first tutorial part: a 60×40×15 plate with its top front edge and front right edge
 /// rounded r2, shelled with the top open. At 2 mm the rounds' inner sides collapse to sharp
-/// edges (as in Fusion); at 1.5 mm the top's round, tangent to the open top, keeps its
+/// edges (the intended behaviour); at 1.5 mm the top's round, tangent to the open top, keeps its
 /// tangency (every face moves in, the opening is swept out through the top).
 #[test]
 fn shell_of_the_tutorial_plate() {
@@ -558,6 +558,7 @@ fn blend_corners_where_edges_meet_on_a_curved_wall() {
 fn a_boundary_found_across_a_seam_is_not_used() {
     let r = fuzz::run(20, 8);
     assert_eq!(r.outcome.kind, "ok", "seed 20: {:?}\n{}", r.outcome, r.script());
+    assert!(r.steps.iter().any(|s| s.kind == "circular pattern"), "the pattern must build, not be skipped as unsupported: {:?}", r.unsupported);
 }
 
 /// Seed 33 ends in a fillet on its second body (#854's corner blends build it differently from

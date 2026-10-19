@@ -188,7 +188,7 @@ fn round_vertex(cur: &Body, at: Vec3, r: f64) -> Result<Body> {
     let notched = crate::ops::boolean(cur, &cutter, BoolOp::Cut)?.ok_or_else(|| unsupported("a corner this small"))?;
     // The cut splits a curved face along the trace of its plane (the whole way across, not just
     // where the plane cuts): the pieces are one face again.
-    let notched = merge_split_faces(&notched, size)?;
+    let notched = crate::guard("merge split faces", || merge_split_faces(&notched, cur, size))?;
     // A point on what is left of each edge, half way from where its plane crosses it to its far end.
     let mut picks: Vec<Vec3> = Vec::with_capacity(3);
     for (e, m) in edges.iter().zip(&normals) {
@@ -320,7 +320,7 @@ fn close_with_sphere(step: &Body, ball: &Ball, planes: [Vec3; 3], r: f64, v: Vec
 
 /// `body` with the curved faces that are pieces of one input face (as the cut that made `body`
 /// recorded them) joined again: the edges two pieces share go, the rest make the one boundary.
-fn merge_split_faces(body: &Body, size: f64) -> Result<Body> {
+fn merge_split_faces(body: &Body, source: &Body, size: f64) -> Result<Body> {
     let tol = (size * 1e-6).max(1e-9);
     let Some(history) = body.history() else { return Ok(body.clone()) };
     let solid = body.deep_copy();
@@ -328,7 +328,7 @@ fn merge_split_faces(body: &Body, size: f64) -> Result<Body> {
     if history.faces.len() != faces.len() {
         return Ok(body.clone());
     }
-    let on = |a: &mt::Face, p: Vec3| project(a, p, None).is_some_and(|(q, _, _)| q.dist(p) <= tol * 10.0);
+    let on = |a: &mt::Face, p: Vec3| project(a, p, None).is_some_and(|(q, _, uv)| crate::curveblend::in_range(a, uv) && q.dist(p) <= tol * 10.0);
     // Pieces by the input face they come from.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (i, f) in history.faces.iter().enumerate() {
@@ -349,10 +349,8 @@ fn merge_split_faces(body: &Body, size: f64) -> Result<Body> {
             continue;
         }
         // Edges used once, as the pieces walk them.
-        let all: Vec<mt::Edge> = pieces
-            .iter()
-            .flat_map(|f| f.absolute_boundaries().iter().flat_map(|w| w.edge_iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>())
-            .collect();
+        let all: Vec<mt::Edge> =
+            pieces.iter().flat_map(|f| f.boundaries().iter().flat_map(|w| w.edge_iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>()).collect();
         let mut uses: HashMap<mt::EdgeID, usize> = HashMap::new();
         for e in &all {
             *uses.entry(e.id()).or_default() += 1;
@@ -371,12 +369,18 @@ fn merge_split_faces(body: &Body, size: f64) -> Result<Body> {
         if !left.is_empty() || wire.first().map(|e| e.front().clone()) != wire.last().map(|e| e.back().clone()) {
             continue;
         }
-        // On the surface of the piece whose patch reaches every corner of all.
+        // A boolean may restrict a piece's surface to its own parameter box. The
+        // joined boundary needs the original face's full patch, not an extrapolation
+        // of one piece (which the bounded display planner correctly refuses).
         let all_on = |f: &mt::Face| {
             pieces.iter().all(|p| p.vertex_iter().all(|v| on(f, vtx(&v))) && p.edge_iter().all(|e| edge_mid(&e).is_none_or(|m| on(f, m))))
         };
-        let Some(like) = pieces.iter().copied().find(|f| all_on(f)) else { continue };
-        let Some(joined) = crate::heal::absolute_face(like, vec![mt::Wire::from(wire)]) else { continue };
+        let original = group.first().and_then(|i| history.faces.get(*i)).and_then(|h| match h.origins.as_slice() {
+            [crate::history::FaceOrigin::Face { operand: 0, face }] => source.solid.face_iter().nth(*face),
+            _ => None,
+        });
+        let Some(like) = original.filter(|f| all_on(f)).or_else(|| pieces.iter().copied().find(|f| all_on(f))) else { continue };
+        let Ok(joined) = mt::Face::try_new(vec![mt::Wire::from(wire)], like.oriented_surface()) else { continue };
         let Some(first) = group.first() else { continue };
         for i in group {
             if let Some(slot) = out.get_mut(*i) {

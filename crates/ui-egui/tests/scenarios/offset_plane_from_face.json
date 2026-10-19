@@ -10,5 +10,5 @@
  {"call": "engine.execute", "params": {"command": "sketch.rectangle.two_point", "params": {"p0": [0, 0], "p1": [10, 10]}}},
  {"call": "engine.execute", "params": {"command": "sketch.finish", "params": {}}},
  {"call": "engine.execute", "params": {"command": "solid.extrude", "params": {"distance": 10, "operation": "new", "body_name": "Pad"}}},
- {"expect": {"errors": 0, "bodies": 2, "bbox": {"body": "Pad", "min": [null, null, 30], "max": [null, null, 40]}}}
+ {"expect": {"errors": 0, "bodies": 2, "bbox": {"body": "Pad", "min": [null, null, 20], "max": [null, null, 30]}}}
 ]

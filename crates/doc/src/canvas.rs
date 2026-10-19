@@ -1,4 +1,4 @@
-//! Canvases: reference images placed on a plane (Fusion's Insert Canvas), kept in the design.
+//! Canvases: reference images placed on a plane (Insert Canvas), kept in the design.
 //! The image bytes travel inside the design file (base64), so it reopens without the original.
 
 use serde::{Deserialize, Serialize};

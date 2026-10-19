@@ -208,15 +208,23 @@ fn expected_revolution(b: &Body, r: &Region2) -> Vec<Vec<FaceOrigin>> {
 #[test]
 fn revolve_partial_and_full() {
     let r = Region2 { outer: rect(10.0, 0.0, 20.0, 5.0), holes: vec![rect(12.0, 1.0, 14.0, 2.0).reversed()] };
-    // Under half a turn truck sweeps in two parts, beyond it in three; a full turn has no caps.
-    for (angle, parts, caps) in [(FRAC_PI_2, 2, 2), (1.5 * PI, 3, 2), (TAU, 3, 0)] {
-        let b = crate::revolve(&SIDE, std::slice::from_ref(&r), Vec2::ZERO, Vec2::Y, angle).unwrap().pop().unwrap();
-        let got = origins(&b);
-        assert_eq!(got, expected_revolution(&b, &r), "angle {angle}");
-        for k in 0..8 {
-            assert_eq!(got.iter().filter(|o| **o == [P(k)]).count(), parts, "segment {k} at angle {angle}");
+    // Under half a turn truck sweeps in two parts, beyond it in three; a full turn has no caps,
+    // and its planar faces (from the segments square to the axis) are whole (#726), as a partial
+    // turn's are when it is final (`revolve_whole`).
+    let segs: Vec<Seg2> = r.outer.segs.iter().chain(r.holes.iter().flat_map(|h| &h.segs)).cloned().collect();
+    for whole in [false, true] {
+        for (angle, parts, caps) in [(FRAC_PI_2, 2, 2), (1.5 * PI, 3, 2), (TAU, 3, 0)] {
+            let revolve = if whole { crate::revolve_whole } else { crate::revolve };
+            let b = revolve(&SIDE, std::slice::from_ref(&r), Vec2::ZERO, Vec2::Y, angle).unwrap().pop().unwrap();
+            let got = origins(&b);
+            assert_eq!(got, expected_revolution(&b, &r), "angle {angle}, whole {whole}");
+            for (k, s) in segs.iter().enumerate() {
+                let square = matches!(s, Seg2::Line { a, b } if (a.y - b.y).abs() < 1e-12);
+                let want = if (angle == TAU || whole) && square { 1 } else { parts };
+                assert_eq!(got.iter().filter(|o| **o == [P(k)]).count(), want, "segment {k} at angle {angle}, whole {whole}");
+            }
+            assert_eq!(got.iter().filter(|o| **o == [START] || **o == [END]).count(), caps);
         }
-        assert_eq!(got.iter().filter(|o| **o == [START] || **o == [END]).count(), caps);
     }
 }
 

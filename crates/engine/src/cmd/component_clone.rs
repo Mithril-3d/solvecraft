@@ -1,4 +1,5 @@
 //! Independent copies of a component definition graph, assembled and evaluated atomically.
+use solidcraft_doc::BodyName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::params::bad;
@@ -92,6 +93,24 @@ fn unique(base: &str, used: &mut BTreeSet<String>) -> String {
     }
     used.insert(name.clone());
     name
+}
+
+/// Whether `built`, the bodies a feature made, are the ones its `stored` names give, one for one. A
+/// name is built as stored, or as `stored (n)` when a body of that name exists already: the solids
+/// of a STEP file that share a label are stored as `X`, `X`, `X` and built as `X`, `X (2)`, `X (3)`,
+/// and a second import of a file builds `Aa (2)` for the stored `Aa`.
+fn named_by(stored: &[String], built: &[String]) -> bool {
+    !stored.is_empty()
+        && stored.len() == built.len()
+        && stored.iter().zip(built).all(|(stored, built)| {
+            let base = stored.trim();
+            !base.is_empty()
+                && (built == base
+                    || built
+                        .strip_prefix(base)
+                        .and_then(|rest| rest.strip_prefix(" (")?.strip_suffix(')'))
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        })
 }
 
 fn graph(doc: &Document, root: u64) -> Result<Vec<u64>> {
@@ -271,17 +290,26 @@ pub(super) fn paste(
     }
     // Collect historical outputs too: a later Combine may have consumed a named tool body.
     let mut outputs: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    // The names the bodies of a feature have in the model, where they are its stored names, numbered.
+    let mut shown: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     for f in &feats {
         if let Some(result) = s.model.result(f.id) {
             let created: Vec<_> = result.state.bodies.iter().filter(|b| b.feature == f.id).map(|b| b.name.clone()).collect();
             for name in &created {
                 bodies.entry(name.clone()).or_insert_with(|| unique(name, &mut used));
             }
+            if named_by(&f.body_names, &created) {
+                shown.insert(f.id, created.clone());
+            }
             outputs.insert(f.id, created);
         }
-        for name in &f.body_names {
-            if !name.is_empty() {
-                bodies.entry(name.clone()).or_insert_with(|| unique(name, &mut used));
+        // Later features name a body as the model shows it. Where that differs from the stored name,
+        // the stored name is only a label (the first body of another import may be called so).
+        if !shown.contains_key(&f.id) {
+            for name in &f.body_names {
+                if !name.is_empty() {
+                    bodies.entry(name.clone()).or_insert_with(|| unique(name, &mut used));
+                }
             }
         }
         if bodies.len() > MAX_WORK {
@@ -300,7 +328,7 @@ pub(super) fn paste(
         let entry = feats.iter().find(|f| {
             !f.suppressed
                 && matches!(&f.kind, FeatureKind::BodyTransfer { bodies, from, to, .. }
-            if !selected.contains(from) && bodies.contains(&body.name)
+            if !selected.contains(from) && bodies.iter().any(|b| *b == body.name)
                 && s.model.result(f.id).is_some_and(|result| !result.skipped && result.error.is_none()
                     && result.state.body(&body.name).is_some_and(|entered| source.model_body_component(entered) == *to)))
         });
@@ -319,7 +347,7 @@ pub(super) fn paste(
         bodies.insert(body.name.clone(), new_name.clone());
         let feature_name = unique(&format!("{} Base", body.name), &mut used);
         let id = scratch.doc_mut().add_feature(
-            FeatureKind::Import { file: format!("{} independent base", body.name), step: step.into(), components: Vec::new() },
+            FeatureKind::Import { file: format!("{} independent base", body.name), step: step.into(), components: Vec::new(), skip: Vec::new() },
             Some(&feature_name),
         )?;
         if let Some(f) = scratch.doc_mut().feature_mut(id) {
@@ -379,7 +407,11 @@ pub(super) fn paste(
         f.id = *features.get(&old.id).ok_or_else(|| bad(CMD, "missing feature mapping"))?;
         f.name = names.get(&old.name).cloned().ok_or_else(|| bad(CMD, "missing feature name"))?;
         f.component = *components.get(&old.component).ok_or_else(|| bad(CMD, "missing component mapping"))?;
-        if f.body_names.is_empty() {
+        if let Some(names) = shown.get(&old.id) {
+            // Stored as `X`, `X`, `X` and built as `X`, `X (2)`, `X (3)`: the copy is stored under the
+            // names of the bodies, so that it builds the names the copied features after it use.
+            f.body_names = names.clone();
+        } else if f.body_names.is_empty() {
             f.body_names = outputs.get(&old.id).cloned().unwrap_or_default();
         }
         f.remap_clone(&features, &names, &bodies, &parameters)?;
@@ -395,7 +427,7 @@ pub(super) fn paste(
         if let FeatureKind::Emboss { face: Some(face), .. } = &mut f.kind
             && !face.path.is_empty()
             && let FeatureKind::Emboss { face: Some(old_face), .. } = &old.kind
-            && bodies.contains_key(&old_face.body)
+            && bodies.contains_key(old_face.body.as_ref())
         {
             face.path = cloned_path(&source, &old_face.path, component, &clone_path, &occurrences)?;
         }
@@ -452,7 +484,7 @@ pub(super) fn paste(
         .collect();
     if !moved_out.is_empty() {
         let name = unique("Assigned-out bodies", &mut used);
-        let id = scratch.doc_mut().add_feature(FeatureKind::Remove { bodies: moved_out }, Some(&name))?;
+        let id = scratch.doc_mut().add_feature(FeatureKind::Remove { bodies: moved_out.into_iter().map(BodyName).collect() }, Some(&name))?;
         if let Some(f) = scratch.doc_mut().feature_mut(id) {
             f.component = root;
         }
@@ -495,7 +527,7 @@ pub(super) fn paste(
     for feature in &feats {
         if let FeatureKind::Emboss { face: Some(face), .. } = &feature.kind
             && !face.path.is_empty()
-            && !bodies.contains_key(&face.body)
+            && !bodies.contains_key(face.body.as_ref())
         {
             notices.push(format!("{} retains external selected occurrence path {:?}", feature.name, face.path));
         }
@@ -557,7 +589,7 @@ pub(super) fn paste(
         }
         if let FeatureKind::Pattern { features: references, .. } | FeatureKind::Mirror { features: references, .. } = &feature.kind {
             for name in references {
-                if !names.contains_key(name) {
+                if !names.contains_key(name.as_ref()) {
                     notices.push(format!("{} retains external feature reference {name}", feature.name));
                 }
             }

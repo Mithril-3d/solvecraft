@@ -1,0 +1,280 @@
+//! Measure on holes, circles, arcs and slots (#1392): centre-to-centre and axis-to-edge
+//! distances with the closest and farthest listed too, diameters and radii, slot sizes. Every
+//! expected value is worked out by hand from the part's dimensions.
+
+use std::f64::consts::{PI, TAU};
+
+use serde_json::{Value, json};
+use solidcraft_geom::Vec3;
+
+use crate::Session;
+
+fn run(s: &mut Session, id: &str, p: Value) -> Value {
+    match s.execute(id, &p) {
+        Ok(v) => v,
+        Err(e) => panic!("{id} {p}: {e}"),
+    }
+}
+
+fn close(v: &Value, want: f64, tol: f64) -> bool {
+    v.as_f64().is_some_and(|x| (x - want).abs() <= tol)
+}
+
+/// A 60 × 40 × 10 plate with a Ø6 hole at (15, 20) and a Ø8 hole at (45, 20).
+fn plate(s: &mut Session) {
+    run(s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(s, "solid.cylinder", json!({"radius": 3, "height": 12, "base": [15, 20, -1], "operation": "cut"}));
+    run(s, "solid.cylinder", json!({"radius": 4, "height": 12, "base": [45, 20, -1], "operation": "cut"}));
+}
+
+fn body(s: &Session) -> String {
+    s.model.state().bodies.first().unwrap().name.clone()
+}
+
+/// The cylindrical face of radius `r`, as a pick.
+fn hole(s: &Session, r: f64) -> Value {
+    let st = s.model.state();
+    let b = st.bodies.first().unwrap();
+    let m = b.mesh();
+    let n = m.tri_face.iter().map(|f| *f as usize + 1).max().unwrap();
+    let f = (0..n)
+        .find(|&f| matches!(solidcraft_kernel::face_surface(&b.body, f), Some(solidcraft_kernel::FaceSurface::Cylinder { radius, .. }) if (radius - r).abs() < 1e-6))
+        .unwrap_or_else(|| panic!("no hole of radius {r}"));
+    let p = m.triangles.iter().zip(&m.tri_face).find(|(_, tf)| **tf as usize == f).and_then(|(t, _)| m.tri(t)).unwrap()[0];
+    json!({"type": "face", "body": b.name, "index": f, "point": p})
+}
+
+/// The planar face all of whose points satisfy `on`, as a pick.
+fn flat(s: &Session, on: impl Fn(Vec3) -> bool) -> Value {
+    let st = s.model.state();
+    let b = st.bodies.first().unwrap();
+    let m = b.mesh();
+    let n = m.tri_face.iter().map(|f| *f as usize + 1).max().unwrap();
+    let f = (0..n)
+        .find(|&f| {
+            let tris: Vec<_> = m.triangles.iter().zip(&m.tri_face).filter(|(_, tf)| **tf as usize == f).filter_map(|(t, _)| m.tri(t)).collect();
+            !tris.is_empty() && tris.iter().all(|t| t.iter().all(|p| on(*p)))
+        })
+        .unwrap();
+    let p = m.triangles.iter().zip(&m.tri_face).find(|(_, tf)| **tf as usize == f).and_then(|(t, _)| m.tri(t)).unwrap()[0];
+    json!({"type": "face", "body": b.name, "index": f, "point": p})
+}
+
+/// The mesh edge all of whose points satisfy `on`, as a pick.
+fn edge(s: &Session, on: impl Fn(Vec3) -> bool) -> Value {
+    let st = s.model.state();
+    let b = st.bodies.first().unwrap();
+    let m = b.mesh();
+    let i = m.edges.iter().position(|e| e.iter().all(|p| on(*p))).expect("edge");
+    let e = &m.edges[i];
+    json!({"type": "edge", "body": b.name, "index": i, "point": e[e.len() / 2]})
+}
+
+fn measure(s: &mut Session, items: Vec<Value>) -> Value {
+    run(s, "inspect.measure", json!({ "items": items }))
+}
+
+#[test]
+fn two_holes_measure_centre_to_centre_with_min_and_max() {
+    let mut s = Session::default();
+    plate(&mut s);
+    let (a, b) = (hole(&s, 3.0), hole(&s, 4.0));
+    let r = measure(&mut s, vec![a.clone(), b.clone()]);
+    assert!(close(&r["center_distance"], 30.0, 1e-9), "{r}");
+    assert!(close(&r["min"], 30.0 - 3.0 - 4.0, 1e-9), "{r}");
+    assert!(close(&r["max"], (37.0f64).hypot(10.0), 1e-9), "{r}");
+    assert_eq!(r["measure"], "center");
+    // Backward compatible: the closest distance is still `distance_mm`, with its points.
+    assert!(close(&r["distance_mm"], 23.0, 1e-9) && r["from"].is_array() && r["to"].is_array(), "{r}");
+    // The centre line runs between the two axes, square to them.
+    let (f, t) = (&r["center_from"], &r["center_to"]);
+    assert!(close(&f[0], 15.0, 1e-9) && close(&f[1], 20.0, 1e-9) && close(&t[0], 45.0, 1e-9) && close(&t[1], 20.0, 1e-9), "{r}");
+    assert!(close(&f[2], t[2].as_f64().unwrap(), 1e-9), "{r}");
+    // Each hole: Ø, R and circumference.
+    assert!(close(&r["items"][0]["diameter"], 6.0, 1e-9) && close(&r["items"][0]["radius"], 3.0, 1e-9), "{r}");
+    assert!(close(&r["items"][1]["circumference"], 8.0 * PI, 1e-9), "{r}");
+    // The two rims on the top face: the same centres, the rims' gap and span.
+    let rim = |c: f64, rr: f64| move |p: Vec3| (p.z - 10.0).abs() < 1e-6 && ((p - Vec3::new(c, 20.0, 10.0)).len() - rr).abs() < 1e-6;
+    let (ea, eb) = (edge(&s, rim(15.0, 3.0)), edge(&s, rim(45.0, 4.0)));
+    let r = measure(&mut s, vec![ea.clone(), eb]);
+    assert!(close(&r["center_distance"], 30.0, 1e-9) && close(&r["min"], 23.0, 1e-9) && close(&r["max"], 37.0, 1e-9), "{r}");
+    // One rim: Ø, R and circumference first-class.
+    let r = measure(&mut s, vec![ea]);
+    assert!(close(&r["diameter"], 6.0, 1e-9) && close(&r["radius"], 3.0, 1e-9) && close(&r["circumference"], TAU * 3.0, 1e-9), "{r}");
+    assert_eq!(r["items"][0]["round"], "circle", "{r}");
+}
+
+#[test]
+fn elevated_cylinder_rims_measure_between_the_picked_circles_centres() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius":4,"height":10,"body_name":"A"}));
+    run(&mut s, "solid.cylinder", json!({"base":[34,19,22],"radius":4,"height":10,"body_name":"B","operation":"new_body"}));
+    let items: Vec<_> = s
+        .model
+        .state()
+        .bodies
+        .iter()
+        .map(|b| {
+            let z = if b.name == "A" { 10.0 } else { 32.0 };
+            let m = b.mesh();
+            let index = m.edges.iter().position(|e| e.len() > 2 && e.iter().all(|p| (p.z - z).abs() < 1e-9)).unwrap();
+            let e = &m.edges[index];
+            json!({"type":"edge","body":b.name,"index":index,"point":e[e.len()/2]})
+        })
+        .collect();
+    assert_eq!(items.len(), 2);
+    for picks in [items.clone(), items.into_iter().rev().collect()] {
+        let r = measure(&mut s, picks);
+        assert!(close(&r["center_distance"], 2001_f64.sqrt(), 1e-9), "{r}");
+        for (endpoint, item) in [("center_from", 0), ("center_to", 1)] {
+            for axis in 0..3 {
+                assert!(close(&r[endpoint][axis], r["items"][item]["center"][axis].as_f64().unwrap(), 1e-9), "{r}");
+            }
+        }
+        assert!((r["center_delta"][2].as_f64().unwrap().abs() - 22.0).abs() < 1e-9, "{r}");
+        assert!(close(&r["min"], (1517_f64.sqrt() - 8.0).hypot(22.0), 1e-9), "{r}");
+        assert!(close(&r["max"], (1517_f64.sqrt() + 8.0).hypot(22.0), 1e-9), "{r}");
+    }
+}
+
+#[test]
+fn an_elevated_circle_to_a_straight_edge_keeps_its_height_difference() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":68,"width":50,"height":6,"body_name":"Plate"}));
+    run(&mut s, "solid.cylinder", json!({"base":[34,25,6],"radius":12,"height":14,"body_name":"Boss","operation":"new_body"}));
+    let straight = edge(&s, |p| p.y.abs() < 1e-9 && (p.z - 6.0).abs() < 1e-9);
+    let round = {
+        let st = s.model.state();
+        let b = st.bodies.iter().find(|b| b.name == "Boss").unwrap();
+        let m = b.mesh();
+        let index = m.edges.iter().position(|e| e.len() > 2 && e.iter().all(|p| (p.z - 20.0).abs() < 1e-9)).unwrap();
+        let e = &m.edges[index];
+        json!({"type":"edge","body":b.name,"index":index,"point":e[e.len()/2]})
+    };
+    for items in [vec![straight.clone(), round.clone()], vec![round, straight]] {
+        let r = measure(&mut s, items);
+        assert!(close(&r["center_distance"], 25_f64.hypot(14.0), 1e-9), "{r}");
+        let (line, circle) = if r["items"][0]["round"] == "circle" { ("center_to", "center_from") } else { ("center_from", "center_to") };
+        for (key, expected) in [(line, [34.0, 0.0, 6.0]), (circle, [34.0, 25.0, 20.0])] {
+            for (axis, value) in expected.into_iter().enumerate() {
+                assert!(close(&r[key][axis], value, 1e-9), "{r}");
+            }
+        }
+        assert!((r["center_delta"][2].as_f64().unwrap().abs() - 14.0).abs() < 1e-9, "{r}");
+        assert!(close(&r["min"], 13_f64.hypot(14.0), 1e-9), "{r}");
+        assert!(close(&r["max"], (34_f64.hypot(25.0) + 12.0).hypot(14.0), 0.05), "{r}");
+    }
+}
+
+#[test]
+fn a_hole_to_the_plate_edge_and_side_measures_from_its_axis() {
+    let mut s = Session::default();
+    plate(&mut s);
+    let a = hole(&s, 3.0);
+    // The top front edge (y = 0, z = 10).
+    let e = edge(&s, |p| p.y.abs() < 1e-9 && (p.z - 10.0).abs() < 1e-9);
+    let r = measure(&mut s, vec![a.clone(), e]);
+    assert!(close(&r["center_distance"], 20.0, 1e-9), "{r}");
+    assert!(close(&r["min"], 17.0, 1e-9), "{r}");
+    assert!(r["max"].as_f64().unwrap() > 20.0, "{r}");
+    // The front face (y = 0): axis to plane, the rim's nearest and farthest.
+    let f = flat(&s, |p| p.y.abs() < 1e-9);
+    let r = measure(&mut s, vec![f, a.clone()]);
+    assert!(close(&r["center_distance"], 20.0, 1e-9) && close(&r["min"], 17.0, 1e-9), "{r}");
+    // The face reaches past the hole: its far corners are farther than the rim's far side.
+    assert!(r["max"].as_f64().unwrap() > 23.0, "{r}");
+    // Picked plane first: the centre line still starts at the plane.
+    assert!(close(&r["center_from"][1], 0.0, 1e-9) && close(&r["center_to"][1], 20.0, 1e-9), "{r}");
+    // Two planes keep today's measure: no centre.
+    let top = flat(&s, |p| (p.z - 10.0).abs() < 1e-9);
+    let bottom = flat(&s, |p| p.z.abs() < 1e-9);
+    let r = measure(&mut s, vec![top, bottom]);
+    assert!(r.get("center_distance").is_none() && close(&r["distance_mm"], 10.0, 1e-9) && r["measure"] == "min", "{r}");
+}
+
+#[test]
+fn sketch_circle_arc_and_slot() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    let c = run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 5}))["curves"][0].as_str().unwrap().to_string();
+    let a =
+        run(&mut s, "sketch.arc.center_point", json!({"center": [30, 0], "start": [34, 0], "sweep": 90}))["curves"][0].as_str().unwrap().to_string();
+    let r = measure(&mut s, vec![json!({"type": "sketch_curve", "id": c})]);
+    assert!(close(&r["diameter"], 10.0, 1e-9) && close(&r["radius"], 5.0, 1e-9) && close(&r["circumference"], 10.0 * PI, 1e-9), "{r}");
+    let r = measure(&mut s, vec![json!({"type": "sketch_curve", "id": a})]);
+    assert!(close(&r["radius"], 4.0, 1e-9) && close(&r["diameter"], 8.0, 1e-9), "{r}");
+    assert!(close(&r["angle_deg"], 90.0, 1e-9) && close(&r["arc_length"], 2.0 * PI, 1e-9), "{r}");
+    assert_eq!(r["items"][0]["round"], "arc");
+    // Circle to arc: centre to centre.
+    let r = measure(&mut s, vec![json!({"type": "sketch_curve", "id": c}), json!({"type": "sketch_curve", "id": a})]);
+    assert!(close(&r["center_distance"], 30.0, 1e-9), "{r}");
+    run(&mut s, "sketch.slot.center_to_center", json!({"p0": [0, 40], "p1": [20, 40], "width": 6}));
+    let sid = s.active_sketch.unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    let st = s.model.state();
+    let ss = st.sketch(sid).unwrap();
+    let slot =
+        ss.profiles.iter().position(|p| p.region.outer.segs.len() >= 4 && (p.area - (20.0 * 6.0 + PI * 9.0)).abs() < 1e-6).expect("slot profile");
+    let circle = ss.profiles.iter().position(|p| (p.area - PI * 25.0).abs() < 1e-6).expect("circle profile");
+    let r = measure(&mut s, vec![json!({"type": "profile", "sketch": sid, "index": slot})]);
+    let sl = &r["slot"];
+    assert!(close(&sl["width"], 6.0, 1e-9) && close(&sl["center_distance"], 20.0, 1e-9) && close(&sl["overall_length"], 26.0, 1e-9), "{r}");
+    let r = measure(&mut s, vec![json!({"type": "profile", "sketch": sid, "index": circle})]);
+    assert!(close(&r["diameter"], 10.0, 1e-9), "{r}");
+}
+
+#[test]
+fn a_slot_cut_in_a_plate_reports_its_sizes_from_an_end() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.slot.center_to_center", json!({"p0": [20, 20], "p1": [40, 20], "width": 8}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "operation": "cut", "profiles": "all"}));
+    let st = s.model.state();
+    let b = st.bodies.first().unwrap();
+    let m = b.mesh();
+    let n = m.tri_face.iter().map(|f| *f as usize + 1).max().unwrap();
+    let end = (0..n)
+        .find(|&f| matches!(solidcraft_kernel::face_surface(&b.body, f), Some(solidcraft_kernel::FaceSurface::Cylinder { radius, .. }) if (radius - 4.0).abs() < 1e-6))
+        .expect("slot end");
+    let p = m.triangles.iter().zip(&m.tri_face).find(|(_, tf)| **tf as usize == end).and_then(|(t, _)| m.tri(t)).unwrap()[0];
+    let name = body(&s);
+    let r = measure(&mut s, vec![json!({"type": "face", "body": name, "index": end, "point": p})]);
+    let sl = &r["slot"];
+    assert!(close(&sl["width"], 8.0, 1e-9) && close(&sl["center_distance"], 20.0, 1e-9) && close(&sl["overall_length"], 28.0, 1e-9), "{r}");
+    // The end is a half cylinder: R 4, half a turn.
+    assert!(close(&r["radius"], 4.0, 1e-9) && close(&r["angle_deg"], 180.0, 1.0), "{r}");
+}
+
+#[test]
+fn a_fillet_edge_is_an_arc() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    run(&mut s, "solid.fillet", json!({"edges": [[40, 30, 10]], "radius": 5}));
+    // The fillet's quarter circle on the top face: centre (35, 25, 20).
+    let e = edge(&s, |p| (p.z - 20.0).abs() < 1e-9 && ((p - Vec3::new(35.0, 25.0, 20.0)).len() - 5.0).abs() < 1e-6);
+    let r = measure(&mut s, vec![e]);
+    assert!(close(&r["radius"], 5.0, 1e-9) && close(&r["diameter"], 10.0, 1e-9), "{r}");
+    assert!(close(&r["angle_deg"], 90.0, 1e-6) && close(&r["arc_length"], 2.5 * PI, 1e-6), "{r}");
+    assert!(close(&r["center"][0], 35.0, 1e-9) && close(&r["center"][1], 25.0, 1e-9), "{r}");
+}
+
+/// A plate with holes through STEP: the holes come back as cylinders, and measure the same.
+#[test]
+fn step_round_trip_of_a_plate_with_holes() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-measure-1392-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Plate.step");
+    let mut s = Session::default();
+    plate(&mut s);
+    run(&mut s, "file.export", json!({"path": path.to_string_lossy()}));
+    let mut t = Session::default();
+    run(&mut t, "doc.open", json!({"path": path.to_string_lossy()}));
+    let (a, b) = (hole(&t, 3.0), hole(&t, 4.0));
+    let r = measure(&mut t, vec![a, b]);
+    assert!(close(&r["center_distance"], 30.0, 1e-6), "{r}");
+    assert!(close(&r["min"], 23.0, 1e-6), "{r}");
+    assert!(close(&r["items"][0]["diameter"], 6.0, 1e-6) && close(&r["items"][1]["diameter"], 8.0, 1e-6), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

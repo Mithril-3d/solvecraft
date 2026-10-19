@@ -3,14 +3,22 @@
 //! cylinder recut from silently removing an additional material boundary that
 //! the fallback's coarse material samples do not see.
 use crate::body::{Body, from_p3};
-use solidcraft_geom::{Plane, Seg2, Vec3};
+use solidcraft_geom::{Plane, Seg2, UnitVec3, Vec3};
 use std::collections::HashSet;
 use truck_modeling as mt;
 
-pub(super) fn boundaries_clear(body: &Body, bore_faces: &[usize], origin: Vec3, axis: Vec3, radius: f64, lo: f64, hi: f64, tol: f64) -> Option<()> {
+pub(super) fn boundaries_clear(
+    body: &Body,
+    bore_faces: &[usize],
+    origin: Vec3,
+    axis: UnitVec3,
+    radius: f64,
+    lo: f64,
+    hi: f64,
+    tol: f64,
+) -> Option<()> {
     let plane = Plane::from_normal(origin, axis)?;
     if !origin.is_finite()
-        || !axis.is_finite()
         || ![radius, lo, hi, tol].iter().all(|v| v.is_finite())
         || radius <= tol
         || hi <= lo

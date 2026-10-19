@@ -1,5 +1,6 @@
 //! Atomic timeline ownership changes, preserving the selected world geometry.
 use super::*;
+use solidcraft_doc::BodyName;
 use std::collections::{BTreeMap, BTreeSet};
 
 type UniqueFrames = BTreeMap<u64, Option<(Vec<u64>, Mat)>>;
@@ -83,7 +84,7 @@ fn transfer(s: &mut Session, name: &str, to: u64, frames: &UniqueFrames, cmd: &s
     if let Some(look) = inherited {
         s.doc_mut().appearances.bodies.insert(name.to_string(), look);
     }
-    let id = s.doc_mut().add_feature(FeatureKind::BodyTransfer { bodies: vec![name.to_string()], from, to, transform }, None)?;
+    let id = s.doc_mut().add_feature(FeatureKind::BodyTransfer { bodies: vec![BodyName::from(name)], from, to, transform }, None)?;
     if let Some(feature) = s.doc_mut().feature_mut(id) {
         feature.component = to;
     }

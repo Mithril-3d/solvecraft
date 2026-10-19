@@ -116,6 +116,47 @@ impl Default for RenderLimits {
     }
 }
 
+impl RenderLimits {
+    /// The largest size with the aspect of `width` × `height`, never larger than it, within
+    /// these limits (and the scratch budget, when a layout is given). Both axes scale by the
+    /// same factor. `None` for a zero size or limits that admit no pixel at all.
+    pub fn fit(self, width: u64, height: u64, scratch: Option<ScratchLayout>) -> Option<(u64, u64)> {
+        let fits = |w: u64, h: u64| {
+            w <= self.max_dimension
+                && h <= self.max_dimension
+                && w.checked_mul(h).is_some_and(|p| p <= self.max_pixels)
+                && scratch.is_none_or(|s| s.estimate(w, h).is_ok_and(|b| b <= self.max_scratch_bytes))
+        };
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if fits(width, height) {
+            return Some((width, height));
+        }
+        let (w, h) = (width as f64, height as f64);
+        let mut budget = self.max_pixels as f64;
+        if let Some(s) = scratch {
+            let per_pixel = (s.sample_scale as f64).powi(2) * s.sample_bytes_per_pixel as f64
+                + s.output_bytes_per_pixel as f64
+                + s.encoding_bytes_per_pixel as f64;
+            if per_pixel > 0.0 {
+                budget = budget.min(self.max_scratch_bytes as f64 / per_pixel);
+            }
+        }
+        let side = self.max_dimension as f64;
+        let mut scale = (side / w).min(side / h).min((budget / (w * h)).sqrt()).min(1.0);
+        // Float rounding can land one pixel over a bound: step down until it fits.
+        for _ in 0..64 {
+            let size = (((w * scale).floor() as u64).max(1), ((h * scale).floor() as u64).max(1));
+            if fits(size.0, size.1) {
+                return Some(size);
+            }
+            scale *= 0.999;
+        }
+        None
+    }
+}
+
 /// Estimated pixel-buffer cost, excluding scene/texture/geometry and codec-internal memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +201,13 @@ pub struct ExecutorDescriptor {
     pub profiles: Vec<RenderProfile>,
     pub limits: RenderLimits,
     pub scratch: ScratchLayout,
+}
+
+impl ExecutorDescriptor {
+    /// The largest request size at this aspect this executor admits ([`RenderLimits::fit`]).
+    pub fn fit(&self, width: u64, height: u64) -> Option<(u64, u64)> {
+        self.limits.fit(width, height, Some(self.scratch))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

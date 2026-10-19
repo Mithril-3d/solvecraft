@@ -561,6 +561,14 @@ fn shell_opened(b: &Body, healed: &Body, open: &[Vec3], opened: &[usize], thickn
         Ok(c) => c,
         Err(e) => return shell_by_opening(healed, opened, thickness, margin).map_err(|_| e),
     };
+    let cavity = match opening_overreach(healed, &cavity, opened, thickness, margin) {
+        Ok(Some(trimmed)) => trimmed,
+        Ok(None) => cavity,
+        Err(e) => {
+            log::warn!("shell: could not trim the opening to the open faces ({e}); the wall next to it may be cut");
+            cavity
+        }
+    };
     let r = crate::ops::boolean(healed, &cavity, crate::BoolOp::Cut);
     if r.is_err()
         && let Ok(x) = shell_by_opening(healed, opened, thickness, margin)
@@ -600,6 +608,83 @@ fn shell_opened(b: &Body, healed: &Body, open: &[Vec3], opened: &[usize], thickn
             Ok(hollowed(r, b, offsets(&cavity)))
         }
     }
+}
+
+/// The cavity with each open face pushed out (`cavity`), trimmed so that beyond an open face's
+/// plane it only reaches through the open face itself; `None` when it already does.
+///
+/// The pushed-out face carries the cavity past every edge of the open face. Past a convex edge
+/// that is outside the body, but past a concave one (a box on a box, its side face open where it
+/// meets the lower box's top) it runs on into the neighbouring wall and cuts a strip through it,
+/// as wide as the push. The trimmed cavity is the shell's cavity with every face moved in,
+/// together with the pushed-out cavity's parts that are on the body's side of every open face's
+/// plane or in front of that open face.
+fn opening_overreach(healed: &Body, cavity: &Body, opened: &[usize], thickness: f64, margin: f64) -> Result<Option<Body>> {
+    let size = healed.size();
+    let tol = size * 1e-6 + 1e-9;
+    let faces: Vec<mt::Face> = healed.solid.face_iter().cloned().collect();
+    // Each open face's plane (outward normal, offset) and its triangles.
+    let mesh = healed.tessellate((size * 1e-3).max(1e-3))?;
+    let mut open: Vec<(&mt::Face, Vec3, f64, Vec<[Vec3; 3]>)> = Vec::new();
+    for fi in opened {
+        let Some(f) = faces.get(*fi) else { return Ok(None) };
+        let mt::Surface::Plane(pl) = f.oriented_surface() else { return Ok(None) };
+        let n = pl.normal();
+        let Some(n) = Vec3::new(n.x, n.y, n.z).normalized() else { return Ok(None) };
+        let d = n.dot(from_p3(pl.origin()));
+        let tris: Vec<[Vec3; 3]> =
+            mesh.triangles.iter().zip(&mesh.tri_face).filter(|(_, f)| **f as usize == *fi).filter_map(|(t, _)| mesh.tri(t)).collect();
+        if tris.is_empty() {
+            return Ok(None);
+        }
+        open.push((f, n, d, tris));
+    }
+    // Only a corner of the cavity past an open face's plane and not in front of that face can be
+    // in a wall; with none, the cavity is right as it is.
+    let overreach = cavity.solid.vertex_iter().any(|v| {
+        let q = from_p3(v.point());
+        open.iter().any(|(_, n, d, tris)| {
+            let h = n.dot(q) - d;
+            h > tol && {
+                let on = q - *n * h;
+                !tris.iter().any(|[a, b, c]| point_tri(on, *a, *b, *c) < size * 1e-4 + 1e-6)
+            }
+        })
+    });
+    if !overreach {
+        return Ok(None);
+    }
+    let closed = offset_planar(healed, |_, _| -thickness)?;
+    // Keep: on the body's side of each open plane, or in front of the open face.
+    let reach = size * 4.0;
+    let mut keep: Option<Body> = None;
+    for (f, n, d, _) in &open {
+        let c = *n * *d;
+        let mut hs = vec![HalfSpace { n: *n, d: *d }];
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            hs.push(HalfSpace { n: axis, d: axis.dot(c) + reach });
+            hs.push(HalfSpace { n: axis * -1.0, d: -axis.dot(c) + reach });
+        }
+        let (side, _) = polyhedron(&hs)?;
+        // In front of the face: its prism, from half a wall inside the body (overlapping `side`
+        // rather than touching it) to past the pushed-out face.
+        let inset = thickness * 0.5;
+        let prism = guard("shell opening prism", || {
+            let start = builder::translated(*f, v3(*n * -inset));
+            let solid: Solid = builder::tsweep(&start, v3(*n * (inset + margin * 2.0)));
+            Ok(solid)
+        })?;
+        let prism = Body::new(prism)?;
+        let k = crate::ops::boolean(&side, &prism, crate::BoolOp::Union)?.ok_or_else(|| KernelError::Failed("shell: opening".into()))?;
+        keep = Some(match keep {
+            None => k,
+            Some(acc) => crate::ops::boolean(&acc, &k, crate::BoolOp::Intersect)?.ok_or_else(|| KernelError::Failed("shell: opening".into()))?,
+        });
+    }
+    let Some(keep) = keep else { return Ok(None) };
+    let kept = crate::ops::boolean(cavity, &keep, crate::BoolOp::Intersect)?.ok_or_else(|| KernelError::Failed("shell: opening".into()))?;
+    let trimmed = crate::ops::boolean(&closed, &kept, crate::BoolOp::Union)?.ok_or_else(|| KernelError::Failed("shell: opening".into()))?;
+    Ok(Some(trimmed))
 }
 
 /// A shell made from the cavity with every face moved in by the thickness (open faces too),

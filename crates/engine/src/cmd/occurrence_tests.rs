@@ -67,6 +67,22 @@ fn instance_selection_survives_rename_move_capture_and_serde() {
 }
 
 #[test]
+fn component_rename_carries_into_placement_names() {
+    // #1665: the browser row shows the placement's name, so a rename has to reach it.
+    let mut s = Session::default();
+    let (component, first) = created(&mut s, "Block");
+    let second = run(&mut s, "occurrence.copy", json!({"component": component, "translate": [20,0,0]}))["occurrence"].as_u64().unwrap();
+    let third = run(&mut s, "occurrence.copy", json!({"component": component, "translate": [40,0,0]}))["occurrence"].as_u64().unwrap();
+    let name = |s: &Session, id: u64| s.doc.occurrences.iter().find(|o| o.id == id).unwrap().name.clone();
+    assert_eq!(name(&s, second), "Block:2");
+    // A placement named otherwise (an import's own name) keeps it.
+    s.doc_mut().occurrences.iter_mut().find(|o| o.id == third).unwrap().name = "Blockade:3".into();
+    run(&mut s, "component.rename", json!({"component": component, "name": "box"}));
+    assert_eq!([name(&s, first), name(&s, second), name(&s, third)], ["box:1", "box:2", "Blockade:3"]);
+    assert_eq!(run(&mut s, "component.list", json!({}))["components"][0]["children"][0]["name"], "box:1");
+}
+
+#[test]
 fn instance_selection_delete_removes_only_selected_instance() {
     let mut s = Session::default();
     let (component, first) = created(&mut s, "Block");
@@ -538,4 +554,111 @@ fn a_linked_design_brings_its_bodies_in_and_follows_edits_to_the_part_file() {
     near(&measured["total"]["volume_mm3"], 9000.0);
     near(&measured["total"]["center_of_mass"][0], 55.0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The compact list counts what a component holds and leaves out identity transforms; the full
+/// list stays as it was.
+#[test]
+fn compact_component_list_counts_and_skips_identity_transforms() {
+    let mut s = Session::default();
+    let (component, first) = created(&mut s, "Block");
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Cube"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let second = run(&mut s, "occurrence.copy", json!({"component": component, "translate": [20, 0, 0]}))["occurrence"].as_u64().unwrap();
+    let full = run(&mut s, "component.list", json!({}));
+    let block = |l: &Value| l["components"].as_array().unwrap().iter().find(|c| c["id"] == component).unwrap().clone();
+    assert_eq!(block(&full)["bodies"], json!(["Cube"]));
+    assert!(block(&full)["occurrences"].as_array().unwrap().iter().all(|o| o["transform"].is_array()));
+    let compact = run(&mut s, "component.list", json!({"compact": true}));
+    let b = block(&compact);
+    assert_eq!((&b["bodies"], &b["features"], &b["sketches"]), (&json!(1), &json!(1), &json!(0)), "{b}");
+    let placed = |id: u64| b["occurrences"].as_array().unwrap().iter().find(|o| o["id"] == id).unwrap().clone();
+    assert!(placed(first).get("transform").is_none(), "{b}");
+    assert_eq!(placed(second)["transform"][3][0], 20.0, "{b}");
+    let root = compact["components"].as_array().unwrap().iter().find(|c| c["id"] == 0).unwrap().clone();
+    assert_eq!(root["children"], json!([first, second]), "{root}");
+    // Body names on request.
+    assert_eq!(block(&run(&mut s, "component.list", json!({"compact": true, "bodies": true})))["bodies"], json!(["Cube"]));
+}
+
+/// A script's 3x4 placement matrix (rotation rows, then the translation column) moves an
+/// occurrence exactly as the same turn and move given as an axis, an angle and a translation.
+#[test]
+fn matrix_move_turns_a_quarter_and_moves() {
+    let mut s = Session::default();
+    let (_, occ) = created(&mut s, "Block");
+    run(&mut s, "solid.box", json!({"length": 2, "width": 1, "height": 1}));
+    // 90 degrees about Z, then (10, 20, 30): (x, y, z) goes to (10 - y, 20 + x, 30 + z).
+    let r = run(&mut s, "occurrence.move", json!({"occurrence": occ, "matrix": [0, -1, 0, 10, 1, 0, 0, 20, 0, 0, 1, 30]}));
+    let t = &r["transform"];
+    for (col, expected) in [[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [10.0, 20.0, 30.0, 1.0]].iter().enumerate() {
+        for (row, x) in expected.iter().enumerate() {
+            near(&t[col][row], *x);
+        }
+    }
+    // The box's centre (1, 0.5, 0.5) lands at (9.5, 21, 30.5).
+    let props = run(&mut s, "occurrence.properties", json!({"occurrence": occ}));
+    for (i, x) in [9.5, 21.0, 30.5].into_iter().enumerate() {
+        near(&props["total"]["center_of_mass"][i], x);
+    }
+    // The same as axis/angle/translate, and the 4x4 form as rows says the same.
+    let mut other = Session::default();
+    let (_, o2) = created(&mut other, "Block");
+    let r2 = run(&mut other, "occurrence.move", json!({"occurrence": o2, "axis": [0, 0, 1], "angle": "90 deg", "translate": [10, 20, 30]}));
+    let mut rows = Session::default();
+    let (_, o3) = created(&mut rows, "Block");
+    let r3 = run(&mut rows, "occurrence.move", json!({"occurrence": o3, "matrix": [[0, -1, 0, 10], [1, 0, 0, 20], [0, 0, 1, 30], [0, 0, 0, 1]]}));
+    for col in 0..4 {
+        for row in 0..4 {
+            near(&r2["transform"][col][row], t[col][row].as_f64().unwrap());
+            near(&r3["transform"][col][row], t[col][row].as_f64().unwrap());
+        }
+    }
+}
+
+/// A rotation that is one only up to rounding is orthonormalised; a scale, a shear or a mirror
+/// is refused with the reason, and the occurrence stays where it was.
+#[test]
+fn matrix_move_orthonormalises_rounding_and_refuses_what_is_not_rigid() {
+    let mut s = Session::default();
+    let (_, occ) = created(&mut s, "Block");
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let e = 3e-10;
+    let nearly = json!([cos + e, -sin, 0, 5, sin, cos - e, e, 0, 0, -e, 1.0 + e, 0]);
+    let r = run(&mut s, "occurrence.move", json!({"occurrence": occ, "matrix": nearly, "space": "world"}));
+    let m: solidcraft_doc::Mat = serde_json::from_value(r["transform"].clone()).unwrap();
+    for i in 0..3 {
+        for j in 0..3 {
+            let dot: f64 = (0..3).map(|k| m[i][k] * m[j][k]).sum();
+            assert!((dot - f64::from(u8::from(i == j))).abs() < 1e-15, "column {i}·{j} = {dot}");
+        }
+    }
+    assert!((m[0][0] - cos).abs() < 1e-9 && (m[0][1] - sin).abs() < 1e-9 && (m[3][0] - 5.0).abs() < 1e-12, "{m:?}");
+
+    let before = s.doc.occurrences.iter().find(|o| o.id == occ).unwrap().transform;
+    let refused = |s: &mut Session, p: Value| s.execute("occurrence.move", &p).unwrap_err().to_string();
+    let scaled = refused(&mut s, json!({"occurrence": occ, "matrix": [1.001, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]}));
+    assert!(scaled.contains("not rigid") && scaled.contains("2.00"), "{scaled}");
+    let sheared = refused(&mut s, json!({"occurrence": occ, "matrix": [1, 0.01, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]}));
+    assert!(sheared.contains("not rigid"), "{sheared}");
+    let mirrored = refused(&mut s, json!({"occurrence": occ, "matrix": [-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]}));
+    assert!(mirrored.contains("solid.mirror"), "{mirrored}");
+    let projective = refused(&mut s, json!({"occurrence": occ, "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.5, 0, 0, 1]}));
+    assert!(projective.contains("fourth row"), "{projective}");
+    // A looser tolerance is the caller's to ask for, up to 1e-3.
+    let rounded = json!([0.866, -0.5, 0, 0, 0.5, 0.866, 0, 0, 0, 0, 1, 0]);
+    assert!(refused(&mut s, json!({"occurrence": occ, "matrix": rounded})).contains("not rigid"));
+    for p in [
+        json!({"occurrence": occ, "matrix": rounded, "tolerance": 1}),
+        json!({"occurrence": occ, "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], "translate": [1, 0, 0]}),
+        json!({"occurrence": occ, "matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0], "translate": [1, 0, 0]}),
+        json!({"occurrence": occ, "matrix": [1, 0, 0, 1e12, 0, 1, 0, 0, 0, 0, 1, 0]}),
+        json!({"occurrence": occ, "matrix": [[1, 0, 0, 0], [0, 1, 0, 0]]}),
+        json!({"occurrence": occ, "matrix": "identity"}),
+        json!({"occurrence": occ, "matrix": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}),
+    ] {
+        assert!(s.execute("occurrence.move", &p).is_err(), "{p}");
+    }
+    assert_eq!(s.doc.occurrences.iter().find(|o| o.id == occ).unwrap().transform, before);
+    run(&mut s, "occurrence.move", json!({"occurrence": occ, "matrix": rounded, "tolerance": 1e-3}));
 }

@@ -1,0 +1,305 @@
+{
+ "description": "A lofted down tube (rounded-rectangle sections, widest 82 mm) joined to a 46 mm \u00d7 73 mm bottom-bracket cylinder: the display mesh of the tube's side face gained a flat triangle across the inside of its bend.",
+ "commands": [
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -4,
+      0.0,
+      2
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.164,
+      0.0,
+      0.986
+     ]
+    },
+    "name": "S4b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -19.0,
+     -18.0
+    ],
+    "p1": [
+     19.0,
+     18.0
+    ],
+    "radius": 10.799999999999999
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      80,
+      0.0,
+      16
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.205,
+      0.0,
+      0.979
+     ]
+    },
+    "name": "S5b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -41.0,
+     -33.0
+    ],
+    "p1": [
+     41.0,
+     33.0
+    ],
+    "radius": 19.8
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      175,
+      0.0,
+      40
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.596,
+      0.0,
+      0.803
+     ]
+    },
+    "name": "S6b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -41.0,
+     -35.0
+    ],
+    "p1": [
+     41.0,
+     35.0
+    ],
+    "radius": 21.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      314.248,
+      0.0,
+      271.657
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S7b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -39.0,
+     -35.0
+    ],
+    "p1": [
+     39.0,
+     35.0
+    ],
+    "radius": 21.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      422.553,
+      0.0,
+      451.835
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S8b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -35.0,
+     -32.0
+    ],
+    "p1": [
+     35.0,
+     32.0
+    ],
+    "radius": 19.2
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      484.441,
+      0.0,
+      554.793
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S9b"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -23.0,
+     -22.0
+    ],
+    "p1": [
+     23.0,
+     22.0
+    ],
+    "radius": 13.2
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.loft",
+   "params": {
+    "sections": [
+     {
+      "sketch": "S4b"
+     },
+     {
+      "sketch": "S5b"
+     },
+     {
+      "sketch": "S6b"
+     },
+     {
+      "sketch": "S7b"
+     },
+     {
+      "sketch": "S8b"
+     },
+     {
+      "sketch": "S9b"
+     }
+    ],
+    "operation": "new",
+    "name": "DT2",
+    "body_name": "DT2"
+   }
+  },
+  {
+   "command": "solid.cylinder",
+   "params": {
+    "diameter": 46,
+    "height": 73.0,
+    "base": [
+     0,
+     -36.5,
+     0
+    ],
+    "axis": "Y",
+    "operation": "new",
+    "name": "BBShell",
+    "body_name": "BBShell"
+   }
+  },
+  {
+   "command": "solid.combine",
+   "params": {
+    "target": "DT2",
+    "tools": [
+     "BBShell"
+    ],
+    "operation": "join"
+   }
+  }
+ ]
+}

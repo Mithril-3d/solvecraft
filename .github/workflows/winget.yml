@@ -1,0 +1,77 @@
+# Publishing a GitHub release (not a prerelease) opens a pull request at microsoft/winget-pkgs
+# that adds the new version of bherbruck.SolidCraft, so `winget install bherbruck.SolidCraft`
+# and `winget upgrade` get it. Komac (https://github.com/russellbanks/Komac) downloads the three
+# versioned MSIs, reads their product codes and copies the rest from the previous manifest.
+# Skipped until the owner adds the WINGET_TOKEN secret, and while the package isn't in
+# winget-pkgs yet; see docs/releasing.md.
+name: WinGet
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to submit (e.g. v0.11.1)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winget
+  cancel-in-progress: false
+
+env:
+  PACKAGE_ID: bherbruck.SolidCraft
+  KOMAC_VERSION: 2.16.0
+  KOMAC_SHA256: 7d2707fa6210f2789a3702de49fbd150b736dbf426ee0b9bc8e098736f9fd82d
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - id: check
+        name: Check for the token and the package
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if [ -z "$WINGET_TOKEN" ]; then
+            echo "No WINGET_TOKEN secret: nothing to submit."
+            exit 0
+          fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-*|*nightly*) echo "$TAG is a prerelease: not submitted."; exit 0 ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Unexpected tag '$TAG'"; exit 1 ;;
+          esac
+          if ! gh api "repos/microsoft/winget-pkgs/contents/manifests/b/bherbruck/SolidCraft" --silent; then
+            echo "$PACKAGE_ID isn't in winget-pkgs yet: nothing to update."
+            exit 0
+          fi
+          echo "version=${TAG#v}" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+      - name: Install Komac
+        if: steps.check.outputs.version != ''
+        run: |
+          archive="komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$archive" \
+            "https://github.com/russellbanks/Komac/releases/download/v${KOMAC_VERSION}/$archive"
+          echo "$KOMAC_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" komac
+      - name: Open the winget-pkgs pull request
+        if: steps.check.outputs.version != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ steps.check.outputs.version }}
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG"
+          "$RUNNER_TEMP/komac" update "$PACKAGE_ID" --version "$VERSION" \
+            --urls "$base/solidcraft-$VERSION-windows-x64.msi" \
+                   "$base/solidcraft-$VERSION-windows-x86.msi" \
+                   "$base/solidcraft-$VERSION-windows-arm64.msi" \
+            --release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG" \
+            --submit

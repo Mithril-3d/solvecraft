@@ -1,6 +1,7 @@
 //! Helpers to read hostile JSON parameters.
 
 use serde_json::Value;
+use solidcraft_doc::Expr;
 use solidcraft_geom::{Vec2, Vec3};
 
 use crate::{EngineError, Result};
@@ -58,15 +59,15 @@ pub fn vec2_list(cmd: &str, p: &Value, k: &str, max: usize) -> Result<Vec<Vec2>>
 }
 
 /// An expression parameter: a number (mm or degrees by context) or an expression string.
-pub fn expr(p: &Value, k: &str) -> Option<String> {
+pub fn expr(p: &Value, k: &str) -> Option<Expr> {
     match p.get(k)? {
-        Value::Number(n) => n.as_f64().and_then(finite).map(|v| format!("{v}")),
-        Value::String(s) if !s.trim().is_empty() && s.len() <= 4096 => Some(s.trim().to_string()),
+        Value::Number(n) => n.as_f64().and_then(finite).map(|v| Expr::new(format!("{v}"))),
+        Value::String(s) if !s.trim().is_empty() && s.len() <= 4096 => Some(Expr::new(s.trim())),
         _ => None,
     }
 }
 
-pub fn req_expr(cmd: &str, p: &Value, k: &str) -> Result<String> {
+pub fn req_expr(cmd: &str, p: &Value, k: &str) -> Result<Expr> {
     expr(p, k).ok_or_else(|| bad(cmd, format!("`{k}` must be a number or an expression")))
 }
 

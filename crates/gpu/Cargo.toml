@@ -1,6 +1,6 @@
 [package]
 name = "solidcraft-gpu"
-description = "SolidCraft GPU compute: evaluates display tessellation plans (surface points and normals) in a compute shader"
+description = "SolidCraft GPU rendering: the viewport's render pipelines, offscreen captures, and display tessellation plans evaluated in a compute shader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,11 @@ workspace = true
 
 [dependencies]
 solidcraft-geom = { workspace = true }
+solidcraft-render = { workspace = true }
 wgpu = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { workspace = true }
@@ -21,3 +23,8 @@ wgpu = { workspace = true, features = ["metal", "vulkan", "dx12", "gles"] }
 
 [dev-dependencies]
 solidcraft-kernel = { workspace = true }
+# Headless pictures of real designs (capture tests).
+solidcraft-engine = { workspace = true }
+serde_json = { workspace = true }
+# The HLSL the D3D12 backend compiles (tests check it suits FXC).
+naga = { workspace = true, features = ["wgsl-in", "hlsl-out"] }

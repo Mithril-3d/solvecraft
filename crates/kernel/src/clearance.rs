@@ -5,6 +5,10 @@
 //! body (a cut), or nothing but its material (a join). A [`Clearance`] decides that on the
 //! other body's faces: every triangle of its mesh is clipped against that space, so a wall, a
 //! rib or a hole anywhere in it is found. Sample points miss what lies between them.
+//!
+//! A cut's or join's tool grown past the faces it lies on, to keep coincident faces out of its
+//! boolean, is asked the same way (in the document's evaluation): it may gain only empty space
+//! (a cut) or material (a join).
 
 use std::collections::HashMap;
 
@@ -16,7 +20,7 @@ use crate::offset::{Surf, surf_of};
 
 /// How a body's material sits in a region of space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Occupancy {
+pub enum Occupancy {
     /// The region holds none of it.
     Empty,
     /// The region lies wholly in it.
@@ -104,12 +108,14 @@ enum Reach {
 }
 
 /// A body's faces, for telling how its material sits in the space a face moves through.
-pub(crate) struct Clearance<'a> {
+pub struct Clearance<'a> {
     body: &'a Body,
     mesh: Mesh,
     /// How far a curved face may stand off its triangles.
     sag: f64,
     tol: f64,
+    /// Whether curved faces are judged by their exact bounds (see [`Clearance::with_exact_bounds`]).
+    exact: bool,
 }
 
 /// Pairs of triangles one question may compare; beyond it there is no answer.
@@ -117,9 +123,20 @@ const MAX_PAIRS: usize = 2_000_000;
 
 impl<'a> Clearance<'a> {
     /// `chord`: the chord error of the mesh the body is asked on.
-    pub(crate) fn new(body: &'a Body, chord: f64) -> Option<Clearance<'a>> {
+    pub fn new(body: &'a Body, chord: f64) -> Option<Clearance<'a>> {
         let mesh = body.tessellate_with(chord, true).ok()?;
-        (!mesh.triangles.is_empty()).then(|| Clearance { body, mesh, sag: 2.0 * chord, tol: (body.size() * 1e-7).max(1e-9) })
+        (!mesh.triangles.is_empty()).then(|| Clearance { body, mesh, sag: 2.0 * chord, tol: (body.size() * 1e-7).max(1e-9), exact: false })
+    }
+
+    /// Judge curved faces by their exact bounds where `clear_of_slab` is asked, not by the chord error each way. A B-spline or NURBS
+    /// face lies in the hull of its control net, so a face whose net ends before a region begins (a loft's side running out in the
+    /// plane the region starts from) can't reach into it, however its triangles stand off it. A face of a sphere or a cylinder
+    /// stands off its triangles away from the centre or the axis only, so a triangle that lies clear of the region and leans away
+    /// from it is clear (a dome standing on the plane the region starts from). Without this such a face counts as reaching in by
+    /// the chord error.
+    pub(crate) fn with_exact_bounds(mut self, on: bool) -> Self {
+        self.exact = on;
+        self
     }
 
     /// How the body's material sits in the space that `faces` move through when they go along
@@ -127,7 +144,7 @@ impl<'a> Clearance<'a> {
     /// planar faces square to `along`, each with how far its face reaches past it sideways
     /// (negative: the triangle's sides are drawn in, so that faces lying against them don't
     /// count). `Mixed` as soon as a face of the body reaches into that space.
-    pub(crate) fn swept(&self, faces: &[([Vec3; 3], f64)], along: Vec3, lo: f64, hi: f64) -> Occupancy {
+    pub fn swept(&self, faces: &[([Vec3; 3], f64)], along: Vec3, lo: f64, hi: f64) -> Occupancy {
         let Some((first, _)) = faces.first() else { return Occupancy::Mixed };
         let base = along.dot(first[0]);
         // The body's triangles near that space.
@@ -194,16 +211,42 @@ impl<'a> Clearance<'a> {
     /// a unit vector), anywhere?
     pub(crate) fn clear_of_slab(&self, n: Vec3, d: f64, lo: f64, hi: f64) -> bool {
         let mut reach: HashMap<u32, Reach> = HashMap::new();
+        let mut round: HashMap<u32, Option<Surf>> = HashMap::new();
         self.mesh.triangles.iter().zip(&self.mesh.tri_face).all(|(t, face)| {
             let Some(tri) = self.mesh.tri(t) else { return false };
-            let pad = match *reach.entry(*face).or_insert_with(|| self.reach(*face, n, d + lo, d + hi)) {
+            // How far the face may stand off its triangle towards larger and towards smaller heights.
+            let (up, down) = match *reach.entry(*face).or_insert_with(|| self.reach(*face, n, d + lo, d + hi)) {
                 Reach::Never => return true,
-                Reach::Around | Reach::Beyond { .. } => self.sag,
-                Reach::Exact | Reach::Sideways => 0.0,
+                Reach::Around => (self.sag, self.sag),
+                Reach::Beyond { .. } => match self.exact.then(|| round.entry(*face).or_insert_with(|| self.round_of(*face))).and_then(|s| s.as_ref())
+                {
+                    Some(s) => self.bulge(s, (tri[0] + tri[1] + tri[2]) / 3.0, n),
+                    None => (self.sag, self.sag),
+                },
+                Reach::Exact | Reach::Sideways => (0.0, 0.0),
             };
             let heights = tri.map(|p| n.dot(p) - d);
-            heights.iter().all(|s| s + pad < lo) || heights.iter().all(|s| s - pad > hi)
+            heights.iter().all(|s| s + up < lo) || heights.iter().all(|s| s - down > hi)
         })
+    }
+
+    /// The round surface (sphere, cylinder, cone, torus) a face lies on, if it is one.
+    fn round_of(&self, face: u32) -> Option<Surf> {
+        let f = self.body.solid.face_iter().nth(face as usize)?;
+        surf_of(f, self.tol * 100.0)
+    }
+
+    /// How far the surface may stand off a triangle with its centroid at `p`, towards larger and towards smaller heights along `n`: a
+    /// sphere or a cylinder lies radially outward from its triangles, within the chord error.
+    fn bulge(&self, s: &Surf, p: Vec3, n: Vec3) -> (f64, f64) {
+        let radial = match *s {
+            Surf::Sphere { c, .. } => p - c,
+            Surf::Cylinder { o, a, .. } => (p - o) - a * (p - o).dot(a),
+            _ => return (self.sag, self.sag),
+        };
+        let Some(out) = radial.normalized() else { return (self.sag, self.sag) };
+        let lean = out.dot(n);
+        (self.sag * lean.max(0.0), self.sag * (-lean).max(0.0))
     }
 
     /// How the face's triangles stand for it in a region between the heights `lo` and `hi`
@@ -218,7 +261,18 @@ impl<'a> Clearance<'a> {
             if matches!(surface, mt::Surface::Plane(_)) {
                 return Ok(Reach::Exact);
             }
+            if self.exact
+                && let Some((least, greatest)) = crate::planar_faces::control_net_span(&surface, along)
+                && (greatest <= lo || least >= hi)
+            {
+                return Ok(Reach::Never);
+            }
             let round = surf_of(f, self.tol * 100.0);
+            // A flat face stored otherwise (a revolve's end: a line swept round its axis) is
+            // a plane all the same: its triangles lie in it.
+            if matches!(round, Some(Surf::Plane { .. })) {
+                return Ok(Reach::Exact);
+            }
             let straight = matches!(round, Some(Surf::Cylinder { a, .. }) if a.dot(along).abs() > 1.0 - 1e-12)
                 || crate::prism::wall_along(&surface, along, self.tol * 10.0, &mut 262_144);
             Ok(if straight {

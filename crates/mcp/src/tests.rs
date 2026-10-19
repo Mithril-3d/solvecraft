@@ -10,6 +10,25 @@ fn server() -> Server {
     Server::new(Box::new(Headless::default()))
 }
 
+/// Screenshots are drawn on the GPU by the renderer the host installs (`solidcraft-cli mcp`); the
+/// tests install the same one. `false`, with the reason printed, on a machine without a GPU
+/// adapter: the screenshots are then left out of the test.
+fn renders() -> bool {
+    match solidcraft_gpu::capture::shared() {
+        Ok(c) => {
+            solidcraft_engine::capture::install(std::sync::Arc::new(move |scene, cam, w, h| {
+                c.rgba(scene, cam, w, h).map(|rgba| solidcraft_engine::capture::Picture { rgba, renderer: c.renderer() }).map_err(|e| e.to_string())
+            }));
+            true
+        }
+        Err(e @ solidcraft_gpu::GpuError::NoAdapter(_)) if std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none() => {
+            eprintln!("screenshots left out: {e}");
+            false
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
 fn call(s: &mut Server, id: u64, method: &str, params: Value) -> Value {
     let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
     let r = s.handle_line(&line).expect("reply");
@@ -166,10 +185,12 @@ fn agent_builds_box_fillet_hole() {
     assert!(rel(volume(&mut s), expect) < 5e-4);
 
     // Look at it from the top: a real PNG comes back as an image block.
-    let img = tool(&mut s, "screenshot", json!({"view": "top", "width": 320, "height": 200}));
-    assert_eq!(img["type"], "image");
-    assert_eq!(img["mimeType"], "image/png");
-    assert!(img["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    if renders() {
+        let img = tool(&mut s, "screenshot", json!({"view": "top", "width": 320, "height": 200}));
+        assert_eq!(img["type"], "image");
+        assert_eq!(img["mimeType"], "image/png");
+        assert!(img["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    }
 
     // Export, save, start over, open.
     let dir = std::env::temp_dir().join(format!("solidcraft-mcp-test-{}", std::process::id()));
@@ -181,8 +202,10 @@ fn agent_builds_box_fillet_hole() {
     tool(&mut s, "export", json!({"path": stl.to_string_lossy(), "format": "stl"}));
     assert!(std::fs::metadata(&stl).unwrap().len() > 1000);
     let shot = dir.join("shot.png");
-    tool(&mut s, "screenshot", json!({"path": shot.to_string_lossy(), "width": 64, "height": 64}));
-    assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+    if renders() {
+        tool(&mut s, "screenshot", json!({"path": shot.to_string_lossy(), "width": 64, "height": 64}));
+        assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+    }
     let design = dir.join("part.solidcraft");
     tool(&mut s, "save", json!({"path": design.to_string_lossy()}));
     tool(&mut s, "new_design", json!({"name": "Empty"}));
@@ -193,6 +216,34 @@ fn agent_builds_box_fillet_hole() {
     let r = tool(&mut s, "open", json!({"path": step.to_string_lossy()}));
     assert_eq!(r["features"], 1, "{r}");
     assert!(rel(volume(&mut s), expect) < 5e-4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `open` hands `up` and `names` to the STEP import, and the tool's schema refuses other values.
+#[test]
+fn open_stands_a_y_up_step_file_up() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 10, "width": 40, "height": 5}}));
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-up-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let step = dir.join("tall.step").to_string_lossy().to_string();
+    tool(&mut s, "export", json!({"path": step}));
+    let height = |s: &mut Server| {
+        let bbox = tool(s, "measure", json!({}))["bodies"][0]["bbox"].clone();
+        bbox["max"][2].as_f64().unwrap() - bbox["min"][2].as_f64().unwrap()
+    };
+
+    let r = tool(&mut s, "open", json!({"path": step}));
+    assert_eq!(r["features"], 1, "{r}");
+    assert!((height(&mut s) - 5.0).abs() < 1e-6, "as written");
+    let r = tool(&mut s, "open", json!({"path": step, "up": "y", "names": "product"}));
+    assert_eq!(r["features"], 1, "the import, its component turned: {r}");
+    assert!((height(&mut s) - 40.0).abs() < 1e-6, "Y became Z");
+
+    for args in [json!({"path": step, "up": "x"}), json!({"path": step, "names": "label"}), json!({"path": step, "up": 1})] {
+        let r = raw_tool(&mut s, "open", args.clone());
+        assert_eq!(r["error"]["code"], -32602, "{args}: {r}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -240,6 +291,18 @@ fn parameters_drive_the_design() {
     assert!(rel(volume(&mut s), 50.0 * 30.0 * 25.0) < 1e-9);
     let d = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}));
     assert!(d["params"].as_array().unwrap().iter().any(|p| p["name"] == "len" && p["value"] == 50.0), "{d}");
+}
+
+/// Design properties (#1015) are set through `execute` and come back in `inspect_design`.
+#[test]
+fn design_properties_show_in_inspect_design() {
+    let mut s = server();
+    let d = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}));
+    assert_eq!(d["metadata"], json!({}), "{d}");
+    let params = json!({"values": {"author": "Agent", "com.example.agent": {"session": 7}}});
+    tool(&mut s, "execute", json!({"command": "document.metadata.set", "params": params}));
+    let d = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}));
+    assert_eq!(d["metadata"], json!({"author": "Agent", "com.example.agent": {"session": 7}}), "{d}");
 }
 
 #[test]
@@ -462,7 +525,7 @@ fn legacy_design_files_and_resource_uris() {
 /// design is open there, without its hidden files. The working folder doesn't count at all.
 #[test]
 fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folder() {
-    let base = std::env::temp_dir().join(format!("solidcraft-mcp-defaults-{}", std::process::id()));
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-defaults-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (proj, other, recovery) = (base.join("proj"), base.join("other"), base.join("recovery"));
     std::fs::create_dir_all(&proj).unwrap();
@@ -484,7 +547,9 @@ fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folde
     tool(&mut s, "execute", json!({"command": "parameters.export", "params": {"path": at(&proj, "params.csv")}}));
     tool(&mut s, "save", json!({"path": at(&proj, "copy.solidcraft")}));
     tool(&mut s, "open", json!({"path": at(&proj, "part.solidcraft")}));
-    tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    if renders() {
+        tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    }
     tool(&mut s, "execute", json!({"command": "doc.recovery_list", "params": {"dir": recovery.to_string_lossy()}}));
     assert!(proj.join("part.step").exists() && proj.join("copy.solidcraft").exists());
     // Hidden files in it, and folders beside it, stay out of reach.
@@ -508,7 +573,7 @@ fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folde
 #[test]
 fn tool_calls_stay_inside_the_agents_folders() {
     use solidcraft_engine::io::vfs::PathScope;
-    let base = std::env::temp_dir().join(format!("solidcraft-mcp-scope-{}", std::process::id()));
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-scope-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (root, out) = (base.join("root"), base.join("out"));
     std::fs::create_dir_all(&root).unwrap();
@@ -523,8 +588,12 @@ fn tool_calls_stay_inside_the_agents_folders() {
     tool(&mut s, "save", json!({"path": at(&root, "part.solidcraft")}));
     tool(&mut s, "export", json!({"path": at(&root, "part.step")}));
     tool(&mut s, "open", json!({"path": at(&root, "part.solidcraft")}));
-    tool(&mut s, "screenshot", json!({"path": at(&root, "shot.png"), "width": 64, "height": 64}));
-    let mut escapes = vec![at(&out, "x.step"), at(&root, "../out/x.step")];
+    if renders() {
+        tool(&mut s, "screenshot", json!({"path": at(&root, "shot.png"), "width": 64, "height": 64}));
+    }
+    let escapes = vec![at(&out, "x.step"), at(&root, "../out/x.step")];
+    #[cfg(unix)]
+    let mut escapes = escapes;
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&out, root.join("link")).unwrap();
@@ -546,6 +615,72 @@ fn tool_calls_stay_inside_the_agents_folders() {
     }
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written outside");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The short (8.3) spelling of an existing `path` as `cmd` gives it (`NAME~1.XYZ`), or `None`
+/// when it has no short name (the volume makes none).
+#[cfg(windows)]
+fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("cmd").raw_arg(format!("/d /c for %I in (\"{}\") do @echo %~sI", path.display())).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| solidcraft_engine::io::vfs::windows_refusal(s).is_some_and(|why| why.contains("8.3")))
+        .map(Into::into)
+}
+
+/// On Windows the temporary folder's path often has a short (8.3) name (the user folder's
+/// `NAME~1.XYZ` when its name is long). The server's own folders are spelled with long names
+/// there, so `screenshot` without a `path` (the scratch folder) and `doc.recovery_list` (the
+/// recovery folder) work; on such a machine both were refused as short names. Run in a child
+/// process whose `TMP`, `TEMP` and `SOLIDCRAFT_RECOVERY_DIR` are short spellings.
+#[cfg(windows)]
+#[test]
+fn the_servers_own_folders_work_when_the_temporary_folder_has_a_short_name() {
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-short-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (temp, recovery) = (base.join("temporary"), base.join("recovery folder"));
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::create_dir_all(&recovery).unwrap();
+    let (Some(short_temp), Some(short_recovery)) = (short_spelling(&temp), short_spelling(&recovery)) else {
+        eprintln!("skipped: {} has no short (8.3) name on this volume", base.display());
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    };
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::short_names_child", "--test-threads=1", "--nocapture"])
+        .env("TMP", &short_temp)
+        .env("TEMP", &short_temp)
+        .env("SOLIDCRAFT_RECOVERY_DIR", &short_recovery)
+        .env("SOLIDCRAFT_MCP_SHORT_NAMES_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("short names: ok"), "{text}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The child process of the test above; does nothing on its own.
+#[cfg(windows)]
+#[test]
+fn short_names_child() {
+    if std::env::var_os("SOLIDCRAFT_MCP_SHORT_NAMES_CHILD").is_none() {
+        return;
+    }
+    use solidcraft_engine::io::vfs::windows_refusal;
+    let temp = std::env::temp_dir();
+    assert!(windows_refusal(&temp.to_string_lossy()).is_some_and(|why| why.contains("8.3")), "{}", temp.display());
+    let mut s = Server::new(Box::new(Headless::default())).with_path_scope(Some(crate::agent_scope([])));
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}}));
+    if renders() {
+        tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    }
+    tool(&mut s, "execute", json!({"command": "doc.recovery_list", "params": {}}));
+    // An agent's own short spelling of the scratch folder stays refused.
+    let scratch = crate::scratch_dir().unwrap();
+    let short = std::env::temp_dir().join(scratch.file_name().unwrap()).join("shot.png");
+    let r = raw_tool(&mut s, "screenshot", json!({"path": short.to_string_lossy(), "width": 32, "height": 32}));
+    assert!(r.to_string().contains("short (8.3) names"), "{r}");
+    println!("short names: ok");
 }
 
 /// A bridged server sends the agent's folders with every request, so the app confines the
@@ -581,6 +716,9 @@ fn a_bridged_request_carries_the_agents_folders() {
 /// standard view.
 #[test]
 fn screenshot_renders_a_saved_named_view() {
+    if !renders() {
+        return;
+    }
     let mut s = server();
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 20, "height": 10}}));
     let camera = json!({"target": [20, 10, 5], "yaw": 0.5, "pitch": -0.6, "distance": 150});
@@ -597,6 +735,153 @@ fn screenshot_renders_a_saved_named_view() {
     let direct = tool(&mut s, "screenshot", json!({"camera": camera, "width": 96, "height": 64}));
     assert_eq!(direct["data"].as_str().unwrap_or_default(), photo);
     assert_eq!(shot(&mut s, "iso"), iso);
+}
+
+/// The ground grid lies on Z 0 and cuts through a part that straddles it: `grid: false` and
+/// `axes: false` leave it and the origin's axes out of the render. An axis hidden with
+/// `browser.visibility` stays out whatever `axes` says.
+#[test]
+fn screenshot_can_leave_the_grid_and_the_axes_out() {
+    if !renders() {
+        return;
+    }
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "corner": [10, -15, -10]}}));
+    let shot = |s: &mut Server, extra: Value| {
+        let mut args = json!({"view": "front", "width": 96, "height": 64});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        tool(s, "screenshot", args)["data"].as_str().unwrap_or_default().to_string()
+    };
+    let all = shot(&mut s, json!({}));
+    let no_grid = shot(&mut s, json!({"grid": false}));
+    let no_axes = shot(&mut s, json!({"axes": false}));
+    let bare = shot(&mut s, json!({"grid": false, "axes": false}));
+    assert!(all.starts_with("iVBORw0KGgo"), "not a PNG");
+    let pictures = [&all, &no_grid, &no_axes, &bare];
+    for (i, a) in pictures.iter().enumerate() {
+        for b in &pictures[i + 1..] {
+            assert_ne!(a, b, "two of the pictures are the same");
+        }
+    }
+    // Asking for them is the default.
+    assert_eq!(shot(&mut s, json!({"grid": true, "axes": true})), all);
+    // Hiding the origin leaves the axes out, with or without `axes`; the grid is not the origin.
+    tool(&mut s, "execute", json!({"command": "browser.visibility", "params": {"folder": "origin", "visible": false}}));
+    assert_eq!(shot(&mut s, json!({})), no_axes);
+    assert_eq!(shot(&mut s, json!({"axes": true})), no_axes);
+    assert_eq!(shot(&mut s, json!({"grid": false})), bare);
+    // Other than booleans are schema errors.
+    for bad in [json!({"grid": "no"}), json!({"axes": 0})] {
+        assert_eq!(raw_tool(&mut s, "screenshot", bad)["error"]["code"], -32602);
+    }
+}
+
+/// Bridged to an app, `grid` and `axes` ask for a model render and travel with it; without them
+/// the window is captured as before; the window cannot be asked to leave things out.
+#[test]
+fn bridged_screenshots_with_grid_or_axes_are_model_renders() {
+    struct App {
+        calls: Vec<(String, Value)>,
+    }
+    impl crate::backend::Backend for App {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.calls.push((method.to_string(), params.clone()));
+            match method {
+                "ui.render" | "ui.screenshot" => {
+                    let path = params["path"].as_str().ok_or("missing `path`")?;
+                    std::fs::write(path, b"\x89PNG").map_err(|e| e.to_string())?;
+                    Ok(json!({"path": path, "width": 64, "height": 48}))
+                }
+                other => Err(format!("unknown method `{other}`")),
+            }
+        }
+        fn has_ui(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> String {
+            "app".into()
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-guides-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shot.png").to_string_lossy().to_string();
+    let shoot = |extra: Value| {
+        let mut args = json!({"path": path, "width": 64, "height": 48});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let mut app = App { calls: Vec::new() };
+        let r = crate::tools::call_tool(&mut app, "screenshot", &args);
+        (app.calls, r)
+    };
+    let (calls, r) = shoot(json!({}));
+    assert!(r["isError"] != json!(true), "{r}");
+    assert_eq!(calls.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(), ["ui.screenshot"]);
+    let (calls, r) = shoot(json!({"grid": false, "axes": false}));
+    assert!(r["isError"] != json!(true), "{r}");
+    assert_eq!(calls, [("ui.render".to_string(), json!({"path": path, "width": 64, "height": 48, "grid": false, "axes": false}))]);
+    let (calls, _) = shoot(json!({"axes": true}));
+    assert_eq!(calls, [("ui.render".to_string(), json!({"path": path, "width": 64, "height": 48, "axes": true}))]);
+    let (calls, r) = shoot(json!({"source": "model", "grid": false}));
+    assert!(r["isError"] != json!(true), "{r}");
+    assert_eq!(calls, [("ui.render".to_string(), json!({"path": path, "width": 64, "height": 48, "grid": false}))]);
+    // The window shows what it shows: nothing is called, and the error says what to ask for.
+    let (calls, r) = shoot(json!({"source": "window", "grid": false, "view": "top"}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("source"), "{r}");
+    assert!(calls.is_empty(), "{calls:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #1677: a hidden window gives no picture. With no `source`, a model render comes back and says
+/// it is one (`fallback`); asked for the window, the tool says why there is none, at once.
+#[test]
+fn a_hidden_window_screenshot_says_so() {
+    struct Hidden {
+        calls: Vec<String>,
+    }
+    impl crate::backend::Backend for Hidden {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.calls.push(method.to_string());
+            match method {
+                "ui.screenshot" => Err("no frame was presented (window hidden?); use ui.render".into()),
+                "ui.render" => {
+                    let path = params["path"].as_str().ok_or("missing `path`")?;
+                    std::fs::write(path, b"\x89PNG").map_err(|e| e.to_string())?;
+                    Ok(json!({"path": path, "width": 64, "height": 48}))
+                }
+                other => Err(format!("unknown method `{other}`")),
+            }
+        }
+        fn has_ui(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> String {
+            "app".into()
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-hidden-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shot.png").to_string_lossy().to_string();
+    let shoot = |extra: Value| {
+        let mut args = json!({"path": path, "width": 64, "height": 48});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let mut app = Hidden { calls: Vec::new() };
+        let r = crate::tools::call_tool(&mut app, "screenshot", &args);
+        (app.calls, r)
+    };
+    // The default: the window first, then a model render that says why.
+    let (calls, r) = shoot(json!({}));
+    assert!(r["isError"] != json!(true), "{r}");
+    assert_eq!(calls, ["ui.screenshot", "ui.render"]);
+    let info: Value = serde_json::from_str(r["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(info["source"], "model", "{info}");
+    assert!(info["fallback"].as_str().is_some_and(|f| f.contains("window hidden")), "{info}");
+    // Asked for the window: an error naming the cause and the way out, and no render.
+    let (calls, r) = shoot(json!({"source": "window"}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("window hidden") && text.contains("source \"model\""), "{text}");
+    assert_eq!(calls, ["ui.screenshot"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// #530: in a design with many bodies every feature result lists all of them, so a batch reply
@@ -833,6 +1118,58 @@ fn sketch_plane_axes_match_the_skill_reference() {
     }
 }
 
+/// The worked example in `skills/solidcraft-mechanisms/reference.md` is what agents copy: the
+/// actuator has to follow the hinge with the stroke the file computes, the mirrored panel its link,
+/// and the drive has to stop where the rod reaches its limit.
+#[test]
+fn mechanisms_skill_example_moves_as_documented() {
+    let doc = include_str!("../../../skills/solidcraft-mechanisms/reference.md");
+    let start = doc.find("{\"commands\":[").expect("the reference has a worked example");
+    let end = start + doc[start..].find("```").expect("the example's code block ends");
+    let example: Value = serde_json::from_str(&doc[start..end]).expect("the example is JSON");
+    let mut s = server();
+    tool(&mut s, "batch", example);
+    let exec = |s: &mut Server, command: &str, params: Value| tool(s, "execute", json!({"command": command, "params": params}));
+    let value = |list: &Value, joint: &str| {
+        let j = list["joints"].as_array().unwrap().iter().find(|j| j["name"] == joint).unwrap_or_else(|| panic!("no joint {joint}: {list}"));
+        j["values"][0]["value"].as_f64().unwrap()
+    };
+    let com = |s: &mut Server, occurrence: &str| -> Vec<f64> {
+        let p = exec(s, "occurrence.properties", json!({"occurrence": occurrence}));
+        p["total"]["center_of_mass"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+    };
+    // Frame 0, the panels and the actuator one motion between them; nothing open.
+    let list = exec(&mut s, "joint.list", json!({}));
+    assert_eq!(list["conflicts"], json!([]), "{list}");
+    let mut dof: Vec<u64> = list["dof"].as_array().unwrap().iter().map(|d| d["dof"].as_u64().unwrap()).collect();
+    dof.sort_unstable();
+    assert_eq!(dof, [0, 0, 1, 1, 1, 1], "root, Frame, then Wing, Wing 2, barrel and rod: {list}");
+    let near = |got: &[f64], want: [f64; 3]| got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-3);
+    let wing = com(&mut s, "Wing:1");
+    assert!(near(&wing, [0.0, 20.0, 1.5]), "joined where it was modelled: {wing:?}");
+
+    // The tip at (0, 30 cos θ, 30 sin θ), the root at (0, 0, -40): L² = 2500 + 2400 sin θ.
+    let stroke = |deg: f64| (2500.0 + 2400.0 * deg.to_radians().sin()).sqrt() - 50.0;
+    assert!((stroke(20.0) - 7.6268).abs() < 5e-5, "the reference states {}", stroke(20.0));
+    exec(&mut s, "joint.drive", json!({"joint": "Hinge", "value": 20}));
+    let list = exec(&mut s, "joint.list", json!({}));
+    assert!((value(&list, "Stroke") - stroke(20.0)).abs() < 1e-6, "{list}");
+    assert!((value(&list, "Hinge 2") + 20.0).abs() < 1e-9, "{list}");
+    let (wing, wing2) = (com(&mut s, "Wing:1"), com(&mut s, "Wing 2:1"));
+    assert!(near(&wing, [0.0, 18.281, 8.250]), "{wing:?}");
+    assert!(near(&wing2, [0.0, -18.281, 8.250]), "{wing2:?}");
+
+    // The rod reaches +10 mm where L = 60: sin θ = 11/24.
+    let stop = (11.0f64 / 24.0).asin().to_degrees();
+    assert!((stop - 27.280).abs() < 5e-4, "the reference states {stop}");
+    let r = exec(&mut s, "joint.drive", json!({"joint": "Hinge", "value": 45}));
+    assert_eq!(r["stopped_by_loop"]["joint"], "Stroke", "{r}");
+    let list = exec(&mut s, "joint.list", json!({}));
+    let hinge = value(&list, "Hinge");
+    assert!((hinge - stop).abs() < 0.01, "stopped at {hinge}, the rod's limit is at {stop}");
+    assert!(value(&list, "Stroke") <= 10.0 + 1e-6 && (value(&list, "Stroke") - stroke(hinge)).abs() < 1e-6, "{list}");
+}
+
 /// Every tool and command the agent skills call exists, so a rename or removal can't leave the
 /// skills sending agents to names the server no longer has.
 #[test]
@@ -843,6 +1180,8 @@ fn skills_name_only_real_tools_and_commands() {
         include_str!("../../../skills/solidcraft-editing/SKILL.md"),
         include_str!("../../../skills/solidcraft-checking/SKILL.md"),
         include_str!("../../../skills/solidcraft-checking/reference/porting.md"),
+        include_str!("../../../skills/solidcraft-mechanisms/SKILL.md"),
+        include_str!("../../../skills/solidcraft-mechanisms/reference.md"),
     ];
     let mut s = server();
     let tools: Vec<String> = tool_definitions().iter().filter_map(|t| t["name"].as_str()).map(str::to_owned).collect();
@@ -1042,6 +1381,63 @@ fn remote_engine_batch_is_not_resent_after_a_lost_reply() {
     }
 }
 
+/// A bridge made before the app runs keeps its tools (#270): calls say the app is not running and
+/// how to start it (a batch was never sent, so it may not "have run"), and reach the app once it
+/// listens.
+#[test]
+fn a_bridge_made_before_the_app_runs_connects_once_it_does() {
+    use std::io::{BufRead, BufReader, Write};
+
+    use crate::backend::Backend;
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut remote = crate::Remote::new(&addr, Some("0123456789abcdef0123456789abcdef"));
+    // Still "connected to the SolidCraft app", which the skills read as bridged.
+    assert!(remote.describe().starts_with("connected to the SolidCraft app") && remote.describe().contains("not running"), "{}", remote.describe());
+    let e = remote.call("engine.execute", json!({"command": "inspect.measure"})).unwrap_err();
+    assert!(e.starts_with(crate::backend::NOT_RUNNING) && e.contains(&format!("solidcraft --control {port}")), "{e}");
+    let batch = crate::call_tool(&mut remote, "batch", &json!({"commands": [{"command": "solid.box"}]}));
+    let text = batch["content"][0]["text"].as_str().unwrap_or_default();
+    assert_eq!(batch["isError"], true);
+    assert!(text.starts_with(crate::backend::NOT_RUNNING) && !text.contains("may have run"), "{text}");
+
+    let listener = std::net::TcpListener::bind(&addr).unwrap();
+    let app = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        let req: Value = serde_json::from_str(&line).unwrap();
+        writeln!(&stream, "{}", json!({"id": req["id"], "ok": true, "result": {"answered": req["params"]["command"]}})).unwrap();
+    });
+    let got = remote.call("engine.execute", json!({"command": "inspect.measure"})).unwrap();
+    assert_eq!(got["answered"], "inspect.measure");
+    assert!(remote.describe().starts_with("connected") && !remote.describe().contains("not running"), "{}", remote.describe());
+    app.join().unwrap();
+}
+
+/// An app that quits while it runs a request may have applied it: the retry then finds nothing
+/// listening, and the error says the call may have run, not just that the app is not running.
+#[test]
+fn an_app_that_quits_during_a_call_may_have_run_it() {
+    use std::io::{BufRead, BufReader};
+
+    use crate::backend::Backend;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        // Quit without answering: the port closes first, so the retry is refused.
+        drop(listener);
+        drop(stream);
+    });
+    let mut remote = crate::Remote::connect(&addr).unwrap();
+    let e = remote.call("engine.execute", json!({"command": "solid.box"})).unwrap_err();
+    app.join().unwrap();
+    assert!(!e.starts_with(crate::backend::NOT_RUNNING) && e.contains("may have quit") && e.contains("Inspect the design"), "{e}");
+}
+
 /// Tool annotations never understate what a tool may do (#205): `screenshot` writes a file when
 /// given a `path`, and `execute`, `batch`, `save`, `export` and `open` can overwrite or delete
 /// files, so none of them is read-only and all are destructive and reach the file system.
@@ -1064,4 +1460,63 @@ fn tool_annotations_tell_the_whole_truth() {
         assert_eq!(hints(name), (false, false, false), "{name}");
     }
     assert!(tools.iter().all(|t| t["annotations"]["readOnlyHint"].is_boolean()), "every tool is annotated");
+}
+
+/// `measure` with `items` (#1392): a sketch circle's diameter and radius, and two circles'
+/// centre-to-centre with the closest and farthest distances.
+#[test]
+fn measure_items_gives_diameters_and_centre_distances() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "sketch.create", "params": {"plane": "XY"}}));
+    let a = tool(&mut s, "execute", json!({"command": "sketch.circle.center", "params": {"center": [0, 0], "radius": 3}}));
+    let b = tool(&mut s, "execute", json!({"command": "sketch.circle.center", "params": {"center": [30, 40], "radius": 2}}));
+    let id = |r: &Value| r["curves"][0].as_str().or(r["result"]["curves"][0].as_str()).unwrap().to_string();
+    let (a, b) = (id(&a), id(&b));
+    let one = tool(&mut s, "measure", json!({"items": [{"type": "sketch_curve", "id": a}]}));
+    assert_eq!((one["diameter"].as_f64(), one["radius"].as_f64()), (Some(6.0), Some(3.0)), "{one}");
+    let two = tool(&mut s, "measure", json!({"items": [{"type": "sketch_curve", "id": a}, {"type": "sketch_curve", "id": b}]}));
+    assert!((two["center_distance"].as_f64().unwrap() - 50.0).abs() < 1e-9, "{two}");
+    assert!((two["min"].as_f64().unwrap() - 45.0).abs() < 1e-9 && (two["max"].as_f64().unwrap() - 55.0).abs() < 1e-9, "{two}");
+    assert!(two["distance_mm"].is_number() && two["from"].is_array(), "{two}");
+}
+
+/// #1833: `timings` / `profile` time every step run, the failing one included, headless with the
+/// kernel's share; bridged, the app is asked to time them and its numbers are passed on.
+#[test]
+fn batch_reports_timings_and_profile() {
+    let mut s = server();
+    let steps = json!([
+        {"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}},
+        {"command": "solid.box", "params": {"length": 4, "width": 4, "height": 30, "operation": "join"}},
+    ]);
+    let r = raw_tool(&mut s, "batch", json!({"commands": steps, "profile": true}));
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rows = body["timings"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!((rows[1]["index"].as_u64(), rows[1]["command"].as_str()), (Some(1), Some("solid.box")));
+    assert!(rows[1]["profile"]["boolean_ms"].as_f64().unwrap() > 0.0, "{body}");
+    assert!(body["total_ms"].as_f64().is_some(), "{body}");
+
+    let r = raw_tool(
+        &mut s,
+        "batch",
+        json!({"timings": true, "commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}, {"command": "NoSuchCommand"}]}),
+    );
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["timings"].as_array().map(Vec::len), Some(2), "the failing step is timed too: {body}");
+    assert!(body["timings"][0].get("profile").is_none());
+    // Not asked: no timings.
+    let d = tool(&mut s, "batch", json!({"commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}]}));
+    assert!(d.get("timings").is_none(), "{d}");
+
+    let reply =
+        json!({"completed": 1, "results": [{"x": 1}], "undone": 0, "timings": [{"index": 0, "command": "a.one", "ms": 2.5}], "total_ms": 2.6});
+    let (b, body, _) = recorded_batch(Ok(reply), json!({"commands": [{"command": "a.one"}], "profile": true}));
+    assert_eq!(b.calls[0].1["timings"], true);
+    assert_eq!(b.calls[0].1["profile"], true);
+    assert_eq!((body["timings"][0]["ms"].as_f64(), body["total_ms"].as_f64()), (Some(2.5), Some(2.6)), "{body}");
+    // An app without engine.batch is timed step by step here, without a kernel split it can't measure.
+    let (_, body, _) = recorded_batch(Err("unknown method `engine.batch`".into()), json!({"commands": [{"command": "a.one"}], "profile": true}));
+    assert_eq!(body["timings"][0]["command"], "a.one", "{body}");
+    assert!(body["timings"][0].get("profile").is_none(), "{body}");
 }

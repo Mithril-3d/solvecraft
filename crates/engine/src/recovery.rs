@@ -18,13 +18,16 @@ use solidcraft_doc::Document;
 use crate::{EngineError, Result, Session};
 
 /// The recovery folder: `SOLIDCRAFT_RECOVERY_DIR`, else the platform's per-user data folder.
+/// Spelled with long names (`vfs::long_names`): an agent's commands reach it by this path, and
+/// short (8.3) names are refused there.
 pub fn default_dir() -> Option<PathBuf> {
+    use solidcraft_io::vfs::long_names;
     // Tests never touch the user's real recovery folder.
     if cfg!(test) {
-        return Some(std::env::temp_dir().join(format!("solidcraft-test-recovery-{}", std::process::id())));
+        return Some(solidcraft_io::vfs::temp_dir().join(format!("solidcraft-test-recovery-{}", std::process::id())));
     }
     if let Some(d) = solidcraft_geom::env::var_os("RECOVERY_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(d));
+        return Some(long_names(Path::new(&d)));
     }
     let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
     let root = if cfg!(windows) {
@@ -34,7 +37,7 @@ pub fn default_dir() -> Option<PathBuf> {
     } else {
         env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))?
     };
-    let (dir, legacy) = dirs_under(&root, cfg!(windows) || cfg!(target_os = "macos"));
+    let (dir, legacy) = dirs_under(&long_names(&root), cfg!(windows) || cfg!(target_os = "macos"));
     // Compatibility shim (docs/compatibility.md): autosaves made before the rename (or, in the
     // Flatpak sandbox, under the old app id) are copied to the new folder on first launch; the
     // old folder is left as it was.

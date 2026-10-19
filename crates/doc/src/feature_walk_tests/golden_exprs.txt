@@ -1,0 +1,390 @@
+body_transfer
+sketch
+  inputs:
+    Angle = sketch.angle (Angle)
+    Offset = sketch.offset (Length)
+  expressions: sketch.angle, sketch.offset
+sketch_along_path
+  inputs:
+    Distance (0 to 1) = sketch.t (Unitless)
+  expressions: sketch.t
+extrude
+  inputs:
+    Distance = extrude.distance (Length)
+    Distance 2 = extrude.distance2 (Length)
+    Start offset = extrude.start_offset (Length)
+    Taper angle = extrude.taper (Angle)
+    To offset = extrude.to_offset (Length)
+  expressions: extrude.distance, extrude.distance2, extrude.start_offset, extrude.taper, extrude.to_offset
+extrude_thin
+  inputs:
+    Distance = thin.distance (Length)
+    Distance 2 = thin.distance2 (Length)
+    Start offset = thin.start_offset (Length)
+    Taper angle = thin.taper (Angle)
+    To offset = thin.to_offset (Length)
+    Thickness = thin.thickness (Length)
+    Thickness 2 = thin.thickness2 (Length)
+  expressions: thin.distance, thin.distance2, thin.start_offset, thin.taper, thin.to_offset, thin.thickness, thin.thickness2
+revolve
+  inputs:
+    Angle = revolve.angle (Angle)
+    Angle 2 = revolve.angle2 (Angle)
+  expressions: revolve.angle, revolve.angle2
+fillet_constant
+  inputs:
+    Radius = fillet.radius (Length)
+  expressions: fillet.radius
+fillet_chord
+  inputs:
+    Chord length = fillet.radius (Length)
+  expressions: fillet.radius
+fillet_curvature
+  inputs:
+    Equivalent radius = fillet.radius (Length)
+  expressions: fillet.radius
+fillet_variable
+  inputs:
+    Start radius = fillet.radius (Length)
+    End radius = fillet.radius2 (Length)
+    Mid radius = fillet.mid (Length)
+  expressions: fillet.radius, fillet.radius2, fillet.mid
+fillet_spline
+  inputs:
+    Start radius = fillet.radius (Length)
+    Control radius = fillet.r1 (Length)
+    Control radius = fillet.r2 (Length)
+    End radius = fillet.r3 (Length)
+  expressions: fillet.radius, fillet.r1, fillet.r2, fillet.r3
+chamfer
+  inputs:
+    Distance = chamfer.distance (Length)
+    Distance 2 = chamfer.distance2 (Length)
+    Angle = chamfer.angle (Angle)
+  expressions: chamfer.distance, chamfer.distance2, chamfer.angle
+box
+  inputs:
+    Length = box.length (Length)
+    Width = box.width (Length)
+    Height = box.height (Length)
+  expressions: box.length, box.width, box.height, box.x, box.y, box.z
+cylinder
+  inputs:
+    Radius = cyl.radius (Length)
+    Height = cyl.height (Length)
+  expressions: cyl.radius, cyl.height, cyl.x, cyl.y, cyl.z
+sphere
+  inputs:
+    Radius = sph.radius (Length)
+  expressions: sph.radius, sph.x, sph.y, sph.z
+torus
+  inputs:
+    Major radius = tor.major (Length)
+    Minor radius = tor.minor (Length)
+  expressions: tor.major, tor.minor, tor.x, tor.y, tor.z
+combine
+pattern_rectangular
+  inputs:
+    Quantity = rect.count1 (Unitless)
+    Spacing = rect.spacing1 (Length)
+    Quantity 2 = rect.count2 (Unitless)
+    Spacing 2 = rect.spacing2 (Length)
+  expressions: rect.count1, rect.spacing1, rect.count2, rect.spacing2
+pattern_circular
+  inputs:
+    Quantity = circ.count (Unitless)
+    Total angle = circ.angle (Angle)
+  expressions: circ.count, circ.angle
+pattern_path
+  inputs:
+    Quantity = path.count (Unitless)
+    Distance = path.spacing (Length)
+  expressions: path.count, path.spacing
+mirror
+  inputs:
+    Angle = mirror.angle (Angle)
+    Offset = mirror.offset (Length)
+  expressions: mirror.angle, mirror.offset
+hole_simple
+  inputs:
+    Diameter = hole.diameter (Length)
+    Depth = hole.depth (Length)
+  expressions: hole.diameter, hole.depth
+hole_drilled
+  inputs:
+    Diameter = hole.diameter (Length)
+    Depth = hole.depth (Length)
+    Tip angle = hole.tip_angle (Angle)
+  expressions: hole.diameter, hole.depth, hole.tip_angle
+hole_counterbore
+  inputs:
+    Diameter = hole.diameter (Length)
+    Depth = hole.depth (Length)
+    Counterbore diameter = hole.cb_diameter (Length)
+    Counterbore depth = hole.cb_depth (Length)
+  expressions: hole.diameter, hole.depth, hole.cb_diameter, hole.cb_depth
+hole_countersink
+  inputs:
+    Diameter = hole.diameter (Length)
+    Depth = hole.depth (Length)
+    Countersink diameter = hole.cs_diameter (Length)
+    Countersink angle = hole.cs_angle (Angle)
+  expressions: hole.diameter, hole.depth, hole.cs_diameter, hole.cs_angle
+thread
+  inputs:
+    Length = thread.length (Length)
+  expressions: thread.length
+loft
+sweep
+sweep_options
+  inputs:
+    Twist = sweep.twist (Angle)
+    Scale = sweep.scale (Unitless)
+  expressions: sweep.twist, sweep.scale
+shell
+  inputs:
+    Thickness = shell.thickness (Length)
+  expressions: shell.thickness
+draft
+  inputs:
+    Angle = draft.angle (Angle)
+    Angle = draft_neutral.angle (Angle)
+    Offset = draft_neutral.offset (Length)
+  expressions: draft.angle, draft_neutral.angle, draft_neutral.offset
+construction_plane
+  inputs:
+    Angle = cplane.angle (Angle)
+    Offset = cplane.offset (Length)
+  expressions: cplane.angle, cplane.offset
+split
+  inputs:
+    Angle = split.angle (Angle)
+    Offset = split.offset (Length)
+  expressions: split.angle, split.offset
+split_line
+  inputs:
+    Angle = split_line.angle (Angle)
+    Offset = split_line.offset (Length)
+  expressions: split_line.angle, split_line.offset
+construction_axis
+  inputs:
+    Angle = axis_a.angle (Angle)
+    Offset = axis_a.offset (Length)
+    Angle = axis_b.angle (Angle)
+    Offset = axis_b.offset (Length)
+  expressions: axis_a.angle, axis_a.offset, axis_b.angle, axis_b.offset
+construction_point_planes
+  inputs:
+    Angle = pt_a.angle (Angle)
+    Offset = pt_a.offset (Length)
+    Angle = pt_b.angle (Angle)
+    Offset = pt_b.offset (Length)
+    Angle = pt_c.angle (Angle)
+    Offset = pt_c.offset (Length)
+  expressions: pt_a.angle, pt_a.offset, pt_b.angle, pt_b.offset, pt_c.angle, pt_c.offset
+construction_point_along
+  inputs:
+    Distance (0 to 1) = pt.t (Unitless)
+  expressions: pt.t
+split_face
+  inputs:
+    Angle = split_face.angle (Angle)
+    Offset = split_face.offset (Length)
+  expressions: split_face.angle, split_face.offset
+scale
+  inputs:
+    Scale factor = scale.factor (Unitless)
+    X scale = scale.x (Unitless)
+    Y scale = scale.y (Unitless)
+    Z scale = scale.z (Unitless)
+  expressions: scale.factor, scale.x, scale.y, scale.z
+offset_face
+  inputs:
+    Distance = offset_face.distance (Length)
+  expressions: offset_face.distance
+delete_face
+bounding_solid
+  inputs:
+    Margin = bounding.margin (Length)
+  expressions: bounding.margin
+pipe
+  inputs:
+    Diameter = pipe.diameter (Length)
+    Wall = pipe.wall (Length)
+  expressions: pipe.diameter, pipe.wall
+emboss
+  inputs:
+    Depth = emboss.depth (Length)
+  expressions: emboss.depth
+rib
+  inputs:
+    Thickness = rib.thickness (Length)
+    Depth = rib.depth (Length)
+  expressions: rib.thickness, rib.depth
+replace_face
+  inputs:
+    Angle = replace_face.angle (Angle)
+    Offset = replace_face.offset (Length)
+  expressions: replace_face.angle, replace_face.offset
+align
+coil
+  inputs:
+    Diameter = coil.diameter (Length)
+    Pitch = coil.pitch (Length)
+    Revolutions = coil.turns (Unitless)
+    Section size = coil.section_size (Length)
+    Start angle = coil.start_angle (Angle)
+  expressions: coil.diameter, coil.pitch, coil.turns, coil.section_size, coil.start_angle, coil.x, coil.y, coil.z
+sheet_base
+sheet_contour
+  inputs:
+    Distance = contour.distance (Length)
+  expressions: contour.distance
+sheet_flange
+  inputs:
+    Height = flange.height (Length)
+    Angle = flange.angle (Angle)
+    Bend radius = flange.radius (Length)
+    Edge angle = flange.e1_angle (Angle)
+    Edge height = flange.e1_height (Length)
+    Edge height = flange.e2_height (Length)
+    Corner relief = flange.relief (Length)
+  expressions: flange.height, flange.angle, flange.radius, flange.e1_angle, flange.e1_height, flange.e2_height, flange.relief
+sheet_hem
+  inputs:
+    Length = hem.length (Length)
+    Gap = hem.gap (Length)
+  expressions: hem.length, hem.gap
+sheet_perforate
+  inputs:
+    Diameter = perforate.diameter (Length)
+    Pitch = perforate.pitch (Length)
+    Margin = perforate.margin (Length)
+  expressions: perforate.diameter, perforate.pitch, perforate.margin
+sheet_fold
+  inputs:
+    Angle = fold.angle (Angle)
+    Bend radius = fold.radius (Length)
+  expressions: fold.angle, fold.radius
+sheet_unfold
+sheet_convert
+boss
+  inputs:
+    Diameter = boss.diameter (Length)
+    Height = boss.height (Length)
+    Hole diameter = boss.hole_diameter (Length)
+    Hole depth = boss.hole_depth (Length)
+    Draft angle = boss.draft (Angle)
+    Root fillet = boss.fillet (Length)
+    Ribs = boss.ribs (Unitless)
+    Rib thickness = boss.rib_thickness (Length)
+    Rib length = boss.rib_length (Length)
+    Rib offset = boss.rib_offset (Length)
+  expressions: boss.diameter, boss.height, boss.hole_diameter, boss.hole_depth, boss.draft, boss.fillet, boss.ribs, boss.rib_thickness, boss.rib_length, boss.rib_offset
+lip
+  inputs:
+    Width = lip.width (Length)
+    Height = lip.height (Length)
+    Gap = lip.gap (Length)
+  expressions: lip.width, lip.height, lip.gap
+snap_fit
+  inputs:
+    Length = snap.length (Length)
+    Thickness = snap.thickness (Length)
+    Width = snap.width (Length)
+    Catch depth = snap.catch_depth (Length)
+    Catch length = snap.catch_length (Length)
+  expressions: snap.length, snap.thickness, snap.width, snap.catch_depth, snap.catch_length
+rest
+  inputs:
+    Width = rest.width (Length)
+    Height = rest.height (Length)
+    Length = rest.length (Length)
+    Draft angle = rest.draft (Angle)
+    Wall thickness = rest.thickness (Length)
+  expressions: rest.width, rest.height, rest.length, rest.draft, rest.thickness
+boundary_fill
+remove
+patch
+stitch
+  inputs:
+    Tolerance = stitch.tolerance (Length)
+  expressions: stitch.tolerance
+thicken
+  inputs:
+    Thickness = thicken.thickness (Length)
+  expressions: thicken.thickness
+surface_extrude
+  inputs:
+    Distance = surface_extrude.distance (Length)
+    Distance 2 = surface_extrude.distance2 (Length)
+    Start offset = surface_extrude.start_offset (Length)
+    Taper angle = surface_extrude.taper (Angle)
+    To offset = surface_extrude.to_offset (Length)
+  expressions: surface_extrude.distance, surface_extrude.distance2, surface_extrude.start_offset, surface_extrude.taper, surface_extrude.to_offset
+surface_revolve
+  inputs:
+    Angle = srev.angle (Angle)
+    Angle 2 = srev.angle2 (Angle)
+  expressions: srev.angle, srev.angle2
+surface_sweep
+surface_sweep_options
+  inputs:
+    Twist = surface_sweep.twist (Angle)
+    Scale = surface_sweep.scale (Unitless)
+  expressions: surface_sweep.twist, surface_sweep.scale
+surface_loft
+surface_blend
+surface_offset
+  inputs:
+    Distance = soff.distance (Length)
+    Tolerance = soff.tolerance (Length)
+  expressions: soff.distance, soff.tolerance
+surface_blend
+surface_boundary
+surface_network
+surface_match
+surface_fair
+  inputs:
+    Tolerance = sfair.tolerance (Length)
+  expressions: sfair.tolerance
+unstitch
+reverse_normal
+surface_untrim
+surface_extend
+  inputs:
+    Distance = extend.distance (Length)
+  expressions: extend.distance
+surface_extend_to_plane
+  inputs:
+    Distance = extend.distance (Length)
+    Angle = extend.angle (Angle)
+    Offset = extend.offset (Length)
+  expressions: extend.distance, extend.angle, extend.offset
+surface_extend_to_face
+  inputs:
+    Distance = extend.distance (Length)
+  expressions: extend.distance
+surface_ruled
+  inputs:
+    Distance = ruled.distance (Length)
+    Angle = ruled.angle (Angle)
+  expressions: ruled.distance, ruled.angle
+surface_trim
+  inputs:
+    Angle = trim.angle (Angle)
+    Offset = trim.offset (Length)
+  expressions: trim.angle, trim.offset
+move
+  inputs:
+    X distance = move.x (Length)
+    Y distance = move.y (Length)
+    Z distance = move.z (Length)
+    Angle = move.angle (Angle)
+  expressions: move.x, move.y, move.z, move.angle
+import
+mesh_convert
+  inputs:
+    Tolerance = mesh_convert.tolerance (Length)
+  expressions: mesh_convert.tolerance
+mesh_import

@@ -1,0 +1,16 @@
+name: Feature request
+description: Something SolidCraft should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do
+      description: The part or workflow you have in mind, and where SolidCraft gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How you imagine it working
+      description: Optional. Describe the behaviour in your own words; please don't paste another product's documentation.

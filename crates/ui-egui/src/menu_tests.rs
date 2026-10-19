@@ -286,18 +286,23 @@ fn folder_and_group_menus_make_rename_and_drop_groups() {
     let names: Vec<String> = app.session.model.state().bodies.iter().map(|b| b.name.clone()).collect();
     let items: Vec<_> = names.iter().map(|n| json!({"type": "body", "name": n})).collect();
     app.run("select.set", json!({ "items": items })).unwrap();
-    let folder = Target::Folder { component: 0, folder: "bodies".into() };
+    let folder = Target::Folder { component: 0, folder: "bodies".into(), scope: "c0".into() };
     act(&mut app, &folder, "Group Selected");
     let g = app.session.doc.browser_groups[0].clone();
     assert_eq!(g.items.len(), 2);
     // A body's menu offers grouping too while several are selected.
     assert!(context_menu::items(&app, &Target::Body { name: names[0].clone() }).iter().any(|i| i.label == "Group Selected"));
-    let t = Target::Group { id: g.id };
+    let t = Target::Group { id: g.id, scope: "c0".into() };
     act(&mut app, &t, "Rename");
     assert!(context_menu::finish_rename(&mut app, Some("Parts"), true));
     assert_eq!(app.session.doc.browser_groups[0].name, "Parts");
+    // Show/Hide hides the group itself: its bodies keep their own state but aren't drawn.
     act(&mut app, &t, "Show/Hide");
-    assert_eq!(app.session.visibility.hidden_bodies.len(), 2);
+    assert!(app.session.visibility.hidden_bodies.is_empty());
+    assert!(app.session.folder_hidden(&format!("c0/g{}", g.id)));
+    assert!(g.items.iter().all(|b| !app.session.body_visible(b)));
+    act(&mut app, &t, "Show/Hide");
+    assert!(g.items.iter().all(|b| app.session.body_visible(b)));
     act(&mut app, &t, "Ungroup");
     assert!(app.session.doc.browser_groups.is_empty());
     act(&mut app, &folder, "New Group");
@@ -419,7 +424,7 @@ fn canvas_menu_hides_renames_calibrates_and_deletes() {
     assert!(app.session.doc.canvases.is_empty());
 }
 
-/// The canvas and browser menus keep Fusion's items in Fusion's order (the ones we have).
+/// The canvas and browser menus keep their items in a fixed order.
 #[test]
 fn menus_follow_fusion_order() {
     let mut app = sample_app();
@@ -484,7 +489,7 @@ fn menus_follow_fusion_order() {
             "Find in Timeline",
         ],
     );
-    let folder = context_menu::items(&app, &Target::Folder { component: 0, folder: "bodies".into() });
+    let folder = context_menu::items(&app, &Target::Folder { component: 0, folder: "bodies".into(), scope: "c0".into() });
     order(&folder, &["Create Components from Bodies", "New Group", "Show/Hide", "Show All"]);
     let origin = context_menu::items(&app, &Target::Origin);
     order(&origin, &["Show/Hide", "Show All", "Hide Planes", "Hide Axes"]);
@@ -660,10 +665,143 @@ fn toolbar_pins_removes_reorders_and_keeps_its_layout() {
 }
 
 #[test]
-fn the_workspace_menu_lists_design_and_greys_the_rest() {
+fn the_workspace_menu_lists_design_and_render_and_greys_future_workspaces() {
     let app = sample_app();
     let items = context_menu::items(&app, &Target::Workspace);
     assert!(find(&items, "Design").enabled);
-    assert!(!find(&items, "Render").enabled && find(&items, "Render").shortcut == "coming later");
+    assert!(find(&items, "Render").enabled);
+    assert!(!find(&items, "Animation").enabled);
     assert!(!items.iter().any(|i| i.label.contains("Generative")));
+}
+
+/// A right-click on a construction plane's browser row opens its menu, like a body's or a
+/// sketch's row, and the menu's items act on that plane.
+#[test]
+fn construction_plane_row_opens_its_menu() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 40, "width": 40, "height": 10, "body_name": "Block"})).unwrap();
+    h.app.run("construct.plane.offset", json!({"base": "XY", "offset": 25, "name": "Cut"})).unwrap();
+    let id = h.app.session.doc.find_feature("Cut").map(|f| f.id).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+    h.frames(3);
+    let at = crate::scenario::handle_at("row:Cut").expect("the plane has a browser row");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "button": "right"}));
+    h.frames(2);
+    let menu = h.call("ui.menu", json!({}));
+    let menu = &menu["result"];
+    assert_eq!(menu["open"], true, "{menu}");
+    assert_eq!(menu["target"], json!({"type": "plane", "id": id}), "{menu}");
+    let labels: Vec<&str> = menu["items"].as_array().unwrap().iter().filter_map(|i| i["label"].as_str()).filter(|l| !l.is_empty()).collect();
+    assert_eq!(labels, ["Create Sketch", "Edit Feature", "Delete", "Rename", "Show/Hide", "Find in Timeline"]);
+    assert_eq!(h.app.session.selection, vec![solidcraft_engine::Sel::Plane { name: "Cut".into() }], "the right-click picks the plane");
+    context_menu::close(&mut h.app);
+
+    let t = Target::Plane { id };
+    act(&mut h.app, &t, "Show/Hide");
+    assert!(h.app.session.visibility.hidden_origin.contains(&"Cut".to_string()));
+    act(&mut h.app, &t, "Show/Hide");
+    assert!(!h.app.session.visibility.hidden_origin.contains(&"Cut".to_string()));
+    act(&mut h.app, &t, "Rename");
+    assert!(context_menu::finish_rename(&mut h.app, Some("Section"), true));
+    assert!(h.app.session.doc.find_feature("Section").is_some_and(|f| f.id == id));
+    act(&mut h.app, &t, "Find in Timeline");
+    assert_eq!(h.app.session.selection, vec![solidcraft_engine::Sel::Feature { id }]);
+    act(&mut h.app, &t, "Edit Feature");
+    assert!(h.app.dialog.is_some(), "Edit Feature opens the plane's dialog");
+    h.app.dialog = None;
+    act(&mut h.app, &t, "Delete");
+    assert!(h.app.session.doc.feature(id).is_none(), "nothing depends on the plane: it goes at once");
+}
+
+/// A right-click on a plane offers a sketch on it (#1354): an origin plane in the viewport (it
+/// stays unselected), an origin plane's browser row and a construction plane's row. Picking it
+/// starts the sketch on that plane.
+#[test]
+fn right_click_on_a_plane_offers_a_sketch_on_it() {
+    use solidcraft_engine::geom::Vec3;
+    let normal = |h: &crate::scenario::Harness| h.app.session.world_state().sketches.first().map(|s| s.plane.normal()).unwrap_or_default();
+    for (plane, axis) in [("XY", Vec3::Z), ("XZ", Vec3::Y), ("YZ", Vec3::X)] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.settle();
+        let p = h.at(&json!({"plane": plane})).unwrap();
+        h.call("ui.menu", json!({"x": p[0], "y": p[1]}));
+        let menu = h.call("ui.menu", json!({}))["result"].clone();
+        let items = menu["items"].as_array().unwrap();
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).filter(|l| !l.is_empty()).collect();
+        assert_eq!(labels[..3], ["Select Other…", "Create Sketch", "Pan"], "{plane}: {labels:?}");
+        let sketch = items.iter().find(|i| i["label"] == "Create Sketch").unwrap();
+        assert_eq!(sketch["params"], json!({"plane": plane}));
+        assert!(h.app.session.selection.is_empty(), "the right-click leaves the plane unselected");
+        assert_eq!(h.call("ui.menuPick", json!({"item": "Create Sketch"}))["ok"], true);
+        assert!(h.app.session.active_sketch.is_some(), "{plane}: picking it starts a sketch");
+        assert!(normal(&h).dot(axis).abs() > 0.999, "{plane}: sketched on {:?}", normal(&h));
+    }
+
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    crate::browser::toggle(&mut h.app, "origin", false);
+    h.frames(3);
+    let at = crate::scenario::handle_at("row:XZ").expect("the Origin folder lists XZ");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "button": "right"}));
+    h.frames(2);
+    let menu = h.call("ui.menu", json!({}))["result"].clone();
+    assert_eq!(menu["target"], json!({"type": "origin_plane", "name": "XZ"}), "{menu}");
+    let t = Target::OriginPlane { name: "XZ".into() };
+    act(&mut h.app, &t, "Show/Hide");
+    assert!(h.app.session.visibility.hidden_origin.contains(&"XZ".to_string()));
+    act(&mut h.app, &t, "Show/Hide");
+    assert!(!h.app.session.visibility.hidden_origin.contains(&"XZ".to_string()));
+    context_menu::close(&mut h.app);
+    // The toolbar's Create Sketch is already waiting for a plane: the menu's replaces it.
+    h.app.start("sketch.create");
+    assert!(h.app.dialog.is_some());
+    act(&mut h.app, &t, "Create Sketch");
+    h.frames(3);
+    assert!(h.app.dialog.is_none(), "no Create Sketch dialog is left waiting for a plane");
+    assert!(normal(&h).dot(Vec3::Y).abs() > 0.999);
+
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("construct.plane.offset", json!({"base": "XY", "offset": 25, "name": "Cut"})).unwrap();
+    let id = h.app.session.doc.find_feature("Cut").map(|f| f.id).unwrap();
+    act(&mut h.app, &Target::Plane { id }, "Create Sketch");
+    h.frames(3);
+    let sketch = h.app.session.active_sketch.and_then(|s| h.app.session.world_state().sketch(s).map(|s| s.plane.origin.z));
+    assert_eq!(sketch, Some(25.0), "the sketch is on the construction plane");
+}
+
+/// Menus opened near the window's bottom right corner, in the viewport or the browser, open up
+/// or to the left where they would not fit, ending at the cursor and staying in the window, at
+/// any UI scale (#1354).
+#[test]
+fn menus_near_the_window_corner_open_inward() {
+    for scale in [0.7, 1.0, 1.5] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.call("ui.prefs", json!({"ui_scale": scale}));
+        let screen = h.ctx.content_rect();
+        let vp = h.app.viewport.rect.unwrap();
+        let at = vp.right_bottom() - egui::vec2(40.0, 40.0);
+        for target in [None, Some(json!({"type": "origin"}))] {
+            let mut params = json!({"x": at.x, "y": at.y});
+            if let Some(t) = &target {
+                params["target"] = t.clone();
+            }
+            h.call("ui.menu", params);
+            assert_eq!(h.call("ui.menu", json!({}))["result"]["open"], true, "{scale} {target:?}");
+            // An auto-sized menu takes a few frames to settle its size.
+            h.frames(3);
+            let r = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_context_menu"))).unwrap();
+            assert!(screen.contains_rect(r), "{scale} {target:?}: {r:?} outside {screen:?}");
+            // Below and right of the cursor where it fits, else ending at it.
+            let x = if at.x + r.width() <= screen.right() { at.x } else { at.x - r.width() };
+            let y = if at.y + r.height() <= screen.bottom() { at.y } else { at.y - r.height() };
+            assert!((r.left() - x).abs() <= 2.0 && (r.top() - y).abs() <= 2.0, "{scale} {target:?}: {r:?} for {at:?} in {screen:?}");
+            if target.is_none() {
+                assert!((r.bottom() - at.y).abs() <= 2.0, "{scale}: the empty-space menu is too tall for below and opens above");
+            }
+            context_menu::close(&mut h.app);
+            h.frames(2);
+        }
+    }
 }

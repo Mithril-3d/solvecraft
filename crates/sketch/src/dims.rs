@@ -178,10 +178,51 @@ fn arc_pts(c: Vec2, r: f64, a0: f64, sweep: f64) -> Vec<Vec2> {
     (0..=n).map(|i| c + Vec2::from_angle(a0 + sweep * i as f64 / n as f64) * r).collect()
 }
 
+/// The lines a linear dimension's two extension lines may start from (#1361), for its `p0` and
+/// `p1` sides: a dimension to a line reaches the nearest part of that line, not the foot of the
+/// measured point, and a dimension between two parallel lines reaches the nearest part of the
+/// line whose end it measures from. `None` for a side that measures a point.
+pub fn dim_reach(sk: &Sketch, k: &ConstraintKind) -> [Option<(Vec2, Vec2)>; 2] {
+    use ConstraintKind::*;
+    let (p, l, to_line) = match *k {
+        PointLineDistance { p, l, .. } => (p, l, true),
+        LinearDiameter { p, l, .. } => (p, l, false),
+        _ => return [None, None],
+    };
+    let Some((a, b)) = line_ends(sk, l) else { return [None, None] };
+    let d = b - a;
+    // A line ending at `p` that runs parallel to `l`.
+    let parallel = sk.curves.iter().enumerate().find_map(|(i, c)| match c.kind {
+        CurveKind::Line { a: pa, b: pb } if i != l && (pa == p || pb == p) => {
+            let (u, v) = line_ends(sk, i)?;
+            let e = v - u;
+            (e.len() > 1e-12 && d.cross(e).abs() <= 1e-9 * d.len() * e.len()).then_some((u, v))
+        }
+        _ => None,
+    });
+    [to_line.then_some((a, b)), parallel]
+}
+
+/// The point of segment `s` nearest `q`.
+fn nearest_on(s: (Vec2, Vec2), q: Vec2) -> Vec2 {
+    let d = s.1 - s.0;
+    let l2 = d.dot(d);
+    if !(l2 > 1e-24) {
+        return s.0;
+    }
+    s.0 + d * ((q - s.0).dot(d) / l2).clamp(0.0, 1.0)
+}
+
 /// Lay a dimension out. `text` is the stored text position (None: the default place), `px`
 /// the sketch length of one screen pixel and `half` the half size of the text box (sketch
 /// units), which the dimension line leaves a gap for.
 pub fn dim_layout(f: &DimFrame, text: Option<Vec2>, px: f64, half: Vec2) -> DimLayout {
+    dim_layout_reaching(f, text, px, half, [None, None])
+}
+
+/// [`dim_layout`] with the extension lines of a linear dimension starting from the nearest
+/// point of the geometry in `reach` ([`dim_reach`]) instead of the measured points.
+pub fn dim_layout_reaching(f: &DimFrame, text: Option<Vec2>, px: f64, half: Vec2, reach: [Option<(Vec2, Vec2)>; 2]) -> DimLayout {
     let px = if px.is_finite() && px > 0.0 { px } else { 1.0 };
     let arrow = 9.0 * px;
     let gap = 3.0 * px;
@@ -196,7 +237,8 @@ pub fn dim_layout(f: &DimFrame, text: Option<Vec2>, px: f64, half: Vec2) -> DimL
             // The dimension line sits `h` across from the middle of the measured points.
             let q0 = p0 + n * (h - (p0 - m).dot(n));
             let q1 = p1 + n * (h - (p1 - m).dot(n));
-            for (p, q) in [(p0, q0), (p1, q1)] {
+            for ((p, q), r) in [(p0, q0), (p1, q1)].into_iter().zip(reach) {
+                let p = r.map_or(p, |r| nearest_on(r, q));
                 let v = q - p;
                 if let Some(u) = v.normalized() {
                     out.lines.push(vec![p + u * gap.min(v.len()), q + u * over]);
@@ -374,5 +416,36 @@ mod tests {
         let l = dim_layout(&DimFrame::Angular { vertex, d0, sweep }, None, 0.1, Vec2::ZERO);
         assert_eq!(l.arrows.len(), 2);
         assert!(l.text.x > 0.0 && l.text.y > 0.0);
+    }
+
+    #[test]
+    fn extension_lines_reach_the_nearest_part_of_the_lines_measured() {
+        // #1361: two parallel lines dimensioned from the low end of one; the dimension placed
+        // across their middles needs no extension lines, one placed above them reaches their
+        // top ends, not the low end.
+        let mut sk = Sketch::new();
+        let l = sk.add_line(Vec2::new(0.0, -100.0), Vec2::new(0.0, 100.0), None, None, None).unwrap_or(0);
+        let m = sk.add_line(Vec2::new(30.0, -80.0), Vec2::new(30.0, 90.0), None, None, None).unwrap_or(0);
+        let p = sk.curves[m].kind.point_ids()[0];
+        let k = ConstraintKind::PointLineDistance { p, l, value: 30.0 };
+        let f = dim_frame(&sk, &k).unwrap_or(DimFrame::Radial { center: Vec2::ZERO, radius: 1.0, diameter: false });
+        let reach = dim_reach(&sk, &k);
+        assert!(reach[0].is_some() && reach[1].is_some());
+        let extension_ys = |at: Vec2| -> Vec<(f64, f64)> {
+            let lay = dim_layout_reaching(&f, Some(encode_text(&f, at)), 0.1, Vec2::new(2.0, 1.0), reach);
+            lay.lines.iter().filter(|line| line.len() == 2 && (line[0].x - line[1].x).abs() < 1e-9).map(|line| (line[0].y, line[1].y)).collect()
+        };
+        assert!(extension_ys(Vec2::new(15.0, 50.0)).is_empty(), "{:?}", extension_ys(Vec2::new(15.0, 50.0)));
+        let above = extension_ys(Vec2::new(15.0, 120.0));
+        assert_eq!(above.len(), 2);
+        assert!((above[0].0 - 100.3).abs() < 1e-9 && (above[1].0 - 90.3).abs() < 1e-9, "{above:?}");
+        // Without the lines' reach the extension lines start at the measured point's height.
+        let lay = dim_layout(&f, Some(encode_text(&f, Vec2::new(15.0, 120.0))), 0.1, Vec2::new(2.0, 1.0));
+        assert!(lay.lines.iter().any(|line| (line[0].y + 79.7).abs() < 1e-9));
+        // A point that is not the end of a parallel line keeps its own extension line.
+        let mut sk = Sketch::new();
+        let l = sk.add_line(Vec2::new(0.0, -100.0), Vec2::new(0.0, 100.0), None, None, None).unwrap_or(0);
+        let q = sk.add_point(Vec2::new(30.0, -80.0), None).unwrap_or(0);
+        assert!(dim_reach(&sk, &ConstraintKind::PointLineDistance { p: q, l, value: 30.0 })[1].is_none());
     }
 }

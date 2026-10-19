@@ -2,6 +2,8 @@
   {"note": "Alias preset (#304): Shift+Alt+left drag orbits, Shift+Alt+middle pans, Shift+Alt+right zooms (down: out, up: in). Other presets don't navigate with Shift+Alt+left."},
   {"call": "engine.execute", "params": {"command": "solid.box", "params": {"length": 20, "width": 10, "height": 5}}},
   {"call": "ui.prefs", "params": {"nav": "alias"}},
+  {"note": "The orbit centre is its own preference, and the origin and cursor pivots move the camera's target: pin the view centre (the default) here so `panned` measures the binding, not the pivot."},
+  {"call": "ui.prefs", "params": {"orbit_around": "view_centre"}},
   {"expect": {"prefs": {"nav": "alias"}}},
 
   {"note": "Orbit: like a right drag (from the drag threshold on), and Shift (part of the binding) doesn't snap."},

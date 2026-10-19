@@ -19,7 +19,7 @@ pub use tools::{call_tool, tool_definitions};
 
 use std::path::PathBuf;
 
-use solidcraft_engine::io::vfs::PathScope;
+use solidcraft_engine::io::vfs::{self, PathScope};
 
 /// The folders `solidcraft-cli mcp` lets its agent read, write and delete in by default: the
 /// app's own recovery folder, this server's private scratch folder (screenshots), and each
@@ -48,16 +48,19 @@ pub fn agent_scope_with(recovery: Option<PathBuf>, allowed: impl IntoIterator<It
 
 /// This server's own folder for screenshots it reads back and deletes (`screenshot` without a
 /// `path`): a new `<temp>/solidcraft-mcp-<pid>-<n>` made on first use (never one that was there
-/// already, which could be someone else's), private to the user on Unix.
+/// already, which could be someone else's), private to the user on Unix. `<temp>` is spelled with
+/// long names (`vfs::temp_dir`), since the scope refuses short (8.3) ones.
 pub fn scratch_dir() -> Option<PathBuf> {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let mut b = std::fs::DirBuilder::new();
+        let b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut b = b;
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         (0..16u32).find_map(|i| {
-            let d = std::env::temp_dir().join(format!("solidcraft-mcp-{}-{:x}", std::process::id(), seed.wrapping_add(i)));
+            let d = vfs::temp_dir().join(format!("solidcraft-mcp-{}-{:x}", std::process::id(), seed.wrapping_add(i)));
             b.create(&d).ok().map(|()| d)
         })
     })

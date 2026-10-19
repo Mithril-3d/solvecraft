@@ -1,21 +1,271 @@
-//! Filling a closed loop of a body's edges that is not planar with one face: a B-spline height
-//! field over the loop's best-fit plane (`solidcraft_geom::fill::fill_loop`), bounded by the
-//! body's own edges, whole. Loops that do not bound a height field over a plane are refused.
+//! Filling a closed loop of a body's edges that is not planar with one face, bounded by the
+//! body's own edges, whole: a B-spline height field over the loop's best-fit plane
+//! (`solidcraft_geom::fill::fill_loop`) when the patch only has to meet the edges (G0) and the
+//! loop bounds one; otherwise the general fill (`solidcraft_geom::fill_general`), developed from
+//! the loop itself, which also meets the faces beside the loop with G1 or G2 and passes through
+//! given points.
 
 use solidcraft_geom::Vec3;
 use solidcraft_geom::bspline::SplineError;
+use solidcraft_geom::fill_general::{Across, FillSpec, MAX_FILL_POINTS, Station};
 use truck_modeling as mt;
 
 use crate::body::{Body, from_p3};
+use crate::bridge::{Continuity, frames_across};
 use crate::plane_fit::EdgeSampler;
 use crate::record::{Rebuild, rebuilt_body};
 use crate::{KernelError, Result};
+
+/// How far (degrees) a G1 or G2 patch's normal may turn from its neighbour's along the loop.
+pub const PATCH_ANGLE_TOL_DEG: f64 = 0.05;
+
+/// A spline error as the patch reports it.
+fn spline_error(e: SplineError) -> KernelError {
+    match e {
+        SplineError::Unsupported(m) => KernelError::Invalid(format!("not supported yet: {m}")),
+        other => KernelError::Invalid(format!("cannot fill the loop: {other}")),
+    }
+}
+
+/// What a patch on a loop of edges must do besides filling it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatchSpec {
+    /// How every edge's neighbour is met (G0, G1 or G2).
+    pub continuity: Continuity,
+    /// Edges met otherwise: a point on the edge and its continuity.
+    pub edges: Vec<(Vec3, Continuity)>,
+    /// Points the patch passes through.
+    pub points: Vec<Vec3>,
+    /// How full the patch's middle is, `crown` times the loop's size (−0.9…3): the bump of
+    /// [`patch_edges_crowned`], laid along the general fill's own normal there (to the side its
+    /// G1/G2 neighbours' normals face) on control points clear of the loop, so the loop and the
+    /// conditions across it do not move. A general fill needs a G1 or G2 edge to crown.
+    pub crown: f64,
+}
+
+impl Default for PatchSpec {
+    fn default() -> PatchSpec {
+        PatchSpec { continuity: Continuity::G0, edges: Vec::new(), points: Vec::new(), crown: 0.0 }
+    }
+}
+
+impl PatchSpec {
+    /// Whether this is the plain patch of [`patch_edges_crowned`]: G0 everywhere, no points.
+    pub fn is_plain(&self) -> bool {
+        self.continuity == Continuity::G0 && self.edges.iter().all(|(_, g)| *g == Continuity::G0) && self.points.is_empty()
+    }
+}
+
+/// What a general fill achieved (all zero for a planar or height-field patch, which meet their
+/// edges within [`face_tolerance`] and ask nothing else).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PatchReport {
+    /// Whether the general fill made the face.
+    pub general: bool,
+    /// The farthest loop station from the surface.
+    pub gap: f64,
+    /// The largest angle (degrees) between the patch's normal and a G1/G2 neighbour's, away from
+    /// corners where the neighbours themselves disagree, and anywhere.
+    pub normal_deviation_deg: f64,
+    pub normal_deviation_all_deg: f64,
+    /// The largest difference (1/mm) between the patch's normal curvature across a G2 edge and
+    /// the neighbour's.
+    pub curvature_mismatch: f64,
+    /// The farthest point from the surface.
+    pub point_gap: f64,
+}
+
+/// [`crate::patch_edges`] meeting the faces beside the loop with the continuity `spec` asks for
+/// and passing through its points; a plain spec is exactly [`patch_edges_crowned`]. Its history
+/// is over `[body]`: the face is new, its edges the body's own.
+pub fn patch_edges_with(body: &Body, at: &[Vec3], spec: &PatchSpec) -> Result<Body> {
+    patch_edges_report(body, at, spec).map(|(b, _)| b)
+}
+
+/// [`patch_edges_with`] and what the fill achieved.
+pub fn patch_edges_report(body: &Body, at: &[Vec3], spec: &PatchSpec) -> Result<(Body, PatchReport)> {
+    if at.is_empty() || at.len() > 10_000 {
+        return Err(KernelError::Invalid("pick the edges of a closed loop".into()));
+    }
+    // A range test also throws out NaN.
+    if !(solidcraft_geom::fill::MIN_CROWN..=solidcraft_geom::fill::MAX_CROWN).contains(&spec.crown) {
+        return Err(KernelError::Invalid("a patch's crown must be between -0.9 and 3".into()));
+    }
+    let g3 = |g: Continuity| g == Continuity::G3;
+    if g3(spec.continuity) || spec.edges.iter().any(|(_, g)| g3(*g)) {
+        return Err(KernelError::Invalid("not supported yet: a patch meets its neighbours with g0, g1 or g2".into()));
+    }
+    if spec.edges.len() > 10_000 || spec.edges.iter().any(|(p, _)| !p.is_finite()) {
+        return Err(KernelError::Invalid("pick at most 10000 edges, each by a finite point, for their continuity".into()));
+    }
+    if spec.points.len() > MAX_FILL_POINTS || spec.points.iter().any(|p| !p.is_finite()) {
+        return Err(KernelError::Invalid(format!("a patch passes through at most {MAX_FILL_POINTS} finite points")));
+    }
+    if spec.is_plain() {
+        return patch_edges_crowned(body, at, spec.crown).map(|b| (b, PatchReport::default()));
+    }
+    body.require_brep("patch")?;
+    crate::guard("patch", || {
+        let chain = crate::surfaces::picked_loop(body, at)?;
+        let mut orders = vec![spec.continuity; chain.len()];
+        for (p, g) in &spec.edges {
+            let e = crate::surfaces::edge_near(body, *p).ok_or_else(|| KernelError::Invalid(format!("no edge at {p:?}")))?;
+            let k = chain
+                .iter()
+                .position(|c| c.id() == e.id())
+                .ok_or_else(|| KernelError::Invalid("a continuity pick is not on an edge of the loop".into()))?;
+            if let Some(slot) = orders.get_mut(k) {
+                *slot = *g;
+            }
+        }
+        if spec.crown != 0.0 && orders.iter().all(|g| *g == Continuity::G0) {
+            return Err(KernelError::Invalid("not supported yet: a crown on a patch through points with no g1 or g2 edge".into()));
+        }
+        general_fill(body, &chain, &orders, &spec.points, spec.crown)
+    })
+}
+
+/// One edge of the loop as the general fill samples it.
+struct Side {
+    sampler: EdgeSampler,
+    start: Vec3,
+    /// The face beside the edge, and whether its boundary runs the edge the way the loop does.
+    face: mt::Face,
+    along: bool,
+    order: Continuity,
+    /// The loop has a corner at the edge's start, and the neighbours' tangent planes disagree
+    /// there.
+    corner: bool,
+    clash: bool,
+}
+
+impl Side {
+    fn point(&mut self, t: f64) -> Option<Vec3> {
+        // The loop's corners are its vertices (an imported edge's curve may end a little off).
+        if t <= 0.0 { Some(self.start) } else { self.sampler.at(t) }
+    }
+
+    /// The loop's unit tangent at `t`, by a central difference (one-sided at the ends).
+    fn tangent(&mut self, t: f64) -> Option<Vec3> {
+        const STEP: f64 = 1e-4;
+        let (a, b) = ((t - STEP).max(0.0), (t + STEP).min(1.0));
+        let (p, q) = (self.sampler.at(a)?, self.sampler.at(b)?);
+        (q - p).normalized()
+    }
+
+    /// The face's frames at points of this edge with the loop's tangents there.
+    fn frames(&self, stations: &[(Vec3, Vec3)], size: f64, shape: bool) -> Result<Vec<(crate::Frame, Vec3)>> {
+        let along: Vec<(Vec3, Vec3)> = stations.iter().map(|(p, t)| (*p, if self.along { *t } else { *t * -1.0 })).collect();
+        frames_across(&self.face, &along, size, shape)
+    }
+}
+
+/// The general fill of the closed loop `chain` of `body`'s edges, edge `k` meeting the face beside
+/// it with `orders[k]`, passing through `points`, its middle made fuller by `crown` (see
+/// [`PatchSpec::crown`]). Call it under [`crate::guard`].
+pub(crate) fn general_fill(body: &Body, chain: &[mt::Edge], orders: &[Continuity], points: &[Vec3], crown: f64) -> Result<(Body, PatchReport)> {
+    let tol = face_tolerance(body);
+    let size = body.size().max(solidcraft_geom::LINEAR_TOL);
+    let mut sides: Vec<Side> = Vec::with_capacity(chain.len());
+    for (e, order) in chain.iter().zip(orders) {
+        let faces: Vec<&mt::Face> = body.solid.face_iter().filter(|f| f.edge_iter().any(|x| x.id() == e.id())).collect();
+        let face = match faces.as_slice() {
+            [f] => (*f).clone(),
+            [f, ..] if *order == Continuity::G0 => (*f).clone(),
+            [] => return Err(KernelError::Failed("patch: an edge of the loop bounds no face".into())),
+            _ => return Err(KernelError::Invalid("an edge of the loop lies between two faces: g1 and g2 need the one face beside it".into())),
+        };
+        let along = face
+            .boundaries()
+            .iter()
+            .flat_map(|w| w.edge_iter())
+            .find(|x| x.id() == e.id())
+            .map(|x| x.orientation() == e.orientation())
+            .ok_or_else(|| KernelError::Failed("patch: the face beside an edge does not hold it".into()))?;
+        let sampler = EdgeSampler::new(e).ok_or_else(|| KernelError::Invalid("an edge has no parameter range".into()))?;
+        sides.push(Side { sampler, start: from_p3(e.front().point()), face, along, order: *order, corner: false, clash: false });
+    }
+    // The corners: where the loop's tangent turns, and where the faces beside it disagree.
+    let n = sides.len();
+    for k in 0..n {
+        let prev = (k + n - 1) % n;
+        let (Some(t_in), Some(t_out)) = (sides.get_mut(prev).and_then(|s| s.tangent(1.0)), sides.get_mut(k).and_then(|s| s.tangent(0.0))) else {
+            return Err(KernelError::Invalid("an edge of the loop has no tangent".into()));
+        };
+        let Some(vertex) = sides.get(k).map(|s| s.start) else { continue };
+        let corner = t_in.dot(t_out) < CORNER_DEG.to_radians().cos();
+        let normal = |s: Option<&Side>, t: Vec3| -> Result<Vec3> {
+            let s = s.ok_or_else(|| KernelError::Failed("patch: side".into()))?;
+            let f = s.frames(&[(vertex, t)], size, false)?;
+            f.first().map(|f| f.1).ok_or_else(|| KernelError::Failed("patch: frame".into()))
+        };
+        let g1 = |s: Option<&Side>| s.is_some_and(|s| s.order != Continuity::G0);
+        let clash = if g1(sides.get(prev)) || g1(sides.get(k)) {
+            let (a, b) = (normal(sides.get(prev), t_in)?, normal(sides.get(k), t_out)?);
+            a.dot(b).abs() < (2.0 * PATCH_ANGLE_TOL_DEG).to_radians().cos()
+        } else {
+            false
+        };
+        if let Some(s) = sides.get_mut(k) {
+            s.corner = corner;
+            s.clash = clash;
+        }
+    }
+    let mut stations = |k: usize, ts: &[f64]| -> std::result::Result<Vec<Station>, String> {
+        let side = sides.get_mut(k).ok_or("no such side")?;
+        let mut at = Vec::with_capacity(ts.len());
+        for &t in ts {
+            let (Some(p), Some(tangent)) = (side.point(t), side.tangent(t)) else { return Err("an edge cannot be sampled".into()) };
+            at.push((p, tangent));
+        }
+        let frames = side.frames(&at, size, side.order == Continuity::G2).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(ts.len());
+        for ((&t, (p, tangent)), (frame, normal)) in ts.iter().zip(&at).zip(&frames) {
+            let up = tangent.cross(frame.leave).normalized().ok_or("the loop runs across its neighbour")?;
+            let across = (side.order != Continuity::G0).then(|| Across {
+                leave: frame.leave,
+                normal: *normal,
+                bend: (side.order == Continuity::G2).then_some(frame.bend),
+            });
+            let first = t <= 0.0;
+            out.push(Station { p: *p, up, across, corner: first && side.corner, clash: first && side.clash });
+        }
+        Ok(out)
+    };
+    let spec = FillSpec { tol, angle_tol: PATCH_ANGLE_TOL_DEG.to_radians(), crown, points };
+    let fill = solidcraft_geom::fill_general::fill_general(chain.len(), &mut stations, &spec).map_err(spline_error)?;
+    // The wire runs counter-clockwise about the surface's normal.
+    let wire: mt::Wire =
+        if fill.counter_clockwise { chain.to_vec().into() } else { chain.iter().rev().map(mt::Edge::inverse).collect::<Vec<_>>().into() };
+    let face = mt::Face::try_new(vec![wire], crate::spline_conv::surface(&fill.surface)?).map_err(|e| KernelError::Failed(format!("fill: {e}")))?;
+    let mut rec = Rebuild::default();
+    rec.made(&face, Vec::new());
+    let report = PatchReport {
+        general: true,
+        gap: fill.deviation,
+        normal_deviation_deg: fill.normal_deviation.to_degrees(),
+        normal_deviation_all_deg: fill.normal_deviation_all.to_degrees(),
+        curvature_mismatch: fill.curvature_mismatch,
+        point_gap: fill.point_deviation,
+    };
+    Ok((rebuilt_body(crate::surfaces::surface_body(vec![face]), &[&body.solid], &rec), report))
+}
+
+/// The loop turns by more than this (degrees) at a corner: its stations hold position only.
+const CORNER_DEG: f64 = 1.0;
 
 /// A surface body of one face filling the closed loop `chain` of `body`'s edges (each edge
 /// oriented along the loop, each ending where the next starts), within [`face_tolerance`] of
 /// every edge. Its history is over `[body]`: the face is new, its edges the body's own. Call it
 /// under [`crate::guard`].
 pub(crate) fn fill_loop(body: &Body, chain: &[mt::Edge]) -> Result<Body> {
+    fill_loop_crowned(body, chain, 0.0)
+}
+
+/// [`fill_loop`] with a crown: positive makes the fitted patch's middle fuller, negative flatter,
+/// by `crown` times the loop's size (see `solidcraft_geom::fill::fill_loop`). The bump vanishes on
+/// the loop, so the face still meets the body's own edges exactly as the plain fill does.
+pub(crate) fn fill_loop_crowned(body: &Body, chain: &[mt::Edge], crown: f64) -> Result<Body> {
     let tol = face_tolerance(body);
     let mut sides: Vec<(EdgeSampler, Vec3)> = Vec::with_capacity(chain.len());
     for e in chain {
@@ -27,10 +277,16 @@ pub(crate) fn fill_loop(body: &Body, chain: &[mt::Edge]) -> Result<Body> {
         // The loop's corners are its vertices (an imported edge's curve may end a little off).
         if t <= 0.0 { Some(*start) } else { sampler.at(t) }
     };
-    let fill = solidcraft_geom::fill::fill_loop(chain.len(), &mut point, tol).map_err(|e| match e {
-        SplineError::Unsupported(m) => KernelError::Invalid(format!("not supported yet: {m}")),
-        other => KernelError::Invalid(format!("cannot fill the loop: {other}")),
-    })?;
+    let fill = match solidcraft_geom::fill::fill_loop(chain.len(), &mut point, tol, crown) {
+        Ok(fill) => fill,
+        // Not a height field over its plane (or too wavy for one): the general fill, developed
+        // from the loop itself, when no crown asks for the height field's bump.
+        Err(SplineError::Unsupported(_)) if crown == 0.0 => {
+            let orders = vec![Continuity::G0; chain.len()];
+            return general_fill(body, chain, &orders, &[], 0.0).map(|(b, _)| b);
+        }
+        Err(e) => return Err(spline_error(e)),
+    };
     // The wire runs counter-clockwise about the surface's normal.
     let wire: mt::Wire =
         if fill.counter_clockwise { chain.to_vec().into() } else { chain.iter().rev().map(mt::Edge::inverse).collect::<Vec<_>>().into() };
@@ -38,6 +294,37 @@ pub(crate) fn fill_loop(body: &Body, chain: &[mt::Edge]) -> Result<Body> {
     let mut rec = Rebuild::default();
     rec.made(&face, Vec::new());
     Ok(rebuilt_body(crate::surfaces::surface_body(vec![face]), &[&body.solid], &rec))
+}
+
+/// [`crate::patch_edges`] with a crown on the fitted face: positive makes the patch's middle
+/// fuller, negative flatter, by `crown` times the loop's size (its projected box's diagonal), the
+/// bump vanishing along the loop, so the face still meets the body's own edges. `crown` 0 is
+/// exactly [`crate::patch_edges`], and a loop that is certainly planar ([`crate::plane_fit`])
+/// makes the same exact planar face whatever the crown. Its history is over `[body]`: the face is
+/// new, its edges the body's own.
+pub fn patch_edges_crowned(body: &Body, at: &[Vec3], crown: f64) -> Result<Body> {
+    if crown == 0.0 {
+        return crate::surfaces::patch_edges(body, at);
+    }
+    body.require_brep("patch")?;
+    if at.is_empty() || at.len() > 10_000 {
+        return Err(KernelError::Invalid("pick the edges of a closed loop".into()));
+    }
+    // A range test also throws out NaN.
+    if !(solidcraft_geom::fill::MIN_CROWN..=solidcraft_geom::fill::MAX_CROWN).contains(&crown) {
+        return Err(KernelError::Invalid("a patch's crown must be between -0.9 and 3".into()));
+    }
+    crate::guard("patch", || {
+        let chain = crate::surfaces::picked_loop(body, at)?;
+        let Some(face) = crate::plane_fit::planar_face(&chain, planarity_tolerance(body))? else {
+            // Not certainly planar: a fitted surface, crowned.
+            return fill_loop_crowned(body, &chain, crown);
+        };
+        // A new face on the body's own edges (a plane has no middle to fill).
+        let mut rec = Rebuild::default();
+        rec.made(&face, Vec::new());
+        Ok(rebuilt_body(crate::surfaces::surface_body(vec![face]), &[&body.solid], &rec))
+    })
 }
 
 /// How far a loop's edges may be from a plane for its patch to be that plane: `10⁻⁷` of the
@@ -71,7 +358,7 @@ mod tests {
     use crate::body::{Body, from_p3, p3};
     use crate::boolean_record::tests::{Reach, checked};
     use crate::history::{Change, EdgeOrigin};
-    use crate::{BoolOp, boolean, copy_faces, cylinder, extrude, measure, patch_edges, stitch};
+    use crate::{BoolOp, boolean, copy_faces, cylinder, extrude, measure, patch_edges, patch_edges_crowned, stitch};
 
     /// The cutting cylinder: axis along y at x = 0, z = 50, radius 40, so the top of a prism
     /// within 20 of the axis and 20 high is cut away everywhere (to between 10 and 15.4 mm).
@@ -451,9 +738,11 @@ mod tests {
     }
 
     #[test]
-    fn a_loop_that_does_not_bound_a_height_field_is_refused() {
+    fn a_loop_that_does_not_bound_a_height_field_fills_with_one_face() {
         // Half a round post's side: two straight edges up and two half circles, whose plane
-        // stands on the post's axis; the half circles run along its normal at their ends.
+        // stands on the post's axis; the half circles run along its normal at their ends, so no
+        // height field over it bounds them (the height-field fill refuses it). The general fill
+        // (#759) fills it with one face on its four edges.
         let post = cylinder(Vec3::ZERO, Vec3::Z, 10.0, 20.0).unwrap();
         let halves = crate::split_by_plane(&post, &Plane::from_normal(Vec3::ZERO, Vec3::X).unwrap()).unwrap();
         let half = halves.into_iter().find(|b| measure(b).unwrap().bbox.min.x > -1e-6).unwrap();
@@ -461,9 +750,16 @@ mod tests {
             (-4..=4).map(|k| Vec2::from_angle(k as f64 * 0.35).extend(10.0) * 1.0).map(|p| Vec3::new(p.x * 10.0, p.y * 10.0, 10.0)).collect();
         let side = copy_faces(&half, &at).unwrap();
         let rim = free_edge_points(&side);
-        let err = patch_edges(&side, &rim).unwrap_err().to_string();
-        eprintln!("half a post's side: {err}");
-        assert!(err.contains("not supported yet"), "{err}");
+        let fill = patch_edges(&side, &rim).unwrap();
+        assert_eq!(fill.face_count(), 1, "one face");
+        let face = fill.solid.face_iter().next().unwrap().clone();
+        let (off, tol) = (edges_off_surface(&face), super::face_tolerance(&side));
+        assert!(off <= tol, "an edge is {off} off the face (tolerance {tol})");
+        // Its area is at least its shadow on the plane x = 0 (the 20 × 20 square the loop bounds
+        // there) and, a least-bending fill, no more than the half side it spans.
+        let area = measure(&fill).unwrap().area;
+        eprintln!("half a post's side: one face of area {area}, its edges within {off:e}");
+        assert!(area > 400.0 && area < std::f64::consts::PI * 10.0 * 20.0, "{area}");
     }
 
     #[test]
@@ -524,4 +820,56 @@ mod tests {
         assert!(patch_edges(&open, &[Vec3::new(1e300, 0.0, 0.0)]).is_err());
         assert!(patch_edges(&open, &vec![rim[0]; 20_000]).is_err());
     }
+
+    /// A crowned patch: the middle is fuller by `crown` times the loop's size, the loop's own
+    /// edges stay exactly where they were (the face still meets them within [`face_tolerance`]),
+    /// and a planar loop is the same exact plane whatever the crown.
+    #[test]
+    fn a_crowned_patch_fills_its_middle_and_keeps_its_edges() {
+        let (_, open, rim) = cup(&regular(5, 0.3), Vec2::ZERO);
+        let plain = patch_edges(&open, &rim).unwrap();
+        let same = patch_edges_crowned(&open, &rim, 0.0).unwrap();
+        // Crown 0 is the plain patch: the same surface, to the last bit.
+        assert_eq!(measure(&plain).unwrap().area, measure(&same).unwrap().area, "crown 0 is patch_edges");
+        for crown in [0.25, -0.25] {
+            let full = patch_edges_crowned(&open, &rim, crown).unwrap();
+            assert_eq!(full.face_count(), 1, "one face");
+            let face = full.solid.face_iter().next().unwrap().clone();
+            assert!(!matches!(face.surface(), mt::Surface::Plane(_)));
+            let own: Vec<mt::EdgeID> = open.solid.edge_iter().map(|e| e.id()).collect();
+            assert!(full.solid.edge_iter().all(|e| own.contains(&e.id())), "an edge that is not the body's");
+            // The loop's edges are within the fill's tolerance of the face, as for the plain fill.
+            let off = edges_off_surface(&face);
+            assert!(off <= super::face_tolerance(&open), "an edge is {off} off the crowned face");
+            mesh_is_clean(&full);
+            // The middle of the loop's box moved by crown × its diagonal (the bump is 1 there).
+            let a = plain.solid.face_iter().next().unwrap().surface();
+            let b = face.surface();
+            let (Some((bu0, bu1)), Some((bv0, bv1))) = a.try_range_tuple() else { panic!("a bounded surface") };
+            let (uc, vc) = ((bu0 + bu1) / 2.0, (bv0 + bv1) / 2.0);
+            let size = (bu1 - bu0).hypot(bv1 - bv0);
+            let bump = a.subs(uc, vc).distance(b.subs(uc, vc));
+            let want = (crown * size).abs();
+            eprintln!("crown {crown}: the middle moved {bump:.6}, wanted {want:.6}");
+            assert!((bump - want).abs() < 1e-6 * size, "middle {bump} against {want}");
+        }
+        // A planar loop: the exact plane, crowned or not (the crown has no middle to fill).
+        let boxed = crate::box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0)).unwrap();
+        let open = copy_faces(
+            &boxed,
+            &[Vec3::new(5.0, 5.0, 0.0), Vec3::new(5.0, 0.0, 5.0), Vec3::new(10.0, 5.0, 5.0), Vec3::new(5.0, 10.0, 5.0), Vec3::new(0.0, 5.0, 5.0)],
+        )
+        .unwrap();
+        let rim = [Vec3::new(5.0, 0.0, 10.0), Vec3::new(10.0, 5.0, 10.0), Vec3::new(5.0, 10.0, 10.0), Vec3::new(0.0, 5.0, 10.0)];
+        let lid = patch_edges_crowned(&open, &rim, 1.0).unwrap();
+        assert!(matches!(lid.solid.face_iter().next().unwrap().surface(), mt::Surface::Plane(_)), "a planar loop is a plane");
+        // Hostile crowns are refused before anything is built.
+        for crown in [f64::NAN, f64::INFINITY, 3.01, -0.91, 1e300] {
+            assert!(patch_edges_crowned(&open, &rim, crown).is_err(), "crown {crown}");
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "fill_general_tests.rs"]
+mod general_tests;

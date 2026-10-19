@@ -1,11 +1,52 @@
 # Fast checks always run; native builds run for code/CI changes.
-# Tests are built once and run in 4 shards. A few heavy tests (see .config/nextest.toml) are
-# skipped on pull requests and run on pushes to main and nightly.
+# PRs test what they touch; main and nightly test everything. On a pull request the "Select
+# checks" job maps the changed files to workspace packages (scripts/ci/affected.py), adds the
+# packages that depend on them, and Clippy, the test archive and the test shards cover only
+# those. Changes to the lockfile, root manifest, toolchain/cargo/nextest config, .github/,
+# vendor/, tests/, scripts/ or any file no package owns select the whole workspace, as do
+# pushes to main, the nightly run and Run workflow.
+# Tests are built once and run in shards. A few heavy tests (see .config/nextest.toml) are
+# skipped on pull requests and run on pushes to main and nightly. The Windows jobs (D3D12 shaders
+# and app startup) run on pull requests only when what they test changes (the GPU crate, the app,
+# the viewport's GPU glue, the graphics dependencies, their scripts or this file); main and
+# nightly always run them. Only main saves the build caches; pull requests restore them.
+# The merge queue runs the full suite on exactly the commit it then puts on main, so a push to
+# main that a passing merge-queue run already tested runs only the repository checks; a push
+# that skipped the queue still runs everything. Pull requests run the reference tests when the
+# command line (or anything it depends on) changes, and doc tests for the affected packages.
+# Heavy checks wait for review: a pull request without the `approved-for-ci` label runs only
+# Select checks, the format and repository checks and a quick compile. Adding the label (after
+# review) runs everything above, and every later push to the PR does too. Pushes to main, merge
+# groups, the nightly run and Run workflow are not pull requests and always run the full suite.
+# GitHub cannot filter `labeled` events by label name, so any other label starts a run whose jobs
+# are all skipped; it gets its own concurrency group (below) so it never cancels the real run.
 # Cross-compilation is opt-in through Run workflow; release builds remain in release.yml.
+# Trusted runs use both pools: pushes to main, merge-queue groups and pull requests from a branch
+# of this repository (people with write access; fork pull requests never run on this machine).
+# There, Select checks and ci run on the self-hosted light runner (`self-hosted-light`, quick
+# jobs, so they never wait behind a build). For pushes to main and the merge queue only, the
+# repository checks, Clippy, the doc tests, the reference tests and all four test shards run on the
+# self-hosted runners (`self-hosted-fast`, warm build directories via scripts/ci/warm-target.sh);
+# a pull request runs them on GitHub's runners, so it never holds up the queue. Fork PRs' Linux
+# jobs run on the isolated, ephemeral `self-hosted-untrusted` runners (no warm caches) when the
+# PR number ends in 7, 8 or 9 (the rest of the fork PRs, and everything else, run on GitHub's
+# runners, which have far more free slots).
+# Where the test shards run on GitHub's runners, the test archive is built there too: the
+# self-hosted machine has a newer glibc, so its binaries wouldn't start on ubuntu-24.04, while the
+# archive runs there unchanged (same /home/runner/work checkout path). The self-hosted shards
+# (main and the merge queue) skip the archive and build the tests in their warm build directories.
+# Fork pull requests, the nightly run and Run workflow use GitHub's runners only; the self-hosted
+# runners refuse any other job.
 name: CI
 
 on:
+  # Draft pull requests run no CI (see `changes`, `checks` and `ci`): it starts when the PR is
+  # marked ready for review, and on every push after that. `labeled` is there for approved-for-ci
+  # only (other labels are skipped, see the top of this file).
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  # The merge queue: each queued group runs the full suite before it lands on main.
+  merge_group:
   push:
     branches: [main]
   schedule:
@@ -23,7 +64,10 @@ permissions:
 concurrency:
   # A new PR push replaces the old run. Only one run per group may wait, so a busy main would
   # cancel the waiting nightly (or a Run workflow) before it starts: they get groups of their own.
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  # A `labeled` event for any label but approved-for-ci does no work and must not cancel (or queue
+  # behind) the PR's real run, so it gets a group of its own; approved-for-ci replaces the
+  # unlabelled run with the full one.
+  group: ci-${{ github.event_name }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'approved-for-ci' && format('-ignored-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -45,10 +89,28 @@ jobs:
 
   changes:
     name: Select checks
-    runs-on: ubuntu-24.04
+    # Not on a draft: every other check needs this one, so they skip too. Not on a label other than
+    # approved-for-ci either (the same skip, for the same reason).
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event.action != 'labeled' || github.event.label.name == 'approved-for-ci')
+    # Trusted runs (see the top of this file) use the self-hosted runners.
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'self-hosted-light' || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      # To ask whether the merge queue already tested a commit pushed to main.
+      actions: read
     outputs:
       native: ${{ steps.paths.outputs.native }}
       kernel: ${{ steps.paths.outputs.kernel }}
+      goldens: ${{ steps.paths.outputs.goldens }}
+      windows: ${{ steps.paths.outputs.windows }}
+      full: ${{ steps.paths.outputs.full }}
+      # Code changed on a pull request that has no approved-for-ci label yet: only Quick compile.
+      quick: ${{ steps.paths.outputs.quick }}
+      packages: ${{ steps.paths.outputs.packages }}
+      oracle: ${{ steps.paths.outputs.oracle }}
+      # The fast self-hosted runners are kept for main and the merge queue (the pre-merge gate);
+      # pull requests, same-repo ones included, take the GitHub-hosted or untrusted paths.
+      local: ${{ runner.environment == 'self-hosted' && github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,72 +121,206 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'approved-for-ci') }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           native=false
           kernel=false
-          if [ "$EVENT_NAME" != pull_request ]; then
+          goldens=false
+          windows=false
+          full=true
+          packages=
+          if [ "$EVENT_NAME" = push ]; then
+            # The queue lands the very commit its merge_group run tested. If that run passed,
+            # testing the push again proves nothing new; otherwise (a merge that skipped the
+            # queue, or the API cannot answer) test everything.
+            # curl and grep only: Select checks of a push runs on the self-hosted runner.
+            tested=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/workflows/ci.yml/runs?event=merge_group&head_sha=$PUSH_SHA&status=success&per_page=1" \
+              | grep -o '"total_count": *[0-9]*' | grep -o '[0-9]*$' || echo 0)
+            if [ "${tested:-0}" -gt 0 ]; then
+              echo "The merge queue already tested $PUSH_SHA: repository checks only."
+            else
+              native=true
+              windows=true
+            fi
+          elif [ "$EVENT_NAME" != pull_request ]; then
             native=true
+            windows=true
           else
             # Compare both old and new paths of renames; unknown paths run native checks.
             git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/ci-paths"
             while IFS= read -r -d '' path; do
               case "$path" in crates/kernel/*|vendor/truck-*) kernel=true ;; esac
+              # What can change a robustness golden: the kernel and the crates a design is built with.
+              case "$path" in
+                crates/kernel/*|crates/engine/*|crates/doc/*|crates/sketch/*|crates/geom/*|vendor/truck-*) goldens=true ;;
+              esac
+              # What the Windows D3D12 jobs exercise: the GPU crate and its shaders, the app and
+              # its startup, the viewport's wgpu glue, the vendored egui-wgpu, their scripts.
+              case "$path" in
+                crates/gpu/*|apps/solidcraft/*|crates/ui-egui/src/gpu.rs|vendor/egui-wgpu/*) windows=true ;;
+                tools/windows-*.ps1|.github/workflows/ci.yml|rust-toolchain*|.cargo/*) windows=true ;;
+              esac
               case "$path" in
                 .github/workflows/ci.yml) native=true ;;
                 *.rs|Cargo.toml|Cargo.lock|*/Cargo.toml|.cargo/*|rust-toolchain*) native=true ;;
                 docs/*|*.md|.github/*|packaging/*|LICENSE*|NOTICE|THIRD-PARTY-LICENSES.txt) ;;
+                # The GitHub bots' scripts: no Rust, tested in this job (Claim and triage bot tests).
+                scripts/claim/*|scripts/triage/*) ;;
                 *) native=true ;;
               esac
             done < "$RUNNER_TEMP/ci-paths"
+            # A lockfile change that moves the graphics stack (wgpu, naga, egui, winit, windows).
+            if [ "$windows" = false ] && grep -qxz 'Cargo.lock' "$RUNNER_TEMP/ci-paths" \
+              && git diff "$BASE_SHA...$HEAD_SHA" -- Cargo.lock \
+                | grep -Eq '^[ +-]name = "(wgpu[a-z_-]*|naga|egui[a-z_-]*|eframe|winit|windows[a-z_-]*|d3d12)"'; then
+              windows=true
+            fi
+            # Pull requests build and test the touched packages and their dependents.
+            python3 -I scripts/ci/affected.py --paths "$RUNNER_TEMP/ci-paths" > "$RUNNER_TEMP/ci-affected"
+            cat "$RUNNER_TEMP/ci-affected"
+            full=$(sed -n 's/^full=//p' "$RUNNER_TEMP/ci-affected")
+            packages=$(sed -n 's/^packages=//p' "$RUNNER_TEMP/ci-affected")
+            # Code changed but nothing was selected: be safe and test everything.
+            if [ "$native" = true ] && [ "$full" != true ] && [ -z "$packages" ]; then full=true; fi
+            # The goldens are solidcraft-engine tests: its tests must be in the archive.
+            if [ "$goldens" = true ] && [ "$full" != true ]; then
+              case " $packages " in *" solidcraft-engine "*) ;; *) packages="$packages solidcraft-engine" ;; esac
+            fi
           fi
-          echo "native=$native" >> "$GITHUB_OUTPUT"
-          echo "kernel=$kernel" >> "$GITHUB_OUTPUT"
+          # The reference tests replay recipes through solidcraft-cli: needed when it, or anything
+          # it depends on, is selected.
+          oracle=$native
+          if [ "$EVENT_NAME" = pull_request ] && [ "$full" != true ]; then
+            case " $packages " in *" solidcraft-cli "*) ;; *) oracle=false ;; esac
+          fi
+          # The pull request fast lane: Windows and the reference tests run on main (and the nightly),
+          # not on every pull request push; a break there is fixed forward on main.
+          if [ "$EVENT_NAME" = pull_request ]; then windows=false; oracle=false; fi
+          # Until a maintainer adds approved-for-ci, a pull request gets a quick compile instead of
+          # Clippy, the tests, the doc tests and the goldens.
+          quick=false
+          if [ "$EVENT_NAME" = pull_request ] && [ "$APPROVED" != true ]; then
+            quick=$native
+            native=false
+            oracle=false
+            goldens=false
+          fi
+          {
+            echo "native=$native"
+            echo "kernel=$kernel"
+            echo "goldens=$goldens"
+            echo "windows=$windows"
+            echo "oracle=$oracle"
+            echo "full=$full"
+            echo "quick=$quick"
+            echo "packages=$packages"
+          } >> "$GITHUB_OUTPUT"
 
   checks:
     name: Format and repository checks
-    runs-on: ubuntu-24.04
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event.action != 'labeled' || github.event.label.name == 'approved-for-ci')
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: scripts/ci/warm-target.sh checks
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The trusted self-hosted runners keep their build directory and Cargo home instead; the
+      # untrusted ones (fork pull requests) start empty and restore main's cache, read-only.
+      - if: runner.environment == 'github-hosted' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: repo-checks
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all -- --check
       - name: Asset attribution
         run: cargo xtask assets
+      - name: UI icon standards and review tool
+        run: cargo xtask icons
       - name: Licences
         run: cargo xtask licences --check
       - name: Dependency layers
         run: cargo xtask layers
+      - name: Sorted lists
+        run: cargo xtask lists
+      - name: Design format pending changes
+        run: bash scripts/test-format-pending.sh
       - name: Web app offline use and updates (headless Chrome)
         run: cargo xtask web-offline-test
+      - name: Affected-package selection self-test
+        run: python3 -I scripts/ci/test_affected.py
+      - name: Claim and triage bot tests
+        run: node --test scripts/claim/*.test.js scripts/triage/*.test.js
+
+  # Fast feedback for a pull request that has not been approved for the full CI yet.
+  quick-compile:
+    name: Quick compile
+    needs: changes
+    if: needs.changes.outputs.quick == 'true'
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-light' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Size parallel compiles to the job's memory
+        run: scripts/ci/build-jobs.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: quick-compile
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --locked
 
   clippy:
     name: Native Linux Clippy
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: scripts/ci/warm-target.sh clippy
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The trusted self-hosted runners keep their build directory and Cargo home instead; the
+      # untrusted ones (fork pull requests) start empty and restore main's cache, read-only.
+      - if: runner.environment == 'github-hosted' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: native-clippy
-      - run: cargo clippy --workspace --all-targets --profile ci --locked -- -D warnings
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          PACKAGES: ${{ needs.changes.outputs.packages }}
+        run: |
+          # Pull requests lint the affected packages (scripts/ci/affected.py); everything else, all.
+          scope=(--workspace)
+          if [ "$FULL" != true ]; then scope=(); for p in $PACKAGES; do scope+=(-p "$p"); done; fi
+          cargo clippy "${scope[@]}" --all-targets --profile ci --locked -- -D warnings
 
   build-tests:
     name: Build tests
     needs: changes
-    if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The self-hosted shards (main and the merge queue) build from their warm build directories
+    # instead: downloading the 3 GB archive took them longer than building.
+    if: needs.changes.outputs.native == 'true' && needs.changes.outputs.local != 'true'
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (endsWith(format('{0}', github.event.pull_request.number), '7') || endsWith(format('{0}', github.event.pull_request.number), '8') || endsWith(format('{0}', github.event.pull_request.number), '9'))) && 'self-hosted-untrusted' || 'ubuntu-24.04' }}
+    # Fork builds compile inside gVisor on shared boxes; give them room to finish and upload.
+    timeout-minutes: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (endsWith(format('{0}', github.event.pull_request.number), '7') || endsWith(format('{0}', github.event.pull_request.number), '8') || endsWith(format('{0}', github.event.pull_request.number), '9'))) && 90 || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 60 || 45 }}
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
@@ -132,10 +328,13 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Size parallel compiles to the job's memory
+        run: scripts/ci/build-jobs.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: native-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Set up compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -144,7 +343,14 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Compile tests into a nextest archive
-        run: cargo nextest archive --workspace --cargo-profile ci --locked --archive-file tests.tar.zst
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          PACKAGES: ${{ needs.changes.outputs.packages }}
+        run: |
+          # Pull requests archive only the affected packages (scripts/ci/affected.py).
+          scope=(--workspace)
+          if [ "$FULL" != true ]; then scope=(); for p in $PACKAGES; do scope+=(-p "$p"); done; fi
+          cargo nextest archive "${scope[@]}" --cargo-profile ci --locked --archive-file tests.tar.zst
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nextest-archive
@@ -158,63 +364,112 @@ jobs:
   tests:
     name: Native Linux tests (${{ matrix.shard }}/4)
     needs: [changes, build-tests]
-    runs-on: ubuntu-24.04
+    if: ${{ !cancelled() && needs.changes.outputs.native == 'true' && (needs.changes.outputs.local == 'true' || needs.build-tests.result == 'success') }}
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-fast' || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (endsWith(format('{0}', github.event.pull_request.number), '7') || endsWith(format('{0}', github.event.pull_request.number), '8') || endsWith(format('{0}', github.event.pull_request.number), '9'))) && 'self-hosted-untrusted' || 'ubuntu-24.04') }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # Pull requests test their affected crates in 2 shards; main and the nightly use 4.
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[1, 2]' || '[1, 2, 3, 4]') }}
+    env:
+      # Pictures (snapshots, screenshots, ui.render, the viewport's offscreen tests) are drawn on
+      # the GPU. The runner has none: Mesa's lavapipe (software Vulkan) draws them, and a test that
+      # would skip for want of an adapter fails instead.
+      SOLIDCRAFT_GPU: software
+      SOLIDCRAFT_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install a software Vulkan driver (lavapipe)
+        # Preinstalled on the self-hosted runner, which has no sudo.
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-nextest
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      # On the self-hosted runners each shard builds the tests in its warm build directory (a few
+      # minutes for what changed); elsewhere it runs the archive the Build tests job made.
+      - name: Size parallel compiles to the job's memory
+        if: needs.changes.outputs.local == 'true'
+        run: scripts/ci/build-jobs.sh
+      - name: Warm build directory (self-hosted runner)
+        if: needs.changes.outputs.local == 'true'
+        run: scripts/ci/warm-target.sh build-tests
+      - if: needs.changes.outputs.local == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.local != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
       - name: Run tests
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GOLDENS: ${{ needs.changes.outputs.goldens }}
+          LOCAL: ${{ needs.changes.outputs.local }}
+          FULL: ${{ needs.changes.outputs.full }}
+          PACKAGES: ${{ needs.changes.outputs.packages }}
           SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ github.event_name == 'pull_request' && 2 || 4 }}
+          # The robustness golden seeds a pull request skips: each takes one to twenty minutes under
+          # CI load, together about four fifths of the goldens' time. Pushes to main, the merge
+          # queue and the nightly run every seed.
+          SLOW_SEEDS: 81|45|20|24|95|02|57|40|18|48|32|46|85|61|77|34|14
         run: |
           # Pull requests skip the heavy tests (default-filter in .config/nextest.toml).
-          all=()
-          if [ "$EVENT_NAME" != pull_request ]; then all=(--ignore-default-filter); fi
-          # Extract into ./target: tests that run a built binary (env!("CARGO_BIN_EXE_*")) have
-          # the build job's path, which is the same checkout path here.
-          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
-            --profile ci --partition "slice:$SHARD/4" "${all[@]}"
-      - name: Robustness goldens sample (pull requests that touch the kernel)
-        # Every 8th seed of tests/robustness/goldens.json, a quarter per shard; pushes to main and
-        # the nightly run every seed in the step above.
-        if: github.event_name == 'pull_request' && needs.changes.outputs.kernel == 'true'
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
-            --profile ci --ignore-default-filter \
-            -E "package(solidcraft-engine) & test(=tests::robustness_goldens::sample_$((SHARD - 1)))"
+          filter=()
+          if [ "$EVENT_NAME" != pull_request ]; then
+            # The boolean property tests draw new random inputs every run; they run only in the
+            # nightly property-tests job, so a known kernel bug cannot turn main red at random.
+            filter=(--ignore-default-filter -E 'not (package(solidcraft-kernel) & binary(boolean_props))')
+          elif [ "$GOLDENS" = true ]; then
+            # A pull request that can change a robustness golden (tests/robustness/goldens.json)
+            # also checks every seed but the slow ones, in the same run so they share its cores.
+            filter=(--ignore-default-filter -E "default() | (package(solidcraft-engine) & test(/^tests::robustness_goldens::/) & not test(/^tests::robustness_goldens::seed_($SLOW_SEEDS)\$/))")
+          fi
+          junit=${CARGO_TARGET_DIR:-target}/nextest/ci/junit.xml
+          # The warm build directory keeps the last run's junit.xml: never upload that one.
+          rm -f "$junit"
+          if [ "$LOCAL" = true ]; then
+            scope=(--workspace)
+            if [ "$FULL" != true ]; then scope=(); for p in $PACKAGES; do scope+=(-p "$p"); done; fi
+            run=(cargo nextest run "${scope[@]}" --cargo-profile ci --locked)
+          else
+            # Extract into ./target: tests that run a built binary (env!("CARGO_BIN_EXE_*")) have
+            # the build job's path, which is the same checkout path here.
+            run=(cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite)
+          fi
+          if ! "${run[@]}" --profile ci --partition "slice:$SHARD/$SHARDS" --no-tests=pass "${filter[@]}"; then
+            # A failed golden gets the hint to re-record it (junit.xml lists the failures).
+            if [ -f "$junit" ] && tr '\n' ' ' < "$junit" | grep -q '<testcase name="tests::robustness_goldens::[^"]*"[^>]*>[[:space:]]*<failure'; then
+              echo "::error::A robustness golden changed. If the new result is intended, re-record it in this pull request and say why:"
+              echo "::error::ROBUSTNESS_GOLDENS_BLESS=\"why it changed\" cargo test --profile ci -p solidcraft-engine --lib robustness_goldens::   (see docs/robustness.md)"
+            fi
+            exit 1
+          fi
       - name: Upload test timings
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: junit-${{ matrix.shard }}
-          path: target/nextest/ci/junit.xml
+          path: ${{ env.CARGO_TARGET_DIR || 'target' }}/nextest/ci/junit.xml
           retention-days: 7
 
   action-matrix:
     # Every ordinary action on every face, edge, vertex and body of the design corpus, against
     # tests/action_matrix/baseline.json (docs/action-matrix.md). Every test run checks a sample;
-    # the whole matrix runs nightly (or by hand), a quarter per job.
-    name: Action matrix (${{ matrix.part }}/4)
+    # the whole matrix runs nightly (or by hand) in shards of about equal cost, cut by
+    # tests/action_matrix/costs.json. Keep SHARDS in step with the matrix below.
+    name: Action matrix (${{ matrix.shard }}/16)
     needs: build-tests
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
@@ -223,18 +478,81 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
-      - name: Run a quarter of the matrix
+      - name: Run one shard of the matrix
+        # A step limit below the job's, so the outcomes so far are still uploaded.
+        timeout-minutes: 45
         env:
-          PART: ${{ matrix.part }}
+          SHARDS: 16
+          SHARD: ${{ matrix.shard }}
+          OUT: ${{ github.workspace }}/action-matrix
+        run: |
+          mkdir -p "$OUT"
+          export ACTION_MATRIX_SHARD="$SHARD/$SHARDS" ACTION_MATRIX_RESULTS="$OUT/results-$SHARD.json" \
+            ACTION_MATRIX_TIMINGS="$OUT/timings-$SHARD.jsonl" ACTION_MATRIX_WORKDIR="$OUT/raw-$SHARD"
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
+            --profile ci --success-output final --run-ignored only -E "binary(action_matrix) & test(=action_matrix_shard)"
+      - name: Upload the outcomes and timings
+        # `cargo xtask action-matrix --from DIR --bless` (with every shard's files in DIR)
+        # records them in the baseline and costs.json.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: action-matrix-${{ matrix.shard }}
+          path: action-matrix
+          retention-days: 14
+
+  action-matrix-determinism:
+    # A sample of the matrix run twice on one runner: every action must come out the same.
+    name: Action matrix determinism
+    needs: build-tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Run a sample twice
         run: |
           cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
-            --profile ci --run-ignored only -E "binary(action_matrix) & test(=action_matrix_full_$PART)"
+            --profile ci --success-output final --run-ignored only -E "binary(action_matrix) & test(=action_matrix_determinism)"
+
+  property-tests:
+    # The boolean property tests and the atomic command tests with many cases. Pull requests skip
+    # them (.config/nextest.toml); pushes to main run atomic_commands with small defaults (seeds
+    # 0..4) and skip boolean_props, whose random inputs would fail main at random.
+    name: Property tests (many cases)
+    needs: build-tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Boolean properties and atomic commands
+        # The defaults (8 cases, seeds 0..4) take 159 s and 802 s on a 2-core VM; four times the
+        # cases and twice the seeds are estimated at about 40 minutes there (not yet timed on CI).
+        env:
+          PROPTEST_CASES: "32"
+          ATOMIC_SEEDS: "0..8"
+        run: |
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
+            --profile ci --ignore-default-filter --success-output final -E "binary(boolean_props) | binary(atomic_commands)"
 
   doc-tests:
     name: Doc tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
@@ -243,22 +561,51 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Size parallel compiles to the job's memory
+        run: scripts/ci/build-jobs.sh
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: scripts/ci/warm-target.sh doc-tests
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The trusted self-hosted runners keep their build directory and Cargo home instead; the
+      # untrusted ones (fork pull requests) start empty and restore main's cache, read-only.
+      - if: runner.environment == 'github-hosted' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: doc-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Set up compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
       # nextest does not run doc tests.
-      - run: cargo test --workspace --profile ci --locked --doc
+      - name: Doc tests
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          PACKAGES: ${{ needs.changes.outputs.packages }}
+        run: |
+          # Pull requests test the affected packages that have a library (only libraries have doc
+          # tests); everything else, the whole workspace.
+          scope=(--workspace)
+          if [ "$FULL" != true ]; then
+            scope=()
+            libs=$(cargo metadata --no-deps --format-version 1 --locked \
+              | python3 -I -c 'import json, sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"] if any("lib" in t["kind"] for t in p["targets"])))')
+            for p in $PACKAGES; do
+              case " $libs " in *" $p "*) scope+=(-p "$p") ;; esac
+            done
+          fi
+          if [ ${#scope[@]} -eq 0 ]; then
+            echo "No affected package has a library: no doc tests to run."
+            exit 0
+          fi
+          cargo test "${scope[@]}" --profile ci --locked --doc
 
   oracle:
     name: Reference tests
     needs: changes
-    if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.oracle == 'true'
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-fast' || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (endsWith(format('{0}', github.event.pull_request.number), '7') || endsWith(format('{0}', github.event.pull_request.number), '8') || endsWith(format('{0}', github.event.pull_request.number), '9'))) && 'self-hosted-untrusted' || 'ubuntu-24.04') }}
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
@@ -267,10 +614,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Size parallel compiles to the job's memory
+        run: scripts/ci/build-jobs.sh
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: scripts/ci/warm-target.sh oracle
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The trusted self-hosted runners keep their build directory and Cargo home instead; the
+      # untrusted ones (fork pull requests) start empty and restore main's cache, read-only.
+      - if: runner.environment == 'github-hosted' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: oracle
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Set up compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -278,7 +634,7 @@ jobs:
       - name: Build the command line
         run: cargo build -p solidcraft-cli --profile ci --locked
       - name: Replay tests/oracle and compare with expected.json
-        run: cargo xtask oracle --cli target/ci/solidcraft-cli
+        run: cargo xtask oracle --cli "${CARGO_TARGET_DIR:-target}/ci/solidcraft-cli"
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -286,31 +642,109 @@ jobs:
           name: oracle-report
           path: docs/oracle.md
 
+  # D3D12's older shader compiler (FXC, used where dxcompiler.dll is absent) is stricter than
+  # DXC, Vulkan and Metal: a shader it cannot compile once crashed the app at startup. Build the
+  # GPU tessellation pipeline with FXC on the runner's WARP software adapter and compare its
+  # results with the CPU, and draw headless pictures with the viewport's pipelines there
+  # (crates/gpu/tests/capture.rs).
+  windows-fxc:
+    name: Windows D3D12 FXC shaders
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      WGPU_BACKEND: dx12
+      WGPU_DX12_COMPILER: fxc
+      # WARP is a software (Cpu) adapter.
+      SOLIDCRAFT_GPU: software
+      SOLIDCRAFT_REQUIRE_GPU: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-fxc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # One test at a time: WARP's shader JIT crashes now and then (a null read in
+      # d3d10warp.dll's JIT optimizer, about 1 run in 60) when several devices compile compute
+      # pipelines at once, which the parallel tests do. Minidumps showed it in WARP itself, not
+      # in SolidCraft or FXC; serial runs never hit it.
+      - run: cargo test -p solidcraft-gpu --profile ci --locked -- --test-threads=1
+
+  # The Windows app starts D3D12 first and only the backend it uses (a Vulkan driver crashed the
+  # app at startup on Intel). Start the real app on the runner (its D3D12 adapter is WARP) with
+  # several saved settings and safe mode, and check each draws a frame and quits cleanly.
+  windows-startup:
+    name: Windows app startup
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-startup
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Backend order and probing on Windows
+        run: cargo test -p solidcraft --profile ci --locked -- startup::tests native_crash::tests native_frame::tests
+      - name: Build the app
+        run: cargo build -p solidcraft --profile ci --locked
+      - name: Start the app under different settings
+        shell: pwsh
+        run: tools/windows-startup-smoke.ps1 -Exe target/ci/solidcraft.exe
+      - name: Resize border from the first frame
+        shell: pwsh
+        run: tools/windows-resize-smoke.ps1 -Exe target/ci/solidcraft.exe
+
   # Preserve the existing check name for branch protection, including docs-only PRs.
   ci:
-    needs: [changes, checks, clippy, build-tests, tests, doc-tests, oracle]
-    if: always()
-    runs-on: ubuntu-24.04
+    # On the skipped run another label starts, this job is named differently, so that skipped job
+    # can never stand in for the required `ci` check of the pull request's real run.
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'approved-for-ci' && 'ci (ignored label)' || 'ci' }}
+    needs: [changes, checks, quick-compile, clippy, build-tests, tests, doc-tests, oracle, windows-fxc, windows-startup]
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event.action != 'labeled' || github.event.label.name == 'approved-for-ci')
+    runs-on: ${{ needs.changes.outputs.local == 'true' && 'self-hosted-light' || 'ubuntu-24.04' }}
     steps:
       - name: Verify required checks
         env:
           CHANGES: ${{ needs.changes.result }}
           CHECKS: ${{ needs.checks.result }}
           NATIVE: ${{ needs.changes.outputs.native }}
+          QUICK: ${{ needs.changes.outputs.quick }}
+          QUICK_COMPILE: ${{ needs.quick-compile.result }}
+          LOCAL: ${{ needs.changes.outputs.local }}
+          WINDOWS: ${{ needs.changes.outputs.windows }}
+          ORACLE_RUN: ${{ needs.changes.outputs.oracle }}
           CLIPPY: ${{ needs.clippy.result }}
           BUILD: ${{ needs.build-tests.result }}
           TESTS: ${{ needs.tests.result }}
           DOCS: ${{ needs.doc-tests.result }}
           ORACLE: ${{ needs.oracle.result }}
+          WINDOWS_FXC: ${{ needs.windows-fxc.result }}
+          WINDOWS_STARTUP: ${{ needs.windows-startup.result }}
         run: |
           test "$CHANGES" = success
           test "$CHECKS" = success
+          # An unapproved pull request: the heavy jobs are skipped on purpose.
+          if [ "$QUICK" = true ]; then
+            test "$QUICK_COMPILE" = success
+          fi
           if [ "$NATIVE" = true ]; then
             test "$CLIPPY" = success
-            test "$BUILD" = success
+            # The self-hosted test shards build their own tests (no Build tests job there).
+            [ "$BUILD" = success ] || { [ "$LOCAL" = true ] && [ "$BUILD" = skipped ]; }
             test "$TESTS" = success
             test "$DOCS" = success
+          fi
+          if [ "$ORACLE_RUN" = true ]; then
             test "$ORACLE" = success
+          fi
+          if [ "$WINDOWS" = true ]; then
+            test "$WINDOWS_FXC" = success
+            test "$WINDOWS_STARTUP" = success
           fi
 
   wasm:
@@ -326,6 +760,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask wasm
 
   riscv64-gates:
@@ -347,6 +782,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: riscv64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cross-compilation dependencies
         run: |
           # Ubuntu's regular archive serves amd64; RISC-V packages live in ports.

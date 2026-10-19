@@ -1,0 +1,7 @@
+{
+  "description": "Issue #226: the upper cap precedes the wall in body order and touches only the edge of a 10 mm outward extrusion from the wall's x=40 face.",
+  "commands": [
+    {"command":"solid.box","params":{"corner":[0,0,20],"length":40,"width":30,"height":5,"body_name":"Cap"}},
+    {"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Wall"}}
+  ]
+}

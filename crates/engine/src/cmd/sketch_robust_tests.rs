@@ -61,7 +61,7 @@ fn trim_cases() {
     let _ = r;
     let mut s = new_sketch();
     let l = add(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0]]}))[0].clone();
-    // No crossings: the whole line goes (Fusion deletes it).
+    // No crossings: the whole line goes (it is deleted).
     let r = s.execute("sketch.trim", &json!({"curve": l, "at": [5, 0]}));
     sound_or_empty(&s);
     assert!(r.is_ok() || r.is_err());

@@ -76,7 +76,7 @@ impl NameCell {
     }
 }
 
-pub use crate::name_lookup::{EdgeHit, FaceHit, LEGACY_MARK, face_has_name, faces_with_stem, legacy_name, locate_edge, locate_face};
+pub use crate::name_lookup::{EdgeHit, FaceHit, LEGACY_MARK, face_has_name, faces_with_stem, legacy_name, locate_edge, locate_face, locate_one};
 pub use crate::piece_names::parent_piece;
 
 /// Deeper chains than this are named by position only (bounded work and stack).
@@ -511,7 +511,22 @@ fn number_pieces(names: &mut [String], pts: &[Vec<Vec3>], mark: char) {
             }
         };
         let mut order = cs.clone();
-        order.sort_by(|a, b| key(a.1).partial_cmp(&key(b.1)).unwrap_or(std::cmp::Ordering::Equal));
+        // Pieces lying almost level along the sort axis differ only in the last bits of their centre:
+        // the centre is the mean of a tessellated boundary, and that depends on where the loop's
+        // polyline starts, which can differ between processes. Comparing the keys with a tolerance
+        // makes those pieces equal, so the stable sort keeps the order they arrived in and a name
+        // keeps its number across runs (solidcraft#569). total_cmp keeps a NaN deterministic.
+        let tol = ext.x.max(ext.y).max(ext.z).max(1.0) * 1e-9;
+        let bucket = |c: Vec3| {
+            let k = key(c);
+            // Rounding onto the grid, rather than comparing with a tolerance, is what keeps this a
+            // total order: `a` and `b` in one bucket and `b` and `c` in the next must not leave `a`
+            // and `c` in different ones, or the sort has no order to work with. Since Rust 1.81
+            // `sort_by` may panic on a comparator that is not one. Two pieces can still flip when
+            // they straddle a bucket edge; that is the price of a key that ignores their low bits.
+            ((k.0 / tol).round() as i64, (k.1 / tol).round() as i64, (k.2 / tol).round() as i64)
+        };
+        order.sort_by_key(|a| bucket(a.1));
         for (k, (j, _)) in order.iter().enumerate() {
             if let Some(slot) = names.get_mut(*j) {
                 *slot = format!("{n}{mark}{}", k + 1);
@@ -525,7 +540,7 @@ fn role_name(f: &Feature, before: &ModelState, ps: &[Vec3], ns: &[Vec3], fi: usi
     let c = ps.iter().fold(Vec3::ZERO, |a, p| a + *p) * (1.0 / ps.len().max(1) as f64);
     match &f.kind {
         FeatureKind::Extrude { sketch, .. } => {
-            let Some(ss) = before.sketch(*sketch) else { return format!("F{fid}:face:{fi}") };
+            let Some(ss) = before.sketch(sketch.0) else { return format!("F{fid}:face:{fi}") };
             let n = ss.plane.normal();
             // A face across the extrusion is a cap; others sweep a sketch curve.
             let flat = !ns.is_empty() && ns.iter().all(|m| m.cross(n).len() < 1e-6);
@@ -537,7 +552,7 @@ fn role_name(f: &Feature, before: &ModelState, ps: &[Vec3], ns: &[Vec3], fi: usi
             nearest_curve(ss, Vec2::new(q.x, q.y)).map(|id| format!("F{fid}:side:{id}")).unwrap_or_else(|| format!("F{fid}:face:{fi}"))
         }
         FeatureKind::Revolve { sketch, axis, .. } => {
-            let Some(ss) = before.sketch(*sketch) else { return format!("F{fid}:face:{fi}") };
+            let Some(ss) = before.sketch(sketch.0) else { return format!("F{fid}:face:{fi}") };
             let Ok((o2, d2)) = crate::eval::revolve_axis(ss, axis) else { return format!("F{fid}:face:{fi}") };
             let (o, d) = (ss.plane.to_world(o2), (ss.plane.to_world(o2 + d2) - ss.plane.to_world(o2)).normalized().unwrap_or(Vec3::Z));
             // A flat face holding the axis is an angle cap: on the sketch plane, or the far one.
@@ -567,7 +582,7 @@ fn role_name(f: &Feature, before: &ModelState, ps: &[Vec3], ns: &[Vec3], fi: usi
                 FeatureKind::Loft { sections, .. } => sections.first().map(|x| x.sketch),
                 _ => None,
             };
-            let Some(ss) = sk.and_then(|k| before.sketch(k)) else { return format!("F{fid}:face:{fi}") };
+            let Some(ss) = sk.and_then(|k| before.sketch(k.0)) else { return format!("F{fid}:face:{fi}") };
             let n = ss.plane.normal();
             let h = |p: &Vec3| (*p - ss.plane.origin).dot(n);
             let flat = !ns.is_empty() && ns.windows(2).all(|w| w[0].cross(w[1]).len() < 1e-6);
@@ -598,10 +613,10 @@ fn role_name(f: &Feature, before: &ModelState, ps: &[Vec3], ns: &[Vec3], fi: usi
             format!("F{fid}:{role}")
         }
         FeatureKind::Cylinder { axis, .. } => {
-            let flat = !ns.is_empty() && ns.iter().all(|m| m.cross(*axis).len() < 1e-6);
+            let flat = !ns.is_empty() && ns.iter().all(|m| m.cross(axis.0).len() < 1e-6);
             let role = if !flat {
                 "side"
-            } else if ns.first().is_some_and(|m| m.dot(*axis) > 0.0) {
+            } else if ns.first().is_some_and(|m| m.dot(axis.0) > 0.0) {
                 "top"
             } else {
                 "bottom"
@@ -741,6 +756,71 @@ pub fn face_name_at_body(body: &ModelBody, point: Vec3) -> Option<String> {
     face_names(body).get(index).filter(|name| !name.is_empty()).cloned()
 }
 
+/// Where a face is, for a script: a point that lies on it and picks it, and the plane, cylinder,
+/// cone, sphere or torus it is part of (when it is one).
+#[derive(Clone, Copy, Debug)]
+pub struct FaceSpot {
+    pub point: Vec3,
+    pub surface: Option<solidcraft_kernel::FaceSurface>,
+}
+
+/// The incentre and inradius of the roomiest triangle (greatest inradius) of each face of a mesh,
+/// of face `only` alone if given.
+fn roomiest(m: &Mesh, only: Option<usize>) -> Vec<Option<(f64, Vec3)>> {
+    let mut best = vec![None; m.tri_face.iter().map(|f| *f as usize + 1).max().unwrap_or(0)];
+    for (t, f) in m.triangles.iter().zip(&m.tri_face) {
+        let f = *f as usize;
+        if only.is_some_and(|i| i != f) {
+            continue;
+        }
+        let Some([a, b, c]) = m.tri(t) else { continue };
+        // The incentre weighs each corner by the side opposite it; the inradius is area / half the perimeter.
+        let (la, lb, lc) = (b.dist(c), c.dist(a), a.dist(b));
+        let perimeter = la + lb + lc;
+        let radius = (b - a).cross(c - a).len() / perimeter;
+        let centre = (a * la + b * lb + c * lc) / perimeter;
+        if let Some(slot) = best.get_mut(f)
+            && radius.is_finite()
+            && centre.is_finite()
+            && slot.is_none_or(|(old, _)| radius > old)
+        {
+            *slot = Some((radius, centre));
+        }
+    }
+    best
+}
+
+/// The spot of face `index` of `b` from its roomiest triangle: the triangle's incentre, so a point
+/// that lies on the face however it is shaped (the centroid of a plate with a hole is in the hole,
+/// that of a half cylinder inside the cylinder) and well away from its edges, so a pick there finds
+/// this face. On a face of an analytic surface the point is moved onto the surface itself (a facet
+/// of a curved face lies inside it by its sag), as far as that stays well inside the triangle.
+fn spot(b: &ModelBody, index: usize, roomiest: Option<(f64, Vec3)>) -> Option<FaceSpot> {
+    let (radius, centre) = roomiest?;
+    let surface = solidcraft_kernel::face_surface(&b.body, index);
+    let point = surface.and_then(|s| s.nearest(centre)).filter(|q| q.dist(centre) <= radius * 0.5).unwrap_or(centre);
+    Some(FaceSpot { point, surface })
+}
+
+/// [`face_spot`] of every face of a body (`None`: the face has no triangles), in one pass.
+pub fn face_spots(b: &ModelBody) -> Vec<Option<FaceSpot>> {
+    roomiest(&b.mesh(), None).into_iter().enumerate().map(|(i, best)| spot(b, i, best)).collect()
+}
+
+/// Where face `index` of `b` is (`None`: it has no triangles).
+pub fn face_spot(b: &ModelBody, index: usize) -> Option<FaceSpot> {
+    spot(b, index, roomiest(&b.mesh(), Some(index)).get(index).copied().flatten())
+}
+
+/// A point on the face with this name, the name `model.faces` lists for it, on the body called
+/// `body` or, without one, on any body (see [`locate_one`]): what a command that takes a face as
+/// a point is given instead when the face is named.
+pub fn named_face_point(st: &ModelState, body: Option<&str>, name: &str) -> Result<Vec3, String> {
+    let hit = locate_one(st, body, name)?;
+    let b = st.bodies.get(hit.body).ok_or_else(|| format!("no face is named `{name}`"))?;
+    face_spot(b, hit.face).map(|spot| spot.point).ok_or_else(|| format!("face `{name}` has no surface to pick"))
+}
+
 /// The point on the face with this name nearest `p` (a split face: its nearest piece, with
 /// `true` for "not exactly that face": split, or merged into another); `None` when no face has
 /// the name.
@@ -760,6 +840,45 @@ pub fn face_on_body(body: &ModelBody, name: &str, p: Vec3) -> Option<(usize, Vec
 
 #[cfg(test)]
 mod tests {
+    /// Pieces lying almost level along the sort axis must keep the order they arrived in, whatever
+    /// the low bits of their centres do. The centre is the mean of a tessellated boundary, so those
+    /// bits depend on where the loop's polyline starts and can differ between processes — which is
+    /// how a name's number used to swap between runs (solidcraft#569).
+    #[test]
+    fn level_pieces_keep_their_input_order() {
+        let piece = |dx: f64| vec![Vec3::new(10.0 + dx, 0.0, 0.0), Vec3::new(10.0 + dx, 0.0, 5.0)];
+        for (first, second) in [(0.0, 1e-12), (1e-12, 0.0)] {
+            let mut names = vec!["f".to_string(), "f".to_string()];
+            let pts = vec![piece(first), piece(second)];
+            number_pieces(&mut names, &pts, '#');
+            assert_eq!(names, vec!["f#1".to_string(), "f#2".to_string()], "input order not kept for {first} then {second}");
+        }
+    }
+
+    /// Three pieces spaced just under the tolerance apart: `a` and `b` in one bucket and `b` and `c`
+    /// in the next, so a tolerance comparison would call `a≈b` and `b≈c` while `a<c` — the
+    /// non-transitivity that leaves `sort_by` without a total order to work with. The key must order
+    /// them by bucket, and within a bucket by the order they arrived in.
+    #[test]
+    fn pieces_just_under_the_tolerance_apart_still_have_a_total_order() {
+        let piece = |dx: f64| vec![Vec3::new(10.0 + dx, 0.0, 0.0), Vec3::new(10.0 + dx, 0.0, 5.0)];
+        // The grid is the spread of the centres floored at 1e-9; these centres span under 1.0, so it
+        // is 1e-9 and the three offsets below sit in buckets 0, 0 and 1.
+        let grid = 1e-9;
+        let step = grid * 0.4;
+        for ((a, b, c), want) in [
+            ((0.0, step, 2.0 * step), ["f#1", "f#2", "f#3"]),
+            ((2.0 * step, step, 0.0), ["f#3", "f#1", "f#2"]),
+            ((0.0, 2.0 * step, step), ["f#1", "f#3", "f#2"]),
+            ((step, 0.0, 2.0 * step), ["f#1", "f#2", "f#3"]),
+        ] {
+            let mut names = vec!["f".to_string(); 3];
+            let pts = [a, b, c].iter().map(|d| piece(*d)).collect::<Vec<_>>();
+            number_pieces(&mut names, &pts, '#');
+            assert_eq!(names, want, "wrong order for offsets {a} {b} {c}");
+        }
+    }
+
     use super::*;
 
     /// A cone's tip repeats its apex vertex, so a triangle can have a zero-length edge. The nearest

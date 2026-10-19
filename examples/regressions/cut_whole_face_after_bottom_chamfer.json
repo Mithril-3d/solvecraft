@@ -1,0 +1,11 @@
+{
+ "description": "A rounded-rectangle block (40 x 40, R8 corners, 20 high) with a 2 mm chamfer round its bottom loop, then an Extrude Cut of its whole top face 5 mm down. The tool's walls, its corner cylinders included, lay on the block's walls; only straight profile edges were grown off the walls, so the cut failed with 'no result' (#1275). Result: the block 15 high, less the chamfer.",
+ "commands": [
+  {"command": "sketch.create", "params": {"plane": "XY"}},
+  {"command": "sketch.rectangle.rounded", "params": {"p0": [0, 0], "p1": [40, 40], "radius": 8}},
+  {"command": "sketch.finish", "params": {}},
+  {"command": "solid.extrude", "params": {"distance": 20, "operation": "new"}},
+  {"command": "solid.chamfer", "params": {"distance": 2, "edges": [[20, 0, 0], [40, 20, 0], [20, 40, 0], [0, 20, 0], [2.343, 2.343, 0], [37.657, 2.343, 0], [37.657, 37.657, 0], [2.343, 37.657, 0]]}},
+  {"command": "solid.extrude", "params": {"face": [20, 20, 20], "distance": -5, "operation": "cut"}}
+ ]
+}

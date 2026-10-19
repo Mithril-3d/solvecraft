@@ -31,12 +31,18 @@ impl Plane {
     }
 
     /// Plane through `origin` with normal `n` (in-plane axes chosen deterministically).
-    pub fn from_normal(origin: Vec3, n: Vec3) -> Option<Plane> {
-        let n = n.normalized()?;
+    pub fn from_normal(origin: Vec3, n: impl Into<Vec3>) -> Option<Plane> {
+        let n = n.into().normalized()?;
         // Horizontal planes keep world X as sketch x; others use the horizontal direction Z × n.
         let cand = if n.dot(Vec3::Z).abs() > 0.9 { Vec3::X } else { Vec3::Z.cross(n) };
         let x = (cand - n * cand.dot(n)).normalized()?;
         Plane::new(origin, x, n.cross(x))
+    }
+
+    /// The same plane seen from its other side: a half turn about the sketch x axis (y
+    /// reversed), or about the y axis (x reversed) when `about_y`. Still right-handed.
+    pub fn flipped(&self, about_y: bool) -> Plane {
+        if about_y { Plane { x: -self.x, ..*self } } else { Plane { y: -self.y, ..*self } }
     }
 
     /// Named origin plane: `XY`, `XZ`, `YZ` (case-insensitive).

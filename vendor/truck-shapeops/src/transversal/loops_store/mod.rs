@@ -158,7 +158,7 @@ impl ParameterKind {
     }
 }
 
-impl<P: Copy, C: Clone> Loops<P, C> {
+impl<P: Copy + Tolerance, C: Clone> Loops<P, C> {
     fn search_parameter(&self, pt: P) -> Option<(usize, usize, ParameterKind)>
     where C: BoundedCurve<Point = P> + SearchParameter<D1, Point = P> {
         self.iter()
@@ -167,7 +167,18 @@ impl<P: Copy, C: Clone> Loops<P, C> {
             .find_map(|(i, j, edge)| {
                 let curve = edge.curve();
                 curve.search_parameter(pt, None, 1).and_then(|t| {
-                    let kind = ParameterKind::try_new(t, curve.range_tuple())?;
+                    // SolidCraft: a point at an end of the curve is that end, however far its
+                    // parameter is from the end's. The parameter alone is no distance: on a
+                    // polyline it counts segments, and an intersection curve ending 2e-7 mm from
+                    // another's end (two walls of a glyph meeting a face) read 1.4e-6 before it,
+                    // so it was cut into a sliver and the result's shell never closed (#391).
+                    let kind = if pt.near(&curve.front()) {
+                        ParameterKind::Front
+                    } else if pt.near(&curve.back()) {
+                        ParameterKind::Back
+                    } else {
+                        ParameterKind::try_new(t, curve.range_tuple())?
+                    };
                     Some((i, j, kind))
                 })
             })
@@ -232,24 +243,50 @@ impl<P: Copy, C: Clone> Loops<P, C> {
         edge0: Edge<P, C>,
         status: ShapesOpStatus,
     ) -> [Option<(usize, usize)>; 2] {
-        let a = self.iter().enumerate().find_map(|(i, wire)| {
-            wire.iter().enumerate().find_map(|(j, edge)| {
-                if edge.front() == edge0.back() {
-                    Some((i, j))
-                } else {
-                    None
-                }
-            })
-        });
-        let b = self.iter().enumerate().find_map(|(i, wire)| {
-            wire.iter().enumerate().find_map(|(j, edge)| {
-                if edge.front() == edge0.front() {
-                    Some((i, j))
-                } else {
-                    None
-                }
-            })
-        });
+        self.add_edge_choosing(edge0, status, &|_, _, _| None)
+    }
+
+    // SolidCraft: the edge added at the visits `chosen` (found for the same edge in the mirror
+    // store, whose wires and edges lie in the same order); the default where they are no visits
+    // of its ends.
+    fn add_edge_at(&mut self, edge0: Edge<P, C>, status: ShapesOpStatus, chosen: [Option<(usize, usize)>; 2]) -> [Option<(usize, usize)>; 2] {
+        self.add_edge_choosing(edge0, status, &|_, at_back, at_front| {
+            let held = |visits: &[(usize, usize)], c: Option<(usize, usize)>| c.is_none_or(|v| visits.contains(&v));
+            (held(at_back, chosen[0]) && held(at_front, chosen[1])).then_some(chosen)
+        })
+    }
+
+    // SolidCraft: `pick(loops, at_back, at_front)` may name the visits (wire, edge) the edge is
+    // added at, from the visits of a wire to its back and front vertices; `None` leaves it to the
+    // default below.
+    #[allow(clippy::type_complexity)]
+    fn add_edge_choosing(
+        &mut self,
+        edge0: Edge<P, C>,
+        status: ShapesOpStatus,
+        pick: &dyn Fn(&Self, &[(usize, usize)], &[(usize, usize)]) -> Option<[Option<(usize, usize)>; 2]>,
+    ) -> [Option<(usize, usize)>; 2] {
+        // SolidCraft: a vertex several intersection curves end on (the tangent point of two equal
+        // cylinders, say) is visited by more than one wire. The edge belongs where both of its
+        // ends are: a wire holding the visit at each end. Taking the first visit of each end
+        // joined wires that are different regions of the face, and the face came out with a wire
+        // visiting a vertex twice.
+        let starting_at = |loops: &Self, vertex: &Vertex<P>| -> Vec<(usize, usize)> {
+            loops
+                .iter()
+                .enumerate()
+                .flat_map(|(i, wire)| wire.iter().enumerate().filter(|(_, edge)| edge.front() == vertex).map(move |(j, _)| (i, j)))
+                .collect()
+        };
+        let (at_back, at_front) = (starting_at(self, edge0.back()), starting_at(self, edge0.front()));
+        let together = at_back
+            .iter()
+            .find_map(|&(i, j)| at_front.iter().find(|&&(k, _)| k == i).map(|&(_, l)| ((i, j), (i, l))));
+        let (a, b) = match (pick(self, &at_back, &at_front), together) {
+            (Some([a, b]), _) => (a, b),
+            (None, Some((a, b))) => (Some(a), Some(b)),
+            (None, None) => (at_back.first().copied(), at_front.first().copied()),
+        };
         if let Some((wire_index0, edge_index0)) = a {
             self[wire_index0].rotate_left(edge_index0);
             self[wire_index0].push_front(edge0.clone());
@@ -284,6 +321,91 @@ impl<P: Copy, C: Clone> Loops<P, C> {
             _ => {}
         }
         [a, b]
+    }
+}
+
+/// SolidCraft: where an edge leaves a vertex, as a unit vector: along the polyline from its
+/// front (or back) vertex to the first point a tenth of its length away, which is steadier
+/// than its first segment where the mesh it was traced on is noisy.
+fn leaving(edge: &Edge<Point3, PolylineCurve>, from_front: bool) -> Option<Vector3> {
+    let curve = edge.curve();
+    let n = curve.len();
+    if n < 2 {
+        return None;
+    }
+    let total: f64 = (1..n).map(|k| (curve[k] - curve[k - 1]).magnitude()).sum();
+    let (origin, order): (Point3, Vec<usize>) = if from_front { (curve[0], (1..n).collect()) } else { (curve[n - 1], (0..n - 1).rev().collect()) };
+    let mut found = None;
+    for k in order {
+        let d = curve[k] - origin;
+        found = Some(d);
+        if d.magnitude() >= 0.1 * total {
+            break;
+        }
+    }
+    found.filter(|d| d.magnitude() > 1e-12 && d.magnitude().is_finite()).map(|d| d.normalize())
+}
+
+/// SolidCraft: the counterclockwise angle about `normal` from `from` to `to`, in `[0, 2π)`.
+fn sweep(from: Vector3, to: Vector3, normal: Vector3) -> Option<f64> {
+    let e1 = from - normal * from.dot(normal);
+    if e1.magnitude() < 1e-9 {
+        return None;
+    }
+    let e1 = e1.normalize();
+    let e2 = normal.cross(e1);
+    let angle = to.dot(e2).atan2(to.dot(e1));
+    Some(if angle < 0.0 { angle + 2.0 * std::f64::consts::PI } else { angle })
+}
+
+impl Loops<Point3, PolylineCurve> {
+    /// SolidCraft: the visit among `visits` (of the vertex `at`) whose corner holds the direction
+    /// `d` the new edge leaves in: the wedge swept counterclockwise about `normal` from the
+    /// wire's outgoing edge to the way back along its incoming one. `None` when no corner can be
+    /// told (a single visit is returned as it is).
+    fn corner_holding(&self, visits: &[(usize, usize)], d: Vector3, normal: Vector3) -> Option<(usize, usize)> {
+        if let [only] = visits {
+            return Some(*only);
+        }
+        let tau = 2.0 * std::f64::consts::PI;
+        visits
+            .iter()
+            .filter_map(|&(i, j)| {
+                let wire = self.get(i)?;
+                let out = leaving(wire.get(j)?, true)?;
+                let before = wire.get((j + wire.len() - 1) % wire.len())?;
+                let back = leaving(before, false)?;
+                let wedge = sweep(out, back, normal)?;
+                let wedge = if wedge < 1e-6 { tau } else { wedge };
+                let at = sweep(out, d, normal)?;
+                (at > 1e-6 && at < wedge - 1e-6).then_some(((i, j), wedge))
+            })
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(visit, _)| visit)
+    }
+
+    /// SolidCraft: [`Loops::add_edge`], with the corner at each end of the edge told by its
+    /// direction there (`normals`: the face's normal at its back and front vertices) where a
+    /// vertex is visited more than once.
+    fn add_edge_by_angle(&mut self, edge0: Edge<Point3, PolylineCurve>, status: ShapesOpStatus, normals: [Option<Vector3>; 2]) -> [Option<(usize, usize)>; 2] {
+        let (d_back, d_front) = (leaving(&edge0, false), leaving(&edge0, true));
+        let pick = |loops: &Self, at_back: &[(usize, usize)], at_front: &[(usize, usize)]| {
+            if at_back.len() < 2 && at_front.len() < 2 {
+                return None;
+            }
+            let a = match (d_back, normals[0]) {
+                (Some(d), Some(n)) => loops.corner_holding(at_back, d, n),
+                _ => None,
+            };
+            let b = match (d_front, normals[1]) {
+                (Some(d), Some(n)) => loops.corner_holding(at_front, d, n),
+                _ => None,
+            };
+            // A vertex visited more than once whose corner could not be told is left to the default.
+            let told = |visits: &[(usize, usize)], c: Option<(usize, usize)>| visits.len() < 2 || c.is_some();
+            (told(at_back, a) && told(at_front, b)).then_some([a.or_else(|| at_back.first().copied()), b.or_else(|| at_front.first().copied())])
+        };
+        self.add_edge_choosing(edge0, status, &pick)
     }
 }
 
@@ -575,10 +697,16 @@ where
                     let pedge = Edge::new(&pv0, &pv1, polyline);
                     let gedge = Edge::new(&gv0, &gv1, intersection_curve.into());
                     lineage.meet(gedge.id(), meeting);
-                    poly_loops_store0[face_index0].add_edge(pedge.clone(), status0);
-                    geom_loops_store0[face_index0].add_edge(gedge.clone(), status0);
-                    poly_loops_store1[face_index1].add_edge(pedge, status1);
-                    geom_loops_store1[face_index1].add_edge(gedge, status1);
+                    let normal_at = |surface: &S, p: Point3| -> Option<Vector3> {
+                        let (u, v) = surface.search_nearest_parameter(p, None, 100)?;
+                        Some(surface.normal(u, v)).filter(|n| n.magnitude() > 0.0 && n.magnitude().is_finite())
+                    };
+                    let normals0 = [normal_at(&surface0, gv1.point()), normal_at(&surface0, gv0.point())];
+                    let normals1 = [normal_at(&surface1, gv1.point()), normal_at(&surface1, gv0.point())];
+                    let chosen0 = poly_loops_store0[face_index0].add_edge_by_angle(pedge.clone(), status0, normals0);
+                    geom_loops_store0[face_index0].add_edge_at(gedge.clone(), status0, chosen0);
+                    let chosen1 = poly_loops_store1[face_index1].add_edge_by_angle(pedge, status1, normals1);
+                    geom_loops_store1[face_index1].add_edge_at(gedge, status1, chosen1);
                 }
                 Some(())
             })

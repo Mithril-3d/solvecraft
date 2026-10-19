@@ -1,4 +1,4 @@
-//! Snapping while a sketch point or a line is dragged, like Fusion: the dragged point snaps to
+//! Snapping while a sketch point or a line is dragged: the dragged point snaps to
 //! other points (ends, centres, the origin, projected points), to the middle of a line and onto
 //! curves, and lines up horizontally or vertically with other points (a dashed guide). Letting
 //! go on a point, a midpoint or a curve adds the matching constraint; lining up adds none. Ctrl

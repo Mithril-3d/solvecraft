@@ -19,7 +19,7 @@
 | 3-Point Rectangle | 3点指定長方形 | `cmd.sketch_rectangle_three_point` |
 | 3-Tangent Circle | 3接線指定の円 | `cmd.sketch_circle_three_tangent` |
 | 3D Line | 3D 線分 | `cmd.sketch_line3d` |
-| 3D mouse (Windows) | 3D マウス (Windows) | `ui.3d_mouse_windows` |
+| 3D mouse | 3D マウス | `ui.3d_mouse_windows` |
 | 3D mouse speed | 3D マウス速度 | `ui.3d_mouse_speed` |
 | 3D Point | 3D 点 | `cmd.sketch_point3d` |
 | 3D Sketch | 3D スケッチ | `ui.3d_sketch` |

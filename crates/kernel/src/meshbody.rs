@@ -112,6 +112,7 @@ pub fn mesh_body(positions: &[Vec3], triangles: &[[u32; 3]]) -> Result<Body> {
         splits: None,
         face_sources: None,
         history: None,
+        display_of: None,
         regularization_protected: false,
     })
 }
@@ -208,6 +209,7 @@ impl Body {
             splits: self.splits.clone(),
             face_sources: None,
             history: None,
+            display_of: None,
             regularization_protected: self.regularization_protected,
         })
     }

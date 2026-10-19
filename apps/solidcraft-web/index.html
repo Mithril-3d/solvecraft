@@ -9,29 +9,43 @@
   <meta property="og:site_name" content="SolidCraft">
   <meta property="og:title" content="SolidCraft: try it in your browser">
   <meta property="og:description" content="Open-source parametric CAD built in Rust. Desktop, browser, and MCP for AI agents.">
-  <meta property="og:url" content="https://bherbruck.github.io/solidcraft/app/">
-  <meta property="og:image" content="https://bherbruck.github.io/solidcraft/og.png">
+  <meta property="og:url" content="https://solidcraft.ai/">
+  <meta property="og:image" content="https://docs.solidcraft.io/og.png">
   <meta property="og:image:width" content="1280">
   <meta property="og:image:height" content="640">
   <meta property="og:image:alt" content="SolidCraft: open-source parametric CAD built in Rust">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="SolidCraft: try it in your browser">
   <meta name="twitter:description" content="Open-source parametric CAD built in Rust. Desktop, browser, and MCP for AI agents.">
-  <meta name="twitter:image" content="https://bherbruck.github.io/solidcraft/og.png">
+  <meta name="twitter:image" content="https://docs.solidcraft.io/og.png">
   <meta name="twitter:image:alt" content="SolidCraft: open-source parametric CAD built in Rust">
   <link data-trunk rel="rust" data-bin="solidcraft-web" data-wasm-opt="z" data-weak-refs />
   <link data-trunk rel="copy-file" href="../../assets/fonts/biz-udp-gothic/BIZUDPGothic-Regular.ttf" data-target-path="fonts" />
   <link data-trunk rel="copy-file" href="../../assets/fonts/biz-udp-gothic/OFL.txt" data-target-path="fonts" />
   <link data-trunk rel="css" href="../../assets/styles/web/loading.css" />
+  <link data-trunk rel="copy-file" href="../../assets/styles/web/loading-logo.svg" />
+  <!-- Installable as an app (manifest.webmanifest); the icons are the Linux exports of the app mark. -->
+  <meta name="theme-color" content="#343840">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/32x32/ai.storyteller.solidcraft.png">
+  <link rel="apple-touch-icon" href="icons/256x256/ai.storyteller.solidcraft.png">
+  <link data-trunk rel="copy-file" href="manifest.webmanifest" />
+  <link data-trunk rel="copy-file" href="../../assets/icons/app/linux/exports/hicolor/32x32/apps/ai.storyteller.solidcraft.png" data-target-path="icons/32x32" />
+  <link data-trunk rel="copy-file" href="../../assets/icons/app/linux/exports/hicolor/256x256/apps/ai.storyteller.solidcraft.png" data-target-path="icons/256x256" />
+  <link data-trunk rel="copy-file" href="../../assets/icons/app/linux/exports/hicolor/512x512/apps/ai.storyteller.solidcraft.png" data-target-path="icons/512x512" />
 </head>
 <body>
   <canvas id="solidcraft_canvas"></canvas>
-  <div id="solidcraft_loading">Loading SolidCraft&hellip;</div>
+  <div id="solidcraft_loading" role="status"><img src="loading-logo.svg" alt=""><span class="sr-only">Loading SolidCraft&hellip;</span></div>
   <script>
     // Offline use and updates (sw.js; written into release builds by `cargo xtask web-offline`).
     if ("serviceWorker" in navigator) {
       addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
     }
+    // Install as an app: the browser's offer can come before the app runs, so it is kept here for
+    // the app's File ▸ Install app… item (src/install.rs). Installed, the browser makes no more offers.
+    addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); window.solidcraftInstall = e; });
+    addEventListener("appinstalled", () => { window.solidcraftInstall = null; });
   </script>
 </body>
 </html>

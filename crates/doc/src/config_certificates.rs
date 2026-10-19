@@ -148,6 +148,35 @@ pub(crate) fn extrude_cap_bindings(sketch: &SolvedSketch, bodies: &[solidcraft_k
     Some(bindings)
 }
 
+/// Cap signatures for a thin extrude (#1519). A thin wall's caps are bounded by offset curves
+/// the sketch doesn't have, so [`extrude_cap_bindings`] can never certify them. A wall built
+/// from one region is signed by the curves it follows instead: the cap of this extrude whose
+/// wall runs along them. That is the signature its solid caps had when the wall follows the
+/// whole profile (a rectangle's four lines), so a sketch attached to a solid cap keeps its face
+/// when the extrude is made thin, and the other way round. Several regions (walls apart, or one
+/// meeting itself) are left uncertified: they keep their history names.
+pub(crate) fn thin_extrude_cap_bindings(curves: &[String], regions: usize, bodies: &[solidcraft_kernel::Body]) -> CapBindings {
+    use solidcraft_kernel::FaceSource;
+    let mut outer = curves.to_vec();
+    outer.sort();
+    outer.dedup();
+    let signed = regions == 1 && bodies.len() == 1 && valid_signature(&outer, &[]);
+    bodies
+        .iter()
+        .map(|body| {
+            let sources: Vec<_> = body.face_sources().into_iter().flatten().collect();
+            let ends =
+                |high: bool| sources.iter().filter(|source| matches!(source, Some(FaceSource::ExtrudeCap { high: h, .. }) if *h == high)).count();
+            // One cap at each end, or none of them is certified.
+            let unique = ends(true) <= 1 && ends(false) <= 1;
+            sources
+                .iter()
+                .map(|source| (signed && unique && matches!(source, Some(FaceSource::ExtrudeCap { .. }))).then(|| (outer.clone(), Vec::new())))
+                .collect()
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FaceCertificate {
@@ -835,7 +864,15 @@ mod tests {
 
     fn solved(mut sketch: solidcraft_sketch::Sketch) -> SolvedSketch {
         let report = solidcraft_sketch::solve(&mut sketch);
-        SolvedSketch { feature: 1, name: "sources".into(), plane: solidcraft_geom::Plane::XY, sketch, report, profiles: Vec::new() }
+        SolvedSketch {
+            feature: 1,
+            name: "sources".into(),
+            plane: solidcraft_geom::Plane::XY,
+            sketch,
+            report,
+            profiles: Vec::new(),
+            ends: Default::default(),
+        }
     }
 
     #[test]

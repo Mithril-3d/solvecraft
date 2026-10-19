@@ -6,8 +6,224 @@ use solidcraft_engine::doc::expr::Kind as ValueKind;
 use solidcraft_engine::geom::Vec3;
 use solidcraft_engine::{Sel, Session};
 
+#[test]
+fn confirming_coplanar_body_faces_uses_one_atomic_extrusion() {
+    let mut h = crate::scenario::Harness::new();
+    let parent = h.app.run("component.create", json!({"name":"Imported assembly"})).unwrap()["component"].clone();
+    h.app.run("component.create", json!({"name":"Part"})).unwrap();
+    h.app.run("solid.box", json!({"length":30,"width":20,"height":20,"body_name":"Plate"})).unwrap();
+    h.app.run("sketch.create", json!({"plane":{"origin":[0,0,20],"x_dir":[1,0,0],"y_dir":[0,1,0]}})).unwrap();
+    for x in [2, 10] {
+        h.app.run("sketch.rectangle.two_point", json!({"p0":[x,2],"p1":[x+4,6]})).unwrap();
+    }
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("solid.extrude", json!({"distance":6,"operation":"join"})).unwrap();
+    h.app.run("component.activate", json!({"component":parent})).unwrap();
+    let world = h.app.session.world_state();
+    let body = world.body("Plate").unwrap();
+    h.app.session.selection = body
+        .body
+        .faces(0.01)
+        .unwrap()
+        .into_iter()
+        .filter(|face| face.plane_normal.is_some_and(|normal| normal.z > 0.99) && (face.centroid.z - 26.0).abs() < 1e-8)
+        .map(|face| Sel::Face { body: "Plate".into(), index: face.index, point: face.centroid })
+        .collect();
+    assert_eq!(h.app.session.selection.len(), 2);
+    h.app.start("solid.extrude");
+    if let Kind::Extrude { distance, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *distance = "-7".into();
+    }
+    h.frames(3);
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.first().unwrap().1["faces"].as_array().unwrap().len(), 2);
+    assert_eq!(commands.first().unwrap().1["face_body"], "Plate");
+    assert_eq!(commands.first().unwrap().1["operation"], "cut");
+    assert!(h.app.preview.error.is_none(), "{:?}", h.app.preview.error);
+    let undo = h.app.session.undo.len();
+    h.frames(3);
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "busy={}, dialog={:?}", h.app.applying.is_some(), h.app.dialog);
+    assert_eq!(h.app.session.doc.features.len(), 5);
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+    let volume = solidcraft_engine::doc::kernel::measure(&h.app.session.model.state().body("Plate").unwrap().body).unwrap().volume;
+    assert!((volume - 11_968.0).abs() < 1e-5, "{volume}");
+}
+
 use crate::dialogs::{Dialog, Kind, apply_commands};
 use crate::{Services, SolveApp};
+
+#[test]
+fn feature_mirror_and_patterns_reopen_as_feature_replays_even_for_body_creators() {
+    for (cmd, params) in [
+        ("solid.mirror", json!({"features":["Base"],"plane":"YZ"})),
+        (
+            "solid.pattern.rectangular",
+            json!({"features":["Base"],"dir1":[1,0,0],"count1":4,"spacing1":20,
+            "dir2":[0.6,0.8,0],"count2":2,"spacing2":20,"alignment":"center","alignment2":"center","reversed":true,"reversed2":true}),
+        ),
+        ("solid.pattern.circular", json!({"features":["Base"],"axis":"Z","count":6,"angle":90,"alignment":"center","reversed":true})),
+    ] {
+        let mut app = app_with(json!([
+            {"command":"solid.box","params":{"corner":[40,0,0],"length":2,"width":2,"height":2,"name":"Base"}}
+        ]));
+        app.session.execute(cmd, &params).unwrap();
+        let feature = app.session.doc.features.last().unwrap().clone();
+        // Exercise the save/reopen boundary as well as reopening the feature editor.
+        app.session = Session::new(solidcraft_engine::doc::Document::from_json(&app.session.doc.to_json()).unwrap());
+        let d = crate::dialogs::for_feature(&app, feature.id, None).unwrap();
+        assert_eq!(d.inputs[0].accept, crate::selection::FEATURES, "{cmd}");
+        assert_eq!(d.inputs[0].items, vec![Sel::Feature { id: app.session.doc.features[0].id }]);
+        let (edit, p) = apply_commands(&app, &d).unwrap().remove(0);
+        assert_eq!(edit, "timeline.redefine");
+        assert_eq!(p["params"]["features"], json!(["Base"]));
+        assert!(p["params"].get("bodies").is_none());
+        app.session.execute(&edit, &p).unwrap();
+        assert_eq!(app.session.doc.feature(feature.id).unwrap().kind, feature.kind, "{cmd}: accepting the reopened editor preserves its definition");
+    }
+}
+
+#[test]
+fn feature_pattern_controls_preview_without_committing_and_cancel_cleanly() {
+    for command in ["solid.pattern.rectangular", "solid.pattern.circular"] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"corner":[40,0,0],"length":2,"width":2,"height":2,"name":"Base"})).unwrap();
+        let source = h.app.session.doc.features[0].id;
+        h.app.session.selection = vec![Sel::Feature { id: source }];
+        h.step(&json!({"start":command})).unwrap();
+        let d = h.app.dialog.as_mut().unwrap();
+        d.inputs[1].items = vec![Sel::Axis { name: if command.ends_with("rectangular") { "X".into() } else { "Z".into() } }];
+        if command.ends_with("rectangular") {
+            d.inputs[2].items = vec![Sel::Axis { name: "Y".into() }];
+        }
+        let saved = h.app.session.doc.to_json();
+        let undo = h.app.session.undo.len();
+        h.frames(3);
+        for handle in ["dialog:Alignment:Center", "dialog:Alignment:Flip direction"] {
+            h.step(&json!({"click":{"handle":handle}})).unwrap();
+        }
+        if command.ends_with("rectangular") {
+            for handle in ["dialog:Alignment 2:Center", "dialog:Alignment 2:Flip direction"] {
+                h.step(&json!({"click":{"handle":handle}})).unwrap();
+            }
+        }
+        let d = h.app.dialog.as_ref().unwrap();
+        let (_, p) = apply_commands(&h.app, d).unwrap().remove(0);
+        assert_eq!(p["alignment"], json!("center"));
+        assert_eq!(p["reversed"], json!(true));
+        if command.ends_with("rectangular") {
+            assert_eq!(p["alignment2"], json!("center"));
+            assert_eq!(p["reversed2"], json!(true));
+        }
+        assert_eq!(h.app.session.doc.to_json(), saved);
+        assert_eq!(h.app.session.undo.len(), undo);
+        wait_feature_preview(&mut h);
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.frames(3);
+        assert!(h.app.dialog.is_none());
+        assert!(!h.app.preview.active);
+        assert_eq!(h.app.session.doc.to_json(), saved);
+    }
+}
+
+fn wait_feature_preview(h: &mut crate::scenario::Harness) {
+    for _ in 0..300 {
+        h.frames(2);
+        if h.app.preview.active && !h.app.preview.busy {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(h.app.preview.active && !h.app.preview.busy, "preview failed: {:?}", h.app.preview.error);
+    assert!(h.app.preview.error.is_none());
+}
+
+#[test]
+fn saved_feature_pattern_vectors_are_visible_clearable_and_replaceable() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":2,"width":2,"height":2,"name":"Base"})).unwrap();
+    h.app
+        .run(
+            "solid.pattern.rectangular",
+            json!({"features":["Base"],"dir1":[1,1,0],"count1":2,"spacing1":30,
+        "dir2":[0.6,0.8,0],"count2":2,"spacing2":50}),
+        )
+        .unwrap();
+    let id = h.app.session.doc.features.last().unwrap().id;
+    h.step(&json!({"call":"ui.editFeature","params":{"feature":id}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:clear:Direction 2"}})).unwrap();
+    let d = h.app.dialog.as_ref().unwrap();
+    let (_, p) = apply_commands(&h.app, d).unwrap().remove(0);
+    assert!(p["params"].get("dir2").is_none(), "clearing the saved second vector makes a single row: {d:?} -> {p}");
+    assert_eq!(p["params"]["dir1"], json!([1.0, 1.0, 0.0]));
+    h.step(&json!({"click":{"handle":"dialog:clear:Direction"}})).unwrap();
+    assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_err());
+    let d = h.app.dialog.as_mut().unwrap();
+    d.pick(&h.app.session, Sel::Axis { name: "X".into() });
+    let (_, p) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    assert_eq!(p["params"]["dir1"], json!([1.0, 0.0, 0.0]));
+}
+
+#[test]
+fn feature_mirror_picks_clear_preview_and_replay_the_source_cut() {
+    let mut h = crate::scenario::Harness::new();
+    for (cmd, p) in [
+        ("solid.box", json!({"length":100,"width":50,"height":5,"corner":[0,0,0]})),
+        ("solid.hole", json!({"position":[30,25,5],"diameter":4,"name":"Hole"})),
+        ("construct.plane.offset", json!({"base":"YZ","offset":50,"name":"Mid"})),
+    ] {
+        h.app.run(cmd, p).unwrap();
+    }
+    let source = Sel::Feature { id: h.app.session.doc.find_feature("Hole").unwrap().id };
+    h.app.session.selection = vec![source.clone()];
+    h.step(&json!({"start":"solid.mirror"})).unwrap();
+    let saved = h.app.session.doc.to_json();
+    let undo = h.app.session.undo.len();
+    let d = h.app.dialog.as_mut().unwrap();
+    d.active = 0;
+    d.pick(&h.app.session, source.clone());
+    assert!(d.inputs[0].items.is_empty());
+    d.pick(&h.app.session, source);
+    d.active = 1;
+    d.pick(&h.app.session, Sel::Plane { name: "Mid".into() });
+    wait_feature_preview(&mut h);
+    assert_eq!(h.app.session.doc.to_json(), saved);
+    assert_eq!(h.app.session.undo.len(), undo);
+    h.step(&json!({"click":{"handle":"dialog:clear:Mirror Plane"}})).unwrap();
+    assert!(h.app.dialog.as_ref().unwrap().inputs[1].items.is_empty());
+    assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_err());
+    let d = h.app.dialog.as_mut().unwrap();
+    d.pick(&h.app.session, Sel::Plane { name: "Mid".into() });
+    wait_feature_preview(&mut h);
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    h.step(&json!({"until":{"dialog":null,"features":4}})).unwrap();
+    let state = h.app.session.world_state();
+    assert_eq!(state.bodies.len(), 1, "a mirrored hole cuts the plate instead of copying it");
+    assert!(!state.bodies[0].body.contains(Vec3::new(70.0, 25.0, 2.5)));
+    let mirror = h.app.session.doc.features.last().unwrap().id;
+    let reopened = crate::dialogs::for_feature(&h.app, mirror, None).unwrap();
+    assert_eq!(reopened.inputs[0].accept, crate::selection::FEATURES);
+    assert_eq!(reopened.inputs[1].items, vec![Sel::Plane { name: "Mid".into() }]);
+}
+
+#[test]
+fn a_face_extrude_keeps_the_picked_body_when_faces_coincide() {
+    let mut app = app_with(json!([
+        {"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Other"}},
+        {"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Wall"}}
+    ]));
+    let before = app.session.model.state();
+    let pick = Sel::Face { body: "Wall".into(), index: 2, point: Vec3::new(40.0, 15.0, 10.0) };
+    let d = start(&mut app, vec![pick], "solid.extrude");
+    let (command, params) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(params["face_body"], json!("Wall"));
+    app.session.execute(&command, &params).unwrap();
+    let after = app.session.model.state();
+    assert_eq!(after.bodies.len(), 2);
+    assert!(after.body("Other").unwrap().body.same(&before.body("Other").unwrap().body));
+    assert!(after.body("Wall").unwrap().body.contains(Vec3::new(49.0, 15.0, 10.0)));
+}
 
 #[test]
 fn path_plane_click_retains_source_and_previews_then_edits_in_place() {
@@ -682,7 +898,7 @@ fn shell_direction_and_tangent_chain_round_trip() {
     let mut app = boxed();
     let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
     let mut d = start(&mut app, vec![top], "solid.shell");
-    // Tangent Chain is on, as in Fusion; Direction Outside.
+    // Tangent Chain is on; Direction Outside.
     assert_eq!(d.extra.get("tangent_chain"), Some(&json!(true)));
     d.extra.insert("direction".into(), json!("outside"));
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
@@ -732,6 +948,235 @@ fn variable_fillet_mid_radii_round_trip() {
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
     // (an edit: the feature's new parameters)
     assert_eq!(p["params"]["mid"], json!([]), "{p}");
+}
+
+/// Use an actual mesh point, as a viewport pick does; analytic cylinder points need not lie
+/// on the display mesh's facets.
+fn thread_face(app: &SolveApp, body: &str) -> Sel {
+    let state = app.session.world_state();
+    let body_state = state.body(body).unwrap();
+    let index = solidcraft_engine::doc::naming::face_spots(body_state)
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, spot)| {
+            spot.filter(|spot| matches!(spot.surface, Some(solidcraft_engine::kernel::FaceSurface::Cylinder { .. }))).map(|_| index)
+        })
+        .unwrap();
+    let mesh = body_state.mesh();
+    let point = mesh
+        .triangles
+        .iter()
+        .zip(&mesh.tri_face)
+        .find_map(|(triangle, face)| {
+            if *face as usize != index {
+                return None;
+            }
+            mesh.tri(triangle).map(|[a, b, c]| (a + b + c) / 3.0)
+        })
+        .unwrap();
+    Sel::Face { body: body.into(), index, point }
+}
+
+#[test]
+fn thread_size_suggestion_matches_the_feature_for_shafts_and_holes() {
+    for (diameter, internal, expected) in [(8.0, false, "M8"), (20.0, false, "M20"), (5.0, true, "M6")] {
+        let mut app = app_with(json!([]));
+        if internal {
+            app.run("solid.box", json!({"corner":[-10,-10,0],"length":20,"width":20,"height":10})).unwrap();
+        }
+        app.run("solid.cylinder", json!({"radius":diameter / 2.0,"height":10,"body_name":"Cylinder"})).unwrap();
+        if internal {
+            app.run("solid.combine", json!({"target":"Body1","tools":["Cylinder"],"operation":"cut"})).unwrap();
+        }
+        let pick = thread_face(&app, if internal { "Body1" } else { "Cylinder" });
+        let saved = app.session.doc.to_json();
+        let d = start(&mut app, vec![pick], "solid.thread");
+        assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == expected), "{:?}", d.kind);
+        assert_eq!(app.session.doc.to_json(), saved, "suggesting a size is read-only");
+        let (command, params) = apply_commands(&app, &d).unwrap().remove(0);
+        assert!(params.get("designation").is_none(), "an automatic size stays automatic");
+        let result = app.session.execute(&command, &params).unwrap();
+        assert_eq!(result["thread"]["designation"], expected);
+        assert_eq!(result["thread"]["internal"], internal);
+    }
+}
+
+#[test]
+fn thread_size_suggestion_follows_picks_without_overwriting_manual_sizes() {
+    let mut app = app_with(json!([
+        {"command":"solid.cylinder","params":{"radius":4,"height":10}},
+        {"command":"solid.cylinder","params":{"base":[30,0,0],"radius":10,"height":10}},
+        {"command":"solid.cylinder","params":{"base":[200,0,0],"radius":50,"height":10}}
+    ]));
+    let small = thread_face(&app, "Body1");
+    let large = thread_face(&app, "Body2");
+    let unsupported = thread_face(&app, "Body3");
+    let planar = crate::dialogs::face_sel(&app.session, Vec3::new(0.0, 0.0, 10.0)).unwrap();
+    let mut d = start(&mut app, vec![], "solid.thread");
+    for (pick, expected) in [
+        (small.clone(), "M8"),
+        (large.clone(), "M20"),
+        (large.clone(), "M20"),
+        (small.clone(), "M8"),
+        (unsupported, ""),
+        (small.clone(), "M8"),
+        (planar, ""),
+    ] {
+        d.pick(&app.session, pick);
+        assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == expected), "{:?}", d.kind);
+    }
+    d.take_box(&app.session, vec![], false);
+    assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation.is_empty()));
+    d.take_box(&app.session, vec![small], false);
+    assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == "M8"));
+    if let Kind::Thread { designation, .. } = &mut d.kind {
+        *designation = "M8x1".into();
+    }
+    d.pick(&app.session, large);
+    assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == "M8x1"));
+    assert_eq!(apply_commands(&app, &d).unwrap()[0].1["designation"], "M8x1");
+}
+
+#[test]
+fn thread_size_suggestion_reopens_without_changing_saved_thread_parameters() {
+    for designation in [None, Some("M8"), Some("M8x1")] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.cylinder", json!({"radius":4,"height":10})).unwrap();
+        let Sel::Face { point, .. } = thread_face(&h.app, "Body1") else { panic!("a face") };
+        let mut params = json!({"face":point});
+        if let Some(size) = designation {
+            params["designation"] = json!(size);
+        }
+        let id = h.app.run("solid.thread", params).unwrap()["feature"].as_u64().unwrap();
+        let before = h.app.session.doc.feature(id).unwrap().kind.clone();
+        h.app.edit_feature(id);
+        h.frames(2);
+        let d = h.app.dialog.as_ref().unwrap();
+        assert!(matches!(&d.kind, Kind::Thread { designation: size, .. } if size == designation.unwrap_or("M8")), "{d:?}");
+        let (command, params) = apply_commands(&h.app, d).unwrap().remove(0);
+        h.app.session.execute(&command, &params).unwrap();
+        assert_eq!(h.app.session.doc.feature(id).unwrap().kind, before);
+    }
+}
+
+#[test]
+fn thread_size_suggestion_can_be_cleared_and_edited_in_the_dialog() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":10})).unwrap();
+    let pick = thread_face(&h.app, "Body1");
+    h.app.session.selection = vec![pick.clone()];
+    h.step(&json!({"start":"solid.thread"})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:clear:Cylindrical face"}})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation.is_empty()));
+    h.app.dialog.as_mut().unwrap().pick(&h.app.session, pick.clone());
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:thread_size"}})).unwrap();
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    // Even deliberately typing the same size turns it into an explicit override.
+    h.step(&json!({"text":"M8"})).unwrap();
+    let d = h.app.dialog.as_ref().unwrap();
+    assert_eq!(apply_commands(&h.app, d).unwrap()[0].1["designation"], "M8");
+    h.step(&json!({"click":{"handle":"dialog:clear:Cylindrical face"}})).unwrap();
+    h.app.dialog.as_mut().unwrap().pick(&h.app.session, pick);
+    h.frames(2);
+    assert_eq!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["designation"], "M8");
+}
+
+#[test]
+fn thread_choices_apply_a_fine_pitch_and_partial_modelled_thread() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":10})).unwrap();
+    h.app.session.selection = vec![thread_face(&h.app, "Body1")];
+    h.step(&json!({"start":"solid.thread"})).unwrap();
+    let saved = h.app.session.doc.to_json();
+    for handle in ["dialog:Pitch", "dialog:Pitch:1 mm", "dialog:Full Length", "dialog:Length"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+    }
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"4 mm"})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Modeled"}})).unwrap();
+    let (command, params) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    assert_eq!(params["designation"], "M8x1");
+    assert_eq!(params["length"], "4 mm");
+    assert_eq!(params["modeled"], true);
+    assert_eq!(h.app.session.doc.to_json(), saved, "changing options only previews");
+    let before = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+    let result = h.app.session.execute(&command, &params).unwrap();
+    let state = h.app.session.world_state();
+    let after = state.body("Body1").unwrap().mesh().measure().volume;
+    assert!(before - after > 1.0, "the selected fine pitch must cut the shaft");
+    let id = result["feature"].as_u64().unwrap();
+    let kind = &h.app.session.doc.feature(id).unwrap().kind;
+    assert!(matches!(kind, solidcraft_engine::doc::FeatureKind::Thread { designation: Some(d), length: Some(l), modeled: true, .. }
+        if d == "M8x1" && l == "4 mm"));
+}
+
+#[test]
+fn thread_choices_reset_to_the_face_and_can_freeze_the_same_size() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":10})).unwrap();
+    h.app.session.selection = vec![thread_face(&h.app, "Body1")];
+    h.step(&json!({"start":"solid.thread"})).unwrap();
+    for handle in ["dialog:Size", "dialog:Size:6 mm", "dialog:Pitch", "dialog:Pitch:0.75 mm"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+    }
+    let d = h.app.dialog.as_ref().unwrap();
+    assert_eq!(apply_commands(&h.app, d).unwrap()[0].1["designation"], "M6x0.75");
+    h.step(&json!({"click":{"handle":"dialog:Automatic size"}})).unwrap();
+    h.frames(2);
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == "M8"));
+    assert!(apply_commands(&h.app, d).unwrap()[0].1.get("designation").is_none());
+    h.step(&json!({"click":{"handle":"dialog:Automatic size"}})).unwrap();
+    assert_eq!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["designation"], "M8");
+}
+
+#[test]
+fn thread_choices_preserve_custom_saved_pairs_and_offer_large_fine_pitches() {
+    for (diameter, designation) in [(7.3, "M7.3x0.6"), (56.0, "M56")] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.cylinder", json!({"radius":diameter / 2.0,"height":10})).unwrap();
+        let Sel::Face { point, .. } = thread_face(&h.app, "Body1") else { panic!("a face") };
+        let id = h.app.run("solid.thread", json!({"face":point,"designation":designation})).unwrap()["feature"].as_u64().unwrap();
+        h.app.edit_feature(id);
+        h.frames(2);
+        assert!(h.widget(&format!("{diameter} mm")).is_some());
+        assert!(h.widget(if diameter == 56.0 { "5.5 mm" } else { "0.6 mm" }).is_some());
+        let (_, params) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+        assert_eq!(params["params"]["designation"], designation);
+        if diameter == 56.0 {
+            for handle in ["dialog:Pitch", "dialog:Pitch:2 mm"] {
+                h.step(&json!({"click":{"handle":handle}})).unwrap();
+            }
+            let (command, params) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+            assert_eq!(params["params"]["designation"], "M56x2");
+            h.app.session.execute(&command, &params).unwrap();
+            let mut reopened = solidcraft_engine::doc::Document::from_json(&h.app.session.doc.to_json()).unwrap();
+            // This test submits the edit command directly; finish the editor's rollback
+            // before checking the complete saved design.
+            reopened.marker = None;
+            let session = Session::new(reopened);
+            assert_eq!(session.world_state().threads[0].designation, "M56x2");
+        }
+    }
+}
+
+#[test]
+fn thread_choices_can_start_without_a_face_and_recover_from_invalid_text() {
+    let mut h = crate::scenario::Harness::new();
+    h.step(&json!({"start":"solid.thread"})).unwrap();
+    for handle in ["dialog:Size", "dialog:Size:8 mm", "dialog:thread_size"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+    }
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"Munknown"})).unwrap();
+    h.frames(2);
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "Munknown"));
+    for handle in ["dialog:Size", "dialog:Size:8 mm"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+    }
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "M8x1.25"));
+    assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_err(), "a face is still required");
 }
 
 #[test]
@@ -969,6 +1414,81 @@ fn surface_loft_dialog_makes_a_section_per_sketch() {
 }
 
 #[test]
+fn ruled_surface_dialog_takes_edges_a_face_and_a_direction() {
+    // A box top's front and right edges, ruled across the top 2 mm with round corners: two
+    // 10 × 2 strips and a quarter disc between them. Edit Feature brings it back; along a
+    // direction it needs one, and keeps the one it was made with.
+    let mut app = app_with(json!([{"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10, "body_name": "Box"}}]));
+    let mut d = start(&mut app, vec![], "surface.ruled");
+    assert!(apply_commands(&app, &d).is_err(), "no edges yet");
+    let edge = |i: usize, p: Vec3| Sel::Edge { body: "Box".into(), index: i, point: p };
+    d.inputs[0].items = vec![edge(0, Vec3::new(5.0, 0.0, 10.0)), edge(1, Vec3::new(10.0, 5.0, 10.0))];
+    d.inputs[1].items = vec![Sel::Face { body: "Box".into(), index: 0, point: Vec3::new(5.0, 5.0, 10.0) }];
+    if let Kind::Surface(crate::dialogs_surface::Surf::Ruled { distance, mode, round, .. }) = &mut d.kind {
+        *distance = "2 mm".into();
+        *mode = 1;
+        *round = true;
+    }
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(
+        (id.as_str(), &p["body"], &p["mode"], &p["corners"], &p["face"]),
+        ("surface.ruled", &json!("Box"), &json!("tangent"), &json!("round"), &json!([5.0, 5.0, 10.0])),
+        "{p}"
+    );
+    app.session.execute(&id, &p).unwrap();
+    let m = app.session.model.state().bodies.last().unwrap().mesh().measure();
+    let want = 40.0 + std::f64::consts::PI;
+    assert!((m.area - want).abs() < want * 2e-3, "{} vs {want}", m.area); // (measured on meshes)
+    let fid = app.session.doc.features.last().unwrap().id;
+    let mut back = crate::dialogs::for_feature(&app, fid, None).unwrap();
+    assert_eq!((back.inputs[0].items.len(), back.inputs[1].items.len()), (2, 1));
+    assert!(matches!(back.kind, Kind::Surface(crate::dialogs_surface::Surf::Ruled { mode: 1, round: true, .. })));
+    if let Kind::Surface(crate::dialogs_surface::Surf::Ruled { mode, .. }) = &mut back.kind {
+        *mode = 3;
+    }
+    assert!(apply_commands(&app, &back).is_err(), "a direction is needed");
+    back.inputs[2].items = vec![Sel::Axis { name: "Z".into() }];
+    // Edit Feature runs the command's parameters as an edit of the feature.
+    let (_, p) = apply_commands(&app, &back).unwrap().remove(0);
+    assert_eq!((&p["params"]["mode"], &p["params"]["direction"]), (&json!("direction"), &json!([0.0, 0.0, 1.0])), "{p}");
+}
+
+#[test]
+fn untrim_dialog_takes_a_face_its_holes_and_the_outer_boundary() {
+    // A 40 × 20 × 2 plate with three holes: its top untrimmed (every hole) is the whole 800 mm²
+    // rectangle; one hole picked by an edge; Edit Feature brings the picks and options back.
+    let mut app = app_with(json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 20, "height": 2, "body_name": "Plate"}},
+        {"command": "solid.cylinder", "params": {"radius": 2, "height": 4, "base": [10, 10, -1], "operation": "cut", "targets": ["Plate"]}},
+        {"command": "solid.cylinder", "params": {"radius": 2, "height": 4, "base": [20, 10, -1], "operation": "cut", "targets": ["Plate"]}},
+        {"command": "solid.cylinder", "params": {"radius": 2, "height": 4, "base": [30, 10, -1], "operation": "cut", "targets": ["Plate"]}}
+    ]));
+    let mut d = start(&mut app, vec![], "surface.untrim");
+    assert!(apply_commands(&app, &d).is_err(), "no face yet");
+    d.inputs[0].items = vec![Sel::Face { body: "Plate".into(), index: 0, point: Vec3::new(5.0, 5.0, 2.0) }];
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!((id.as_str(), &p["face"], &p["holes"]), ("surface.untrim", &json!({"body": "Plate", "point": [5.0, 5.0, 2.0]}), &json!("all")), "{p}");
+    app.session.execute(&id, &p).unwrap();
+    let m = app.session.model.state().bodies.last().unwrap().mesh().measure();
+    assert!((m.area - 800.0).abs() < 1e-6, "{}", m.area);
+    app.session.execute("edit.undo", &json!({})).unwrap();
+    // Picked holes: none picked is refused; an edge of the middle hole sends its point.
+    if let Kind::Surface(crate::dialogs_surface::Surf::Untrim { holes, outer, .. }) = &mut d.kind {
+        *holes = 1;
+        *outer = true;
+    }
+    assert!(apply_commands(&app, &d).is_err(), "no holes picked");
+    d.inputs[1].items = vec![Sel::Edge { body: "Plate".into(), index: 0, point: Vec3::new(22.0, 10.0, 2.0) }];
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!((&p["holes"], &p["outer"]), (&json!([[22.0, 10.0, 2.0]]), &json!(true)), "{p}");
+    app.session.execute(&id, &p).unwrap();
+    let fid = app.session.doc.features.last().unwrap().id;
+    let back = crate::dialogs::for_feature(&app, fid, None).unwrap();
+    assert!(matches!(back.kind, Kind::Surface(crate::dialogs_surface::Surf::Untrim { holes: 1, outer: true, in_place: false })));
+    assert_eq!((back.inputs[0].items.len(), back.inputs[1].items.len()), (1, 1));
+}
+
+#[test]
 fn offset_surface_dialog_takes_faces_a_distance_and_the_chain() {
     // A box top picked, moved up 5: a 10 × 10 square at z = 15; Edit Feature brings it back.
     let mut app = app_with(json!([{"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10, "body_name": "Box"}}]));
@@ -1122,4 +1642,149 @@ fn a_primitive_without_a_pick_or_with_its_position_cleared_stays_at_the_origin()
     let v = Sel::Vertex { body: "Body1".into(), point: Vec3::new(40.0, 30.0, 20.0) };
     let (p, _) = primitive_on(&mut app, vec![v], "solid.sphere", |_| {});
     assert_eq!(p["center"], json!([40.0, 30.0, 20.0]), "{p}");
+}
+
+#[test]
+fn patch_dialog_takes_continuity_and_points_and_brings_them_back() {
+    // A tube with its top face taken off: the rim's edges, G1, through a point above it.
+    let mut app = app_with(json!([
+        {"command": "solid.cylinder", "params": {"radius": 10, "height": 30, "body_name": "Tube"}},
+        {"command": "surface.unstitch", "params": {"body": "Tube", "faces": [[0, 0, 30]]}}
+    ]));
+    let rim: Vec<Sel> = {
+        let st = app.session.model.state();
+        let m = st.body("Tube").unwrap().mesh();
+        m.edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.iter().all(|p| (p.z - 30.0).abs() < 1e-6))
+            .map(|(i, e)| Sel::Edge { body: "Tube".into(), index: i, point: e[e.len() / 2] })
+            .collect()
+    };
+    assert!(!rim.is_empty());
+    let mut d = start(&mut app, vec![], "surface.patch");
+    d.inputs[0].items = rim;
+    d.inputs[1].items = vec![Sel::Vertex { body: "Tube".into(), point: Vec3::new(0.0, 0.0, 36.0) }];
+    if let Kind::Surface(crate::dialogs_surface::Surf::Patch { continuity }) = &mut d.kind {
+        *continuity = 1;
+    }
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!((id.as_str(), &p["continuity"], &p["points"]), ("surface.patch", &json!("g1"), &json!([[0.0, 0.0, 36.0]])), "{p}");
+    app.session.execute(&id, &p).unwrap();
+    let top = app.session.model.state().bodies.last().unwrap().mesh().bounds().max.z;
+    assert!(top > 35.9, "the cap reaches the point: {top}");
+    // Edit Feature: G1 again, and the point (on no face) kept as it was.
+    let fid = app.session.doc.features.last().unwrap().id;
+    let back = crate::dialogs::for_feature(&app, fid, None).unwrap();
+    assert!(matches!(back.kind, Kind::Surface(crate::dialogs_surface::Surf::Patch { continuity: 1 })));
+    let (_, p) = apply_commands(&app, &back).unwrap().remove(0);
+    assert_eq!((&p["params"]["continuity"], &p["params"]["points"]), (&json!("g1"), &json!([[0.0, 0.0, 36.0]])), "{p}");
+}
+
+#[test]
+fn patch_dialog_rows_are_translated() {
+    for (lang, continuity, through) in [("en", "Continuity", "Pass through"), ("de", "Stetigkeit", "Durch Punkte"), ("ja", "連続性", "通過点")]
+    {
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.language = lang.into();
+        h.app.home.open = false;
+        h.call("ui.start", json!({"command": "surface.patch"}));
+        h.frames(3);
+        assert!(h.widget(continuity).is_some(), "{lang}: the Continuity row must show {continuity:?}");
+        assert!(h.widget(through).is_some(), "{lang}: the points input must show {through:?}");
+    }
+}
+
+/// Midplane opens a two-plane dialog. Starting it with nothing selected used to run the
+/// command and report that `a` is required.
+#[test]
+fn midplane_asks_for_two_planes_then_builds_the_one_between_them() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("construct.plane.offset", json!({"base":"XY","offset":"20 mm","name":"Shelf"})).unwrap();
+    h.app.start("construct.plane.midplane");
+    h.frames(2);
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(matches!(d.kind, Kind::Midplane));
+    assert_eq!(d.inputs.len(), 2);
+    let status = h.app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+    assert!(!status.contains("is required"), "{status}");
+    h.app.dialog.as_mut().unwrap().inputs[0].items = vec![Sel::Plane { name: "XY".into() }];
+    h.app.dialog.as_mut().unwrap().inputs[1].items = vec![Sel::Plane { name: "Shelf".into() }];
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let (_, _, pl) =
+        solidcraft_engine::view::construction_planes(&h.app.session).into_iter().find(|(_, name, _)| name != "Shelf").expect("the midplane");
+    assert!(pl.normal().cross(Vec3::Z).len() < 1e-6, "{pl:?}");
+    assert!((pl.origin.z - 10.0).abs() < 1e-6, "{pl:?}");
+}
+
+/// #2474, #2494: every construct tool asks for what it needs. Started from the toolbar with
+/// nothing selected, none of them runs its command and reports that `a` (or `face`, `edge`…)
+/// is required; a construct command added later without a dialog fails here too.
+#[test]
+fn every_construct_tool_opens_a_dialog_instead_of_failing() {
+    let mut h = crate::scenario::Harness::new();
+    // A body, so the tools that need one are enabled.
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+    let commands = h.app.session.execute("engine.commands", &json!({})).unwrap();
+    let ids: Vec<String> =
+        commands.as_array().unwrap().iter().filter_map(|c| c["id"].as_str()).filter(|id| id.starts_with("construct.")).map(String::from).collect();
+    assert!(ids.len() >= 17, "{ids:?}");
+    for id in &ids {
+        h.app.session.selection.clear();
+        h.app.status = None;
+        h.app.start(id);
+        h.frames(1);
+        let status = h.app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+        assert!(!status.contains("is required"), "{id}: {status}");
+        assert!(h.app.dialog.as_ref().is_some_and(|d| !d.inputs.is_empty()), "{id} opens a dialog that asks for picks");
+        crate::dialogs::cancel(&mut h.app);
+    }
+}
+
+/// #2494: two planes selected first, Axis Through Two Planes takes both and makes the axis
+/// where they meet.
+#[test]
+fn axis_through_two_preselected_planes_builds_their_intersection() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.session.selection = vec![Sel::Plane { name: "XY".into() }, Sel::Plane { name: "XZ".into() }];
+    h.app.start("construct.axis.two_planes");
+    h.frames(1);
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(matches!(d.kind, Kind::Construct { .. }));
+    assert_eq!((d.inputs[0].items.len(), d.inputs[1].items.len()), (1, 1), "each plane fills one input");
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let axes = solidcraft_engine::view::construction_axes(&h.app.session);
+    let (_, _, _, dir) = axes.first().expect("the axis");
+    assert!(dir.cross(Vec3::X).len() < 1e-6, "XY and XZ meet along X: {dir:?}");
+}
+
+/// #2474: Plane Through Two Edges takes two edges picked in the dialog.
+#[test]
+fn plane_through_two_picked_edges() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+    h.app.start("construct.plane.two_edges");
+    h.frames(1);
+    let edge = |p: Vec3| Sel::Edge { body: "Body1".into(), index: 0, point: p };
+    let d = h.app.dialog.as_mut().unwrap();
+    d.inputs[0].items = vec![edge(Vec3::new(10.0, 0.0, 20.0))];
+    d.inputs[1].items = vec![edge(Vec3::new(0.0, 10.0, 20.0))];
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let (_, _, pl) = solidcraft_engine::view::construction_planes(&h.app.session).into_iter().next().expect("the plane");
+    assert!(pl.normal().cross(Vec3::Z).len() < 1e-6 && (pl.origin.z - 20.0).abs() < 1e-6, "the top face's plane: {pl:?}");
+}
+
+/// Point Along Path asks for its position too, and a missing pick names the input.
+#[test]
+fn point_along_path_has_its_position_and_missing_picks_are_named() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.start("construct.point.along_path");
+    h.frames(1);
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Construct { t: Some(t), .. } if t == "0.5"));
+    h.step(&json!({"key":"Enter"})).unwrap();
+    let e = h.app.dialog.as_ref().and_then(|d| d.error.clone()).unwrap_or_default();
+    assert!(e.contains("path"), "{e}");
 }

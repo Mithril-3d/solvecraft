@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use crate::*;
-use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_geom::{Loop2, Plane, Region2, Seg2, UnitVec3, Vec2, Vec3};
 
 fn fixture() -> (Body, Body, Vec3, f64) {
     let slope = 1f64.to_radians().tan();
@@ -113,7 +113,7 @@ fn unproved_curved_boundary_between_clear_endpoints_refuses_recut() {
     assert!(a.len() > 5. && b.len() > 5., "endpoint samples miss the interior excursion");
     assert!(body.tessellate_with(1e-4, true).unwrap().contains(Vec3::new(4.5, 0., 16.06)));
     let before = step_export(&[&body], "curved source").unwrap();
-    assert!(crate::bore_guard::boundaries_clear(&body, &[], Vec3::ZERO, Vec3::Z, 5., 14., 24., 1e-6).is_none());
+    assert!(crate::bore_guard::boundaries_clear(&body, &[], Vec3::ZERO, UnitVec3::Z, 5., 14., 24., 1e-6).is_none());
     assert_eq!(step_export(&[&body], "curved source").unwrap(), before);
 }
 

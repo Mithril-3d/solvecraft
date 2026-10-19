@@ -27,9 +27,13 @@ struct CachedBody {
     size: f64,
 }
 
+/// A member of a contact set: (occurrence id, name).
+pub(super) type Member = (u64, String);
+
 pub(super) struct ContactGeometry {
     bodies: Vec<CachedBody>,
-    pairs: Vec<(usize, usize, String, String)>,
+    /// Body indices, and the set members (occurrence id, name) they are under.
+    pairs: Vec<(usize, usize, Member, Member)>,
     step: f64,
 }
 
@@ -41,6 +45,12 @@ impl ContactGeometry {
         } else {
             assembly.contact_sets.iter().filter(|set| !set.suppressed).map(|set| set.occurrences.clone()).collect()
         };
+        Self::of_sets(s, &sets)
+    }
+
+    /// The geometry of the bodies under `sets` (occurrence ids), paired as contact sets pair
+    /// them: bodies under different members of one set.
+    pub(super) fn of_sets(s: &Session, sets: &[Vec<u64>]) -> Result<Self> {
         let mut out = Self { bodies: Vec::new(), pairs: Vec::new(), step: f64::INFINITY };
         if sets.is_empty() {
             return Ok(out);
@@ -120,7 +130,7 @@ impl ContactGeometry {
             }
         }
         let mut pairs = BTreeSet::new();
-        for set in &sets {
+        for set in sets {
             let tagged: Vec<(usize, u64)> =
                 out.bodies.iter().enumerate().filter_map(|(i, b)| b.path.iter().rev().find(|id| set.contains(id)).map(|id| (i, *id))).collect();
             for (i, (a, oa)) in tagged.iter().enumerate() {
@@ -132,12 +142,27 @@ impl ContactGeometry {
             }
         }
         let name = |id| s.doc.occurrences.iter().find(|o| o.id == id).map(|o| o.name.clone()).unwrap_or_default();
-        out.pairs = pairs.into_iter().map(|(a, b, oa, ob)| (a, b, name(oa), name(ob))).collect();
+        out.pairs = pairs.into_iter().map(|(a, b, oa, ob)| (a, b, (oa, name(oa)), (ob, name(ob)))).collect();
         Ok(out)
     }
 
     pub(super) fn has_pairs(&self) -> bool {
         !self.pairs.is_empty()
+    }
+
+    /// Keeps only the pairs of set members (occurrence ids) `keep` takes.
+    pub(super) fn keep_pairs(&mut self, keep: impl Fn(u64, u64) -> bool) {
+        self.pairs.retain(|(_, _, a, b)| keep(a.0, b.0));
+    }
+
+    /// How many mesh points are placed for each check.
+    pub(super) fn vertex_count(&self) -> usize {
+        self.bodies.iter().map(|b| b.mesh.positions.len()).fold(0, usize::saturating_add)
+    }
+
+    /// How many pairs of set members are checked against each other.
+    pub(super) fn pair_count(&self) -> usize {
+        self.pairs.iter().map(|(_, _, a, b)| (a.0.min(b.0), a.0.max(b.0))).collect::<BTreeSet<_>>().len()
     }
 
     fn frame(body: &CachedBody, s: &Session) -> Result<Mat> {
@@ -205,6 +230,16 @@ impl ContactGeometry {
     }
 
     pub(super) fn first_hit(&self, s: &Session, work: &mut usize) -> Result<Option<(String, String, f64)>> {
+        Ok(self.hits(s, work, MAX_WORK, false)?.into_iter().next().map(|(a, b, depth)| (a.1, b.1, depth)))
+    }
+
+    /// The pairs of set members whose bodies pass through each other in `s`, with how deep the
+    /// first two bodies found go (every pair, or the first found when `all` is false). `work`
+    /// adds up the cost, refused past `budget`.
+    pub(super) fn hits(&self, s: &Session, work: &mut usize, budget: usize, all: bool) -> Result<Vec<(Member, Member, f64)>> {
+        let mut out: Vec<(Member, Member, f64)> = Vec::new();
+        // The member pairs found so far (lower id first).
+        let mut found: BTreeSet<(u64, u64)> = BTreeSet::new();
         let meshes: Vec<Mesh> = self
             .bodies
             .iter()
@@ -214,11 +249,19 @@ impl ContactGeometry {
                 Ok(Mesh { positions, triangles: body.mesh.triangles.clone(), ..Mesh::default() })
             })
             .collect::<Result<_>>()?;
-        for (a, b, aname, bname) in &self.pairs {
+        // Each mesh's box once, not once per pair it is in.
+        let boxes: Vec<Aabb3> = meshes.iter().map(Mesh::bounds).collect();
+        for (a, b, oa, ob) in &self.pairs {
+            // Members already found colliding need no more of their bodies tested.
+            if found.contains(&(oa.0.min(ob.0), oa.0.max(ob.0))) {
+                continue;
+            }
             let (Some(ma), Some(mb), Some(ba), Some(bb)) = (meshes.get(*a), meshes.get(*b), self.bodies.get(*a), self.bodies.get(*b)) else {
                 return Err(limit("invalid contact geometry pair"));
             };
-            let (aabb, bbb) = (ma.bounds(), mb.bounds());
+            let (Some(aabb), Some(bbb)) = (boxes.get(*a), boxes.get(*b)) else {
+                return Err(limit("invalid contact geometry pair"));
+            };
             if aabb.max.x < bbb.min.x
                 || bbb.max.x < aabb.min.x
                 || aabb.max.y < bbb.min.y
@@ -235,14 +278,18 @@ impl ContactGeometry {
                 .saturating_mul(mb.triangles.len())
                 .saturating_add(mb.positions.len().saturating_add(mb.triangles.len().saturating_mul(4)).saturating_mul(ma.triangles.len()));
             *work = work.saturating_add(cost);
-            if *work > MAX_WORK {
+            if *work > budget {
                 return Err(limit("motion exceeds contact sweep collision budget; simplify the contact set or use smaller increments"));
             }
             if let Some(depth) = super::mesh_overlap(ma, mb, 1e-4 * ba.size.max(bb.size).max(1.0)) {
-                return Ok(Some((aname.clone(), bname.clone(), depth)));
+                found.insert((oa.0.min(ob.0), oa.0.max(ob.0)));
+                out.push((oa.clone(), ob.clone(), depth));
+                if !all {
+                    break;
+                }
             }
         }
-        Ok(None)
+        Ok(out)
     }
 }
 

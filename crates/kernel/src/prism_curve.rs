@@ -5,6 +5,9 @@ use solidcraft_geom::{Plane, Seg2, Vec2};
 use truck_modeling::{self as mt, BoundedCurve, Invertible, ParametricCurve};
 
 const MAX_DEGREE: usize = 32;
+/// How far an arc read off a curve may end from the curve's end (mm): half the gap a profile
+/// loop may have between segments and still close (`crate::build`).
+const ARC_END_TOL: f64 = 5e-7;
 const MAX_CONTROLS: usize = 4096;
 type H = [f64; 3];
 
@@ -239,6 +242,18 @@ pub(super) fn segment_fitted(e: &mt::Edge, plane: &Plane, tol: f64, fit: f64, wo
 }
 
 pub(super) fn segment(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize) -> Option<Vec<Seg2>> {
+    read(e, plane, tol, work, false)
+}
+
+/// Edge `e` in `plane` exactly, for a sketch to project it: as [`segment`], and a curve of
+/// several Bézier spans (a chain of a font's curves, a spline through points) as one segment
+/// per span, each the line, conic or Bézier it is. `None` when the edge doesn't lie in a plane
+/// parallel to `plane` or isn't read exactly.
+pub(crate) fn projected(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize) -> Option<Vec<Seg2>> {
+    read(e, plane, tol, work, true)
+}
+
+fn read(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize, each_span: bool) -> Option<Vec<Seg2>> {
     if !tol.is_finite() || tol <= 0. {
         return None;
     }
@@ -276,6 +291,98 @@ pub(super) fn segment(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize) -
     if a.dist(b) > tol && spans.iter().all(|s| line_span(s, a, b, tol, error, work).is_some()) {
         return Some(vec![Seg2::Line { a, b }]);
     }
+    arc(&c, &spans, plane, a, b, tol, error, work)
+        .or_else(|| free_form(&spans, a, b, tol))
+        .or_else(|| if each_span { span_by_span(&spans, a, b, tol) } else { None })
+}
+
+/// Several `spans` end to end, from `a` to `b`, each as the segment it is: a span whose control
+/// polygon lies along its chord a line, the others as [`free_form`] reads them. Spans whose
+/// ends meet are left out; each segment starts where the one before ended.
+fn span_by_span(spans: &[Vec<H>], a: Vec2, b: Vec2, tol: f64) -> Option<Vec<Seg2>> {
+    let spans: Vec<&Vec<H>> = spans.iter().filter(|s| s.first().zip(s.last()).is_some_and(|(p, q)| point(*p).dist(point(*q)) > tol)).collect();
+    if spans.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut start = a;
+    for (i, span) in spans.iter().enumerate() {
+        let end = if i + 1 == spans.len() { b } else { point(*span.last()?) };
+        let seg = match free_form(std::slice::from_ref(*span), start, end, tol) {
+            Some(mut s) => s.pop()?,
+            None if span.iter().all(|p| (p[2] - 1.).abs() <= 1e-12) && off_chord(&span.iter().map(|p| point(*p)).collect::<Vec<_>>()) <= tol => {
+                Seg2::Line { a: start, b: end }
+            }
+            None => return None,
+        };
+        out.push(seg);
+        start = end;
+    }
+    Some(out)
+}
+
+/// How far the control points `pts` lie off the chord between the first and the last.
+fn off_chord(pts: &[Vec2]) -> f64 {
+    let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied()) else { return f64::INFINITY };
+    let chord = last - first;
+    let len = chord.len();
+    if !(len > 0.) {
+        return f64::INFINITY;
+    }
+    pts.iter().map(|p| chord.cross(*p - first).abs()).fold(0., f64::max) / len
+}
+
+/// One Bézier span that is neither a line nor an arc, as the exact free-form segment it is
+/// (a font's quadratic or cubic, a conic), its ends `a` and `b`. `None` for several spans (a
+/// curve that may wind about more than once), degrees past [`solidcraft_geom::MAX_BEZIER_DEGREE`],
+/// rational spans other than conics, and control polygons with no area (a curve doubling back
+/// along a line).
+fn free_form(spans: &[Vec<H>], a: Vec2, b: Vec2, tol: f64) -> Option<Vec<Seg2>> {
+    let [span] = spans else { return None };
+    let pts: Vec<Vec2> = span.iter().map(|p| point(*p)).collect();
+    let (first, last) = (*pts.first()?, *pts.last()?);
+    if first.dist(a) > tol || last.dist(b) > tol || first.dist(last) <= tol {
+        return None;
+    }
+    // Twice the area the control polygon spans off the chord: none is a line, maybe doubling back.
+    let chord = last - first;
+    let off = pts.iter().map(|p| chord.cross(*p - first).abs()).fold(0., f64::max) / chord.len();
+    if !(off > tol) {
+        return None;
+    }
+    let rational = span.iter().any(|p| (p[2] - 1.).abs() > 1e-12);
+    let seg = match (pts.len(), rational) {
+        (_, false) => solidcraft_geom::bezier(&pts)?,
+        (3, true) => {
+            // Weights normalised to 1 at the ends: the middle one is the conic's.
+            let (w0, w1, w2) = (span[0][2], span[1][2], span[2][2]);
+            let w = w1 / (w0 * w2).sqrt();
+            if !(w.is_finite() && w > 1e-9) {
+                return None;
+            }
+            Seg2::Conic { a: first, apex: pts[1], b: last, w }
+        }
+        _ => return None,
+    };
+    // The exact ends of the edge (the span's agree within the tolerance).
+    let seg = match seg {
+        Seg2::Cubic { p1, p2, .. } => Seg2::Cubic { p0: a, p1, p2, p3: b },
+        Seg2::Conic { apex, w, .. } => Seg2::Conic { a, apex, b, w },
+        Seg2::Bezier { n, mut p } => {
+            *p.first_mut()? = a;
+            *p.get_mut(n as usize)? = b;
+            Seg2::Bezier { n, p }
+        }
+        other => other,
+    };
+    Some(vec![seg])
+}
+
+/// The spline `c` (its Bézier `spans` in the plane, from `a` to `b`) as a circular arc, when
+/// whole-span proofs show it is one.
+#[allow(clippy::too_many_arguments)]
+fn arc(c: &mt::Curve, spans: &[Vec<H>], plane: &Plane, a: Vec2, b: Vec2, tol: f64, error: f64, work: &mut usize) -> Option<Vec<Seg2>> {
+    let (t0, t1) = c.range_tuple();
     // Samples are only a candidate proposal. Whole-span implicit and oriented
     // angular proofs below are required before converting any spline to an arc.
     let q = plane.to_local(from_p3(c.subs(t0 + (t1 - t0) * 5. / 16.))) - a;
@@ -290,7 +397,7 @@ pub(super) fn segment(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize) -
         return None;
     }
     let mut sweep: f64 = 0.;
-    for span in &spans {
+    for span in spans {
         let ds = circle_span(span, center, radius, tol, error, 0, work)?;
         if sweep != 0. && sweep.signum() != ds.signum() {
             return None;
@@ -299,7 +406,10 @@ pub(super) fn segment(e: &mt::Edge, plane: &Plane, tol: f64, work: &mut usize) -
     }
     let start = (a - center).angle();
     let end = center + Vec2::new((start + sweep).cos(), (start + sweep).sin()) * radius;
-    if end.dist(b) + error > tol {
+    // The arc ends where the curve does, as closely as a profile loop must close: within `tol`
+    // only (which grows with the model), a curve that is merely near a circle (a font's) would
+    // come back as an arc ending off the next segment's start, and the loop would not close.
+    if end.dist(b) + error > tol.min(ARC_END_TOL) {
         return None;
     }
     let closed = a.dist(b) < tol;
@@ -415,6 +525,29 @@ mod tests {
         assert!(backtrack.curve().der(1. / 3.).x < -1.);
         assert!(segment(&backtrack, &Plane::XY, 1e-5, &mut 2_000_000).is_none());
         assert!(segment(&arc, &Plane::XY, 1e-5, &mut 0).is_none());
+    }
+
+    /// A curve read as an arc ends where the curve does, however large the tolerance (it grows
+    /// with the part): a font's quadratic that is within a micron of a circle, not on one, is
+    /// kept as the curve it is. Read as an arc whose end is a micron off, the outline of a letter
+    /// cut into a 2 m plate did not close.
+    #[test]
+    fn a_curve_near_a_circle_is_not_an_arc_ending_off_it() {
+        // A parabola within a micron of the circle through its ends and middle.
+        let e = edge(&[0., 2., 0.], &[0., 0., 0.2], &[1.], 2);
+        let (a, b) = (Vec2::new(0., 0.), Vec2::new(2., 0.2));
+        assert!(from_p3(e.back().point()).dist(solidcraft_geom::Vec3::new(2., 0.2, 0.)) < 1e-12);
+        for tol in [1e-5, 2e-3] {
+            let segs = segment(&e, &Plane::XY, tol, &mut 2_000_000).unwrap();
+            let (first, last) = (segs.first().unwrap(), segs.last().unwrap());
+            assert!(first.start().dist(a) < 1e-9 && last.end().dist(b) < 1e-9, "{tol}: {segs:?}");
+        }
+        // A true arc is still one at either tolerance.
+        let (p, q) = (mt::Vertex::new(mt::Point3::new(10., 0., 0.)), mt::Vertex::new(mt::Point3::new(0., 10., 0.)));
+        let arc = builder::circle_arc(&p, &q, mt::Point3::new(10. / 2f64.sqrt(), 10. / 2f64.sqrt(), 0.));
+        for tol in [1e-5, 2e-3] {
+            assert!(matches!(segment(&arc, &Plane::XY, tol, &mut 2_000_000).unwrap()[..], [Seg2::Arc { .. }]));
+        }
     }
 
     #[test]

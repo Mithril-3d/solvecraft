@@ -127,3 +127,39 @@ fn stl_export_is_closed_where_faces_meet() {
         }
     }
 }
+
+#[test]
+fn save_mesh_rejects_unknown_format_and_slicer_without_writing() {
+    let mut s = imported_box();
+    let path = std::env::temp_dir().join(format!("solvecraft-save-mesh-{}.stl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    for params in [json!({"path":path,"format":"nope"}), json!({"path":path,"slicer":"no such slicer anywhere"})] {
+        assert!(s.execute("file.save_mesh", &params).is_err());
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn save_mesh_writes_stl_and_3mf() {
+    let mut s = imported_box();
+    let dir = std::env::temp_dir();
+    for (ext, format) in [("stl", None), ("3mf", None), ("dat", Some("3mf"))] {
+        let path = dir.join(format!("solvecraft-save-mesh-{}.{ext}", std::process::id()));
+        let mut params = json!({"path": path});
+        if let Some(f) = format {
+            params["format"] = json!(f);
+        }
+        s.execute("file.save_mesh", &params).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // A 3MF file is a zip archive; a binary STL starts with its 80-byte header.
+        assert_eq!(bytes.starts_with(b"PK"), ext == "3mf" || format == Some("3mf"), "{ext}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn installed_slicers_are_listed() {
+    let mut s = imported_box();
+    let r = s.execute("file.slicers", &json!({})).unwrap();
+    assert!(r["slicers"].is_array());
+}

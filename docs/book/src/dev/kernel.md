@@ -33,5 +33,11 @@ wired in with `[patch.crates-io]`. The patches fix robustness bugs found by our 
 STEP corpus. `vendor/` is excluded from our fmt and clippy rules, and each patch should go
 upstream when it can.
 
+Equal cylinders crossing each other (`tangent_cylinders.rs`) touch at two points, which truck's
+mesh-based intersection cannot trace through. When a boolean of such a pair fails, the kernel
+splits both cylinder faces along the line through the touching points and takes the boolean of
+the split bodies; the shapeops patch that picks the corner of a face at a vertex several curves
+end on makes the arms of the crossing connect.
+
 Some truck assertions only run in debug builds and can fail on valid geometry, so tests and CI
 run with `--release`.

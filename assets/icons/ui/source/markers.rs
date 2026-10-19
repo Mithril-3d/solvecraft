@@ -5,8 +5,9 @@ use egui::{Color32, Pos2, Stroke, vec2};
 
 pub(crate) fn snap(painter: &egui::Painter, c: Pos2, tip: Option<Pos2>, kind: SnapKind, col: Color32, tag: Option<&str>) {
     // A dark halo under every stroke keeps the glyph readable on light and dark faces alike.
-    let halo = Stroke::new(4.5, Color32::from_black_alpha(150));
-    let white = Stroke::new(1.5, Color32::WHITE);
+    let ic = Tokens::get().icons;
+    let halo = Stroke::new(4.5, ic.marker_halo);
+    let white = Stroke::new(1.5, ic.highlight);
     if let Some(tip) = tip {
         let d = (tip - c).normalized();
         let n = vec2(-d.y, d.x);
@@ -30,7 +31,7 @@ pub(crate) fn snap(painter: &egui::Painter, c: Pos2, tip: Option<Pos2>, kind: Sn
             }
         }
     };
-    painter.add(shape(Color32::from_black_alpha(150), Stroke::NONE, 4.0));
+    painter.add(shape(ic.marker_halo, Stroke::NONE, 4.0));
     painter.add(shape(col, Stroke::NONE, 0.0));
     match kind {
         SnapKind::FaceCenter => {
@@ -38,8 +39,8 @@ pub(crate) fn snap(painter: &egui::Painter, c: Pos2, tip: Option<Pos2>, kind: Sn
         }
         SnapKind::CircleCenter => {
             painter.circle_stroke(c, 7.0, white);
-            painter.line_segment([c - vec2(4.5, 0.0), c + vec2(4.5, 0.0)], Stroke::new(1.2, Color32::WHITE));
-            painter.line_segment([c - vec2(0.0, 4.5), c + vec2(0.0, 4.5)], Stroke::new(1.2, Color32::WHITE));
+            painter.line_segment([c - vec2(4.5, 0.0), c + vec2(4.5, 0.0)], Stroke::new(1.2, ic.highlight));
+            painter.line_segment([c - vec2(0.0, 4.5), c + vec2(0.0, 4.5)], Stroke::new(1.2, ic.highlight));
         }
         SnapKind::EdgeMid | SnapKind::Vertex => {
             painter.add(shape(Color32::TRANSPARENT, white, 0.0));

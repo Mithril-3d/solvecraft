@@ -17,7 +17,7 @@ fn shell_document() -> (Document, u64, u64) {
     let shell = doc
         .add_feature(
             FeatureKind::Shell {
-                faces: vec![Vec3::new(5., 6., 10.)],
+                faces: vec![crate::FacePick(Vec3::new(5., 6., 10.))],
                 thickness: "wall".into(),
                 body: Some("Case".into()),
                 direction: "inside".into(),
@@ -118,7 +118,8 @@ fn shell_planar_anchor_rebuild_cold_geometry_and_missing_source_errors() {
     let boss = doc
         .add_feature(
             FeatureKind::Extrude {
-                sketch: sk,
+                thin: None,
+                sketch: crate::SketchId(sk),
                 profiles: crate::ProfileSel::All,
                 extent: serde_json::from_value(json!({"distance":"2"})).unwrap(),
                 operation: crate::Operation::NewBody,
@@ -280,7 +281,8 @@ fn saved_former_strip_projection_reports_lost_without_expanding_healthy_material
     let boss = doc
         .add_feature(
             FeatureKind::Extrude {
-                sketch: sk,
+                thin: None,
+                sketch: crate::SketchId(sk),
                 profiles: crate::ProfileSel::All,
                 extent: serde_json::from_value(json!({"distance":"1"})).unwrap(),
                 operation: crate::Operation::NewBody,
@@ -342,7 +344,7 @@ fn saved_curved_strip_projection_is_lost_after_exact_wall_coalescence() {
     let shell = doc
         .add_feature(
             FeatureKind::Shell {
-                faces: vec![Vec3::new(0., 0., 30.)],
+                faces: vec![crate::FacePick(Vec3::new(0., 0., 30.))],
                 thickness: "wall".into(),
                 body: Some("Case".into()),
                 direction: "inside".into(),
@@ -429,7 +431,8 @@ fn saved_curved_strip_projection_is_lost_after_exact_wall_coalescence() {
     let boss = doc
         .add_feature(
             FeatureKind::Extrude {
-                sketch: sk,
+                thin: None,
+                sketch: crate::SketchId(sk),
                 profiles: crate::ProfileSel::All,
                 extent: serde_json::from_value(json!({"distance":"1"})).unwrap(),
                 operation: crate::Operation::NewBody,
@@ -553,7 +556,8 @@ fn saved_stepped_tab_cut_piece_projection_is_lost_without_expanding_material() {
     let material = doc
         .add_feature(
             FeatureKind::Extrude {
-                sketch: sk,
+                thin: None,
+                sketch: crate::SketchId(sk),
                 profiles: crate::ProfileSel::All,
                 extent: serde_json::from_value(json!({"distance":"1"})).unwrap(),
                 operation: crate::Operation::NewBody,

@@ -17,8 +17,15 @@
 //!   written again; at most [`MAX_NEW_PER_SESSION`] new reports per run, [`MAX_REPORTS`]
 //!   reports, [`MAX_TOTAL_BYTES`] on disk, nothing older than [`MAX_AGE_DAYS`] days.
 //!
+//! - **Startup steps** ([`phase`]): the journal keeps the step the app is in while it gets its
+//!   window and graphics device up, so a crash inside a graphics driver still says where it
+//!   happened, and the renderer ([`set_environment`]) once it is known.
+//! - **Native crashes** (Windows): the app's exception filter writes what it caught (exception
+//!   code, faulting module and offset) and a minidump next to the journal ([`native_paths`]);
+//!   the next start puts both into the unclean exit's report.
+//!
 //! Reports are folders `crashes/<time>-<signature>/` holding `report.json`, and when known
-//! `design.solidcraft` and `replay.json`. Nothing is ever sent anywhere.
+//! `design.solidcraft`, `replay.json` and `minidump.dmp`. Nothing is ever sent anywhere.
 
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
@@ -93,7 +100,12 @@ struct State {
     known: Mutex<HashMap<u64, (u64, String)>>,
     written: AtomicUsize,
     started: u64,
+    /// When the app started, in milliseconds (for how far into the start a step came).
+    started_ms: u64,
 }
+
+/// The startup step that ends startup: the app is up and drawing.
+pub const RUNNING: &str = "running";
 
 static STATE: OnceLock<State> = OnceLock::new();
 /// The hook is writing a report (a panic inside it must not write another).
@@ -129,6 +141,10 @@ pub fn default_dir() -> Option<PathBuf> {
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// `secs` since 1970 as (year, month, day, hour, minute, second) in UTC.
@@ -279,10 +295,12 @@ fn frames(bt: &str) -> Vec<String> {
 pub fn install(dir: PathBuf, build: Build) -> Vec<Summary> {
     let _ = fs::create_dir_all(dir.join("sessions"));
     let started = now();
+    let started_ms = now_ms();
     for path in dead_journals(&dir) {
         unclean_exit(&dir, &build, &path);
         let _ = fs::remove_file(&path);
     }
+    remove_stray_native_files(&dir);
     prune(&dir, started);
     // Reports the user has been told about (by id).
     let seen_file = dir.join(".seen");
@@ -304,6 +322,7 @@ pub fn install(dir: PathBuf, build: Build) -> Vec<Summary> {
             known: Mutex::new(known),
             written: AtomicUsize::new(0),
             started,
+            started_ms,
         })
         .is_ok()
     {
@@ -323,6 +342,53 @@ pub fn set_environment(text: &str) {
         && let Ok(mut e) = s.environment.lock()
     {
         *e = limited(text, 500);
+        if let Ok(mut j) = s.journal.lock() {
+            let line = json!({ "environment": *e }).to_string();
+            j.write(&line);
+            j.environment = Some(line);
+        }
+    }
+}
+
+/// The app is about to start a step of getting up (`"window"`, `"device creation"`, …; [`RUNNING`]
+/// once it draws): the journal keeps the latest, so a crash nothing catches (inside a graphics
+/// driver, say) is still reported with the step it happened in.
+pub fn phase(step: &str) {
+    let Some(s) = STATE.get() else { return };
+    if let Ok(mut j) = s.journal.lock() {
+        if j.phase_step.as_deref() == Some(step) {
+            return;
+        }
+        let line = json!({ "phase": limited(step, 200), "ms": now_ms().saturating_sub(s.started_ms) }).to_string();
+        j.write(&line);
+        j.phase = Some(line);
+        j.phase_step = Some(step.to_string());
+    }
+}
+
+/// Where a native crash handler writes what it caught for this run: a small JSON file
+/// (`code`, `name`, `address`, `module`, `offset`, `detail`, `thread`) and a minidump. The next
+/// start reports both with this run's unclean exit. `None` before [`install`] or without a journal.
+pub fn native_paths() -> Option<(PathBuf, PathBuf)> {
+    let s = STATE.get()?;
+    let j = s.journal.lock().ok()?;
+    j.path.as_ref().map(|p| native_paths_for(p))
+}
+
+fn native_paths_for(journal: &Path) -> (PathBuf, PathBuf) {
+    (journal.with_extension("native.json"), journal.with_extension("dmp"))
+}
+
+/// Native crash files whose journal is gone (their report was written, or never will be).
+fn remove_stray_native_files(dir: &Path) {
+    for path in fs::read_dir(dir.join("sessions")).into_iter().flatten().flatten().map(|e| e.path()).take(200) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let stem = name.strip_suffix(".native.json").or_else(|| name.strip_suffix(".dmp"));
+        if let Some(stem) = stem
+            && !path.with_file_name(format!("{stem}.jsonl")).exists()
+        {
+            let _ = fs::remove_file(&path);
+        }
     }
 }
 
@@ -473,6 +539,8 @@ pub(crate) fn command_done(
             recent,
             base: json!("the design as it was when the command started"),
             notes: Vec::new(),
+            fields: serde_json::Map::new(),
+            attach: Vec::new(),
         };
         write_report(state, kind, Some(&p), extra);
     }
@@ -508,6 +576,10 @@ struct Journal {
     header: String,
     /// Where the running command's line starts (to take it back when it changed nothing).
     running_at: Option<u64>,
+    /// The latest startup step's line and name, and the renderer's line (kept across rebases).
+    phase: Option<String>,
+    phase_step: Option<String>,
+    environment: Option<String>,
 }
 
 impl Journal {
@@ -517,7 +589,18 @@ impl Journal {
         // Append-only handles cannot truncate on Windows; seek explicitly for each write.
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path).ok().filter(|f| f.try_lock().is_ok());
         let header = json!({ "start": utc(started), "pid": std::process::id(), "version": build.version, "commit": build.commit }).to_string();
-        let mut j = Journal { path: file.as_ref().map(|_| path), file, bytes: 0, full: false, last_doc: 0, header, running_at: None };
+        let mut j = Journal {
+            path: file.as_ref().map(|_| path),
+            file,
+            bytes: 0,
+            full: false,
+            last_doc: 0,
+            header,
+            running_at: None,
+            phase: None,
+            phase_step: None,
+            environment: None,
+        };
         j.rebase(&json!("new"), 0);
         j
     }
@@ -547,6 +630,9 @@ impl Journal {
         let h = self.header.clone();
         self.write(&h);
         self.record(&json!({ "base": base }));
+        for line in [self.phase.clone(), self.environment.clone()].into_iter().flatten() {
+            self.write(&line);
+        }
     }
 
     fn run(&mut self, id: &str, params: &Value) {
@@ -601,6 +687,10 @@ struct JournalRead {
     recent: Vec<Value>,
     complete: bool,
     reported: bool,
+    /// The latest startup step and how many milliseconds after the start it began.
+    phase: Option<(String, u64)>,
+    /// The renderer, once known.
+    environment: Option<String>,
 }
 
 // Read through the lock-owning file object. On Windows an independently opened
@@ -626,7 +716,10 @@ fn read_journal_file(mut file: File) -> JournalRead {
             r.header = v;
             continue;
         }
-        r.reported = v.get("reported").is_some();
+        // Startup steps and the renderer say nothing about whether the run was reported.
+        if v.get("phase").is_none() && v.get("environment").is_none() {
+            r.reported = v.get("reported").is_some();
+        }
         if let Some(b) = v.get("base") {
             r.base = b.clone();
             r.replay.clear();
@@ -655,6 +748,10 @@ fn read_journal_file(mut file: File) -> JournalRead {
             }
         } else if v.get("full").is_some() {
             r.complete = false;
+        } else if let Some(p) = v.get("phase").and_then(Value::as_str) {
+            r.phase = Some((p.to_string(), v.get("ms").and_then(Value::as_u64).unwrap_or(0)));
+        } else if let Some(e) = v.get("environment").and_then(Value::as_str) {
+            r.environment = Some(e.to_string());
         }
     }
     r.in_flight = running;
@@ -678,33 +775,84 @@ fn dead_journals(dir: &Path) -> Vec<PathBuf> {
 
 fn unclean_exit(dir: &Path, build: &Build, journal: &Path) {
     let j = read_journal(journal);
+    let (native_file, dump_file) = native_paths_for(journal);
+    let native = fs::read(&native_file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object);
     if j.reported {
         return;
     }
     let was = j.header.get("version").and_then(Value::as_str).unwrap_or("?");
     let when = j.header.get("start").and_then(Value::as_str).unwrap_or("?");
     let doing = j.in_flight.as_ref().and_then(|c| c.get("command")).and_then(Value::as_str);
-    let message = match doing {
-        Some(c) => format!("SolidCraft {was} (started {when}) ended without a clean exit while running `{c}`"),
-        None => format!("SolidCraft {was} (started {when}) ended without a clean exit between commands"),
+    // A run that never got to drawing died while starting up: say at which step.
+    let starting = j.phase.as_ref().filter(|(p, _)| p != RUNNING).map(|(p, ms)| (p.clone(), *ms));
+    let during = match (&starting, doing) {
+        (Some((p, ms)), _) => format!("during startup ({p}, {:.1} s after launch)", *ms as f64 / 1000.0),
+        (None, Some(c)) => format!("while running `{c}`"),
+        (None, None) => "between commands".to_string(),
+    };
+    let field = |k: &str| native.as_ref().and_then(|n| n.get(k)).and_then(Value::as_str).map(|v| limited(v, 300));
+    let (message, location, signature_text, backtrace) = match &native {
+        Some(_) => {
+            let code = field("code").unwrap_or_else(|| "?".into());
+            let name = field("name").unwrap_or_else(|| "exception".into());
+            let module = field("module").unwrap_or_else(|| "(unknown module)".into());
+            let short = module.rsplit(['\\', '/']).next().unwrap_or(&module).to_string();
+            let offset = field("offset").unwrap_or_else(|| "?".into());
+            let at = format!("{short}+{offset}");
+            let mut frames = vec![format!("{code} {name}{}", field("detail").map(|d| format!(" ({d})")).unwrap_or_default())];
+            frames.push(format!("at {module}+{offset} (address {})", field("address").unwrap_or_else(|| "?".into())));
+            if let Some(t) = native.as_ref().and_then(|n| n.get("thread")).and_then(Value::as_u64) {
+                frames.push(format!("on thread {t}"));
+            }
+            (
+                format!("SolidCraft {was} (started {when}) crashed with {name} ({code}) in {at} {during}"),
+                format!("native exception in {at}"),
+                format!("{code} {short} {}", starting.as_ref().map_or(doing.unwrap_or("idle"), |(p, _)| p.as_str())),
+                frames,
+            )
+        }
+        None => (
+            format!("SolidCraft {was} (started {when}) ended without a clean exit {during}"),
+            match (&starting, doing) {
+                (Some((p, _)), _) => format!("unclean exit during startup: {p}"),
+                (None, c) => format!("unclean exit in {}", c.unwrap_or("(between commands)")),
+            },
+            match &starting {
+                Some((p, _)) => format!("startup: {p}"),
+                None => doing.unwrap_or("idle").to_string(),
+            },
+            Vec::new(),
+        ),
     };
     // A temporary state just for this report (the app's own is not set up yet).
     let state = State {
         dir: dir.to_path_buf(),
         build: build.clone(),
-        environment: Mutex::new(String::new()),
-        journal: Mutex::new(Journal { path: None, file: None, bytes: 0, full: true, last_doc: 0, header: String::new(), running_at: None }),
+        environment: Mutex::new(j.environment.clone().unwrap_or_default()),
+        journal: Mutex::new(Journal {
+            path: None,
+            file: None,
+            bytes: 0,
+            full: true,
+            last_doc: 0,
+            header: String::new(),
+            running_at: None,
+            phase: None,
+            phase_step: None,
+            environment: None,
+        }),
         known: Mutex::new(list(dir).into_iter().filter_map(|s| sig_of(&s.id).map(|sig| (sig, (0, s.id)))).collect()),
         written: AtomicUsize::new(0),
         started: now(),
+        started_ms: now_ms(),
     };
     let p = Panic {
         message,
-        location: format!("unclean exit in {}", doing.unwrap_or("(between commands)")),
+        location,
         thread: "(unknown)".into(),
-        backtrace: Vec::new(),
+        backtrace,
         recovered: false,
-        signature: signature("unclean exit", doing.unwrap_or("idle")),
+        signature: signature(if native.is_some() { "native exception" } else { "unclean exit" }, &signature_text),
     };
     if let Ok(mut k) = state.known.lock()
         && let Some(e) = k.get_mut(&p.signature)
@@ -715,7 +863,13 @@ fn unclean_exit(dir: &Path, build: &Build, journal: &Path) {
         bump(dir, &id, n);
         return;
     }
-    let extra = from_journal(j);
+    let mut extra = from_journal(j);
+    if let Some(n) = native {
+        extra.fields.insert("native".into(), n);
+        if dump_file.is_file() {
+            extra.attach.push(("minidump".into(), dump_file, "minidump.dmp".into()));
+        }
+    }
     write_report(&state, "unclean_exit", Some(&p), extra);
 }
 
@@ -729,6 +883,10 @@ struct Extra {
     recent: Vec<Value>,
     base: Value,
     notes: Vec<String>,
+    /// More top-level fields for the report (`startup_phase`, `native`).
+    fields: serde_json::Map<String, Value>,
+    /// Files moved into the report's folder: (key in `files`, source, name in the folder).
+    attach: Vec<(String, PathBuf, String)>,
 }
 
 /// Design and replay from a journal: the base design (autosave or saved file) and the commands
@@ -762,7 +920,20 @@ fn from_journal(j: JournalRead) -> Extra {
     if j.base.as_str() == Some("unknown") {
         notes.push("the design changed outside commands before this; it cannot be rebuilt from the journal".into());
     }
-    Extra { command: j.in_flight, design, replay: replay.then(|| json!({ "commands": commands })), recent: j.recent, base: j.base, notes }
+    let mut fields = serde_json::Map::new();
+    if let Some((p, ms)) = j.phase.filter(|(p, _)| p != RUNNING) {
+        fields.insert("startup_phase".into(), json!({ "step": p, "ms": ms }));
+    }
+    Extra {
+        command: j.in_flight,
+        design,
+        replay: replay.then(|| json!({ "commands": commands })),
+        recent: j.recent,
+        base: j.base,
+        notes,
+        fields,
+        attach: Vec::new(),
+    }
 }
 
 fn write_from_journal(state: &State, kind: &str, p: Option<&Panic>) -> Option<String> {
@@ -805,13 +976,19 @@ fn write_report(state: &State, kind: &str, p: Option<&Panic>, extra: Extra) -> O
         {
             files.insert("replay".into(), json!("replay.json"));
         }
+        for (key, from, name) in &extra.attach {
+            let to = folder.join(name);
+            if fs::rename(from, &to).is_ok() || fs::copy(from, &to).is_ok() {
+                files.insert(key.clone(), json!(name));
+            }
+        }
         let reproduce = match (files.contains_key("replay"), files.contains_key("design")) {
             (true, true) => Some(format!("solidcraft-cli crashes replay {id}")),
             (true, false) => Some(format!("solidcraft-cli crashes replay {id}  (starts from a new design)")),
             _ => None,
         };
         let environment = state.environment.lock().map(|e| e.clone()).unwrap_or_default();
-        let report = json!({
+        let mut report = json!({
             "format": FORMAT,
             "id": id,
             "kind": kind,
@@ -833,6 +1010,11 @@ fn write_report(state: &State, kind: &str, p: Option<&Panic>, extra: Extra) -> O
             "reproduce": reproduce,
             "notes": notes,
         });
+        if let Some(r) = report.as_object_mut() {
+            for (k, v) in extra.fields {
+                r.entry(k).or_insert(v);
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&report).ok()?;
         solidcraft_io::write_atomic(&folder.join("report.json"), &bytes, false).ok()?;
         prune(&state.dir, t);
@@ -957,7 +1139,7 @@ pub fn read(dir: &Path, id: &str) -> std::result::Result<Value, String> {
     let folder = dir.join(id);
     let mut v = read_report_file(&folder.join("report.json")).ok_or_else(|| format!("no crash report `{id}`"))?;
     v["path"] = json!(folder.to_string_lossy());
-    for (k, f) in [("design_path", "design.solidcraft"), ("replay_path", "replay.json")] {
+    for (k, f) in [("design_path", "design.solidcraft"), ("replay_path", "replay.json"), ("minidump_path", "minidump.dmp")] {
         if folder.join(f).is_file() {
             v[k] = json!(folder.join(f).to_string_lossy());
         }

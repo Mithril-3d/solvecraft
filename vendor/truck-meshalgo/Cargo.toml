@@ -68,6 +68,9 @@ version = "0.5.0"
 [dependencies.truck-geometry]
 version = "0.5.0"
 
+[dependencies.truck-modeling]
+version = "0.6.0"
+
 [dependencies.truck-polymesh]
 version = "0.6.0"
 
@@ -94,6 +97,8 @@ default = [
     "tessellation",
 ]
 filters = []
+# Exposes equivalence checks for the SolidCraft kernel tests. Never on in shipped builds.
+test-hooks = []
 tessellation = [
     "spade",
     "filters",

@@ -207,7 +207,7 @@ fn iso_curve(s: &mt::Surface, d: Dir, mid: f64, q1: mt::Point3, q2: mt::Point3, 
 }
 
 /// The iso-curve of a homogeneous B-spline surface at `v = w` (`along_u`) or `u = w`.
-fn iso_bsp(b: &mt::BSplineSurface<mt::Vector4>, w: f64, along_u: bool) -> R<mt::NurbsCurve<mt::Vector4>> {
+pub(crate) fn iso_bsp(b: &mt::BSplineSurface<mt::Vector4>, w: f64, along_u: bool) -> R<mt::NurbsCurve<mt::Vector4>> {
     let (ku, kv) = b.knot_vecs();
     let ctrl = b.control_points();
     let nu = ctrl.len();

@@ -17,6 +17,10 @@ use crate::{BoolOp, KernelError, Result};
 #[path = "prism_lineage.rs"]
 mod lineage;
 
+#[cfg(test)]
+#[path = "prism_spline_tests.rs"]
+mod spline_tests;
+
 const MAX_PLANAR_SEGMENTS: usize = 8192;
 const MAX_PLANAR_EVENTS: usize = 131_072;
 const MAX_PLANAR_PAIRS: usize = 16_000_000;
@@ -177,8 +181,8 @@ pub fn extrude_planar_regions(plane: &Plane, regions: &[Region2], start: f64, en
                         remaining_pairs = remaining_pairs
                             .checked_sub(1)
                             .ok_or_else(|| KernelError::Invalid("planar extrusion separation exceeds its work budget".into()))?;
-                        let endpoints_touch = [s.start(), s.end()].iter().any(|p| t.point_at(t.closest_param(*p)).dist(*p) <= 1e-7)
-                            || [t.start(), t.end()].iter().any(|p| s.point_at(s.closest_param(*p)).dist(*p) <= 1e-7);
+                        let endpoints_touch = [s.start(), s.end()].iter().any(|p| t.point_at(closest_param(t, *p)).dist(*p) <= 1e-7)
+                            || [t.start(), t.end()].iter().any(|p| s.point_at(closest_param(s, *p)).dist(*p) <= 1e-7);
                         if endpoints_touch || !crossings(s, t, 1e-7).is_empty() {
                             return Err(KernelError::Invalid("planar material pieces touch at a boundary".into()));
                         }
@@ -216,10 +220,13 @@ pub(crate) struct Tag {
     pub far: Option<usize>,
     pub start: Option<usize>,
     pub end: Option<usize>,
+    /// Inside [`boolean2d_tagged`] only: the free-form segment (by number) the arc this tags
+    /// was fitted to, so the result's pieces of it get the exact curve back.
+    pub free: Option<usize>,
 }
 
 /// A segment nothing is known of.
-const BLANK: Tag = Tag { operand: 0, wall: None, edge: None, far: None, start: None, end: None };
+const BLANK: Tag = Tag { operand: 0, wall: None, edge: None, far: None, start: None, end: None, free: None };
 
 impl Tag {
     /// The segment run the other way.
@@ -428,6 +435,9 @@ pub(crate) struct Index {
     points: Vec<Vec3>,
     /// Per edge (edge order): whether it is a line.
     lines: Vec<bool>,
+    /// Per edge (edge order) that is not a line: the points its curve lies within (see
+    /// [`control_hull`]); `None` where they are not known.
+    hulls: Vec<Option<Vec<Vec3>>>,
 }
 
 impl Index {
@@ -444,6 +454,7 @@ impl Index {
             }
         }
         let lines = edges.iter().map(|e| matches!(e.curve(), mt::Curve::Line(_))).collect();
+        let hulls = edges.iter().map(|e| control_hull(&e.curve())).collect();
         let mut between: std::collections::HashMap<(usize, usize), Vec<usize>> = std::collections::HashMap::new();
         for (i, fs) in bounds.iter().enumerate() {
             match fs.as_slice() {
@@ -457,7 +468,7 @@ impl Index {
             .zip(bounds)
             .map(|(e, fs)| (fs, vertices.get(&e.absolute_front().id()).copied(), vertices.get(&e.absolute_back().id()).copied()))
             .collect();
-        Index { operand, edges: crate::record::edge_index(&b.solid), bounds, between, vertices, points, lines }
+        Index { operand, edges: crate::record::edge_index(&b.solid), bounds, between, vertices, points, lines, hulls }
     }
 
     /// The tag of the segments read off edge `e` (as it runs in a wire) of cap face `cap`.
@@ -475,6 +486,7 @@ impl Index {
             far: None,
             start: self.vertices.get(&e.front().id()).copied(),
             end: self.vertices.get(&e.back().id()).copied(),
+            free: None,
         }
     }
 
@@ -509,7 +521,7 @@ struct Stations {
     /// Each wall's highest level.
     tops: std::collections::HashMap<usize, f64>,
     /// Per wall, the edges across it: the other wall and the edge's lowest and highest levels.
-    /// A curve other than a line spans every level.
+    /// A curve other than a line spans every level, unless it lies at one level.
     cross: std::collections::HashMap<usize, Vec<(usize, f64, f64)>>,
 }
 
@@ -532,7 +544,13 @@ impl Stations {
                     let (h, k) = (plane.height(*p), plane.height(*q));
                     (h.min(k), h.max(k))
                 }
-                _ => (f64::NEG_INFINITY, f64::INFINITY),
+                // A curve at one level (where a piece of a wall's surface stacked on another
+                // meets it: a boss's cylinder over the arc of the plate it stands on) crosses
+                // the walls there only. Any other spans every level.
+                _ => match index.hulls.get(i).and_then(Option::as_deref).map(|hull| level_span(hull, plane)) {
+                    Some((lo, hi)) if hi - lo < tol => (lo, hi),
+                    _ => (f64::NEG_INFINITY, f64::INFINITY),
+                },
             };
             cross.entry(f).or_default().push((g, lo, hi));
             cross.entry(g).or_default().push((f, lo, hi));
@@ -579,6 +597,35 @@ impl Stations {
             (1, false) => at.first().copied(),
             _ => None,
         }
+    }
+}
+
+/// The most control points [`control_hull`] reads of one curve.
+const MAX_HULL_POINTS: usize = 4096;
+
+/// The points curve `c` lies within: a B-spline's control points, or a NURBS curve's where its
+/// weights are positive (the curve then lies in their convex hull). `None` for a line, an
+/// intersection curve, other weights or too many points.
+fn control_hull(c: &mt::Curve) -> Option<Vec<Vec3>> {
+    match c {
+        mt::Curve::BSplineCurve(c) if c.control_points().len() <= MAX_HULL_POINTS => Some(c.control_points().iter().map(|p| from_p3(*p)).collect()),
+        mt::Curve::NurbsCurve(c) if c.control_points().len() <= MAX_HULL_POINTS => {
+            c.control_points().iter().map(|p| (p.w > 0.0 && p.w.is_finite()).then(|| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w))).collect()
+        }
+        _ => None,
+    }
+}
+
+/// The lowest and highest levels of `points` (infinite where there are none, or one isn't
+/// finite).
+fn level_span(points: &[Vec3], plane: &Plane) -> (f64, f64) {
+    let span = points
+        .iter()
+        .map(|p| plane.height(*p))
+        .try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), h| h.is_finite().then(|| (lo.min(h), hi.max(h))));
+    match span {
+        Some((lo, hi)) if lo <= hi => (lo, hi),
+        _ => (f64::NEG_INFINITY, f64::INFINITY),
     }
 }
 
@@ -757,7 +804,7 @@ fn heights_of(b: &Body, plane: &Plane) -> (f64, f64) {
 /// Does `s` run along `t` from end to end? Two lines, `s`'s ends on `t`; two arcs of one
 /// circle, `s`'s ends and middle on `t`.
 fn runs_along(s: &Seg2, t: &Seg2, tol: f64) -> bool {
-    let on = |p: Vec2| t.point_at(t.closest_param(p)).dist(p) < tol;
+    let on = |p: Vec2| t.point_at(closest_param(t, p)).dist(p) < tol;
     match (*s, *t) {
         (Seg2::Line { .. }, Seg2::Line { .. }) => on(s.start()) && on(s.end()),
         (Seg2::Arc { center: c, radius: r, .. }, Seg2::Arc { center: d, radius: q, .. }) => {
@@ -832,7 +879,7 @@ fn crossings(s: &Seg2, t: &Seg2, tol: f64) -> Vec<(f64, f64)> {
     }
     let mut out = Vec::new();
     for p in pts {
-        let (u, v) = (s.closest_param(p), t.closest_param(p));
+        let (u, v) = (closest_param(s, p), closest_param(t, p));
         if s.point_at(u).dist(p) < tol && t.point_at(v).dist(p) < tol {
             out.push((u, v));
         }
@@ -863,7 +910,7 @@ fn inside_loop(lp: &Loop2, p: Vec2) -> bool {
         }
     }
     // A point on the loop keeps the half-open answer.
-    if lp.segs.iter().any(|s| s.point_at(s.closest_param(p)).dist(p) < scale * 1e-9) {
+    if lp.segs.iter().any(|s| s.point_at(closest_param(s, p)).dist(p) < scale * 1e-9) {
         return inside_loop_ray(lp, p);
     }
     let grazes = |q: Vec2| {
@@ -983,12 +1030,43 @@ fn inside(regions: &[Region2], p: Vec2) -> bool {
     regions.iter().any(|r| inside_loop(&r.outer, p) && !r.holes.iter().any(|h| inside_loop(h, p)))
 }
 
+/// Call only after proving the point is at least `tol` from the other boundary.
+/// This sub-tolerance interior probe cannot cross that boundary, and avoids casting
+/// exactly through fitted arc/line endpoints whose heights differ by roundoff.
+fn inside_clear(regions: &[Region2], point: Vec2, tol: f64) -> bool {
+    inside(regions, point + Vec2::new(tol * 0.173, tol * 0.317))
+}
+
+/// Analytic projections avoid iterative searches at every planar boundary probe.
+/// Other curve types keep the shared solver introduced on main.
+fn closest_param(segment: &Seg2, point: Vec2) -> f64 {
+    match *segment {
+        Seg2::Line { a, b } => {
+            let direction = b - a;
+            let length2 = direction.dot(direction);
+            if length2 > 1e-300 && length2.is_finite() { ((point - a).dot(direction) / length2).clamp(0.0, 1.0) } else { 0.0 }
+        }
+        Seg2::Arc { center, radius, start, sweep } if radius > 0.0 && sweep.abs() > 1e-12 && sweep.abs() <= std::f64::consts::TAU + 1e-9 => {
+            let offset = point - center;
+            let delta = ((offset.y.atan2(offset.x) - start) * sweep.signum()).rem_euclid(std::f64::consts::TAU);
+            if delta <= sweep.abs() {
+                (delta / sweep.abs()).clamp(0.0, 1.0)
+            } else if segment.start().dist(point) <= segment.end().dist(point) {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        _ => segment.closest_param(point),
+    }
+}
+
 fn dist_to(regions: &[Region2], p: Vec2) -> f64 {
     regions
         .iter()
         .flat_map(|r| std::iter::once(&r.outer).chain(&r.holes))
         .flat_map(|l| l.segs.iter())
-        .map(|s| s.point_at(s.closest_param(p)).dist(p))
+        .map(|s| s.point_at(closest_param(s, p)).dist(p))
         .fold(f64::INFINITY, f64::min)
 }
 
@@ -1035,7 +1113,7 @@ fn box_holds(b: Option<SegBox>, p: Vec2) -> bool {
 /// Distance from `p` to the nearest of `segs` whose box holds it: infinite when none does (no
 /// segment is within the tolerance of `p` then).
 fn near_dist(segs: &[Seg2], boxes: &[Option<SegBox>], p: Vec2) -> f64 {
-    segs.iter().zip(boxes).filter(|(_, b)| box_holds(**b, p)).map(|(s, _)| s.point_at(s.closest_param(p)).dist(p)).fold(f64::INFINITY, f64::min)
+    segs.iter().zip(boxes).filter(|(_, b)| box_holds(**b, p)).map(|(s, _)| s.point_at(closest_param(s, p)).dist(p)).fold(f64::INFINITY, f64::min)
 }
 
 /// Direction of the first of `segs` through `p` (within `tol`), as it runs.
@@ -1044,7 +1122,7 @@ fn near_dir(segs: &[Seg2], boxes: &[Option<SegBox>], p: Vec2, tol: f64) -> Optio
         .iter()
         .zip(boxes)
         .filter(|(_, b)| box_holds(**b, p))
-        .map(|(s, _)| (s, s.closest_param(p)))
+        .map(|(s, _)| (s, closest_param(s, p)))
         .find(|(s, t)| s.point_at(*t).dist(p) < tol)?;
     s.derivative(t).normalized()
 }
@@ -1055,8 +1133,350 @@ fn boolean2d(a: &[Region2], b: &[Region2], op: BoolOp, tol: f64) -> Option<Vec<R
 }
 
 /// [`boolean2d`] of tagged sections: each segment of the result tagged as the segment of `a` or
-/// `b` it is (a piece of).
+/// `b` it is (a piece of). Free-form segments (a font's curves) take part as arcs within
+/// [`PLANAR_FIT_TOL`]; each piece of one in the result is the exact curve again, ending where
+/// it exactly meets the segment next to it (see [`exact_again`]).
 fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Section> {
+    let line_arc = |s: &Section| s.regions.iter().all(Region2::is_line_arc);
+    if line_arc(a) && line_arc(b) {
+        return boolean2d_arcs(a, b, op, tol);
+    }
+    let mut sources = Vec::new();
+    let (fa, fb) = (fitted(a, &mut sources, PLANAR_FIT_TOL)?, fitted(b, &mut sources, PLANAR_FIT_TOL)?);
+    let out = boolean2d_arcs(&fa, &fb, op, tol)?;
+    Some(exact_again(out, &sources, tol))
+}
+
+/// `s` with each free-form segment replaced by lines and arcs within `fit`, tagged with its
+/// number in `sources` (where it is put).
+fn fitted(s: &Section, sources: &mut Vec<Seg2>, fit: f64) -> Option<Section> {
+    let mut out = Section::default();
+    let mut pieces = 0usize;
+    for (r, reg) in s.regions.iter().enumerate() {
+        let mut loops = Vec::new();
+        let mut tags = Vec::new();
+        for (l, lp) in std::iter::once(&reg.outer).chain(&reg.holes).enumerate() {
+            let (mut segs, mut ts) = (Vec::new(), Vec::new());
+            for (i, seg) in lp.segs.iter().enumerate() {
+                let tag = s.tag(r, l, i);
+                if seg.is_line_or_arc() {
+                    segs.push(*seg);
+                    ts.push(tag);
+                    continue;
+                }
+                let arcs = seg.fit_arcs(fit)?;
+                pieces = pieces.checked_add(arcs.len()).filter(|n| *n <= MAX_PLANAR_SEGMENTS)?;
+                let n = arcs.len();
+                ts.extend((0..n).map(|k| Tag { free: Some(sources.len()), ..tag.piece(k, n) }));
+                segs.extend(arcs);
+                sources.push(*seg);
+            }
+            loops.push(Loop2 { segs });
+            tags.push(ts);
+        }
+        let mut loops = loops.into_iter();
+        out.regions.push(Region2 { outer: loops.next()?, holes: loops.collect() });
+        out.tags.push(tags);
+    }
+    Some(out)
+}
+
+/// A loop's piece in [`exact_again`]: a run of arcs fitted to free-form segment `src`, standing
+/// for its exact curve from parameter `t0` to `t1` (`t1 < t0`: run backwards), from `a` to `b`;
+/// or a line or arc as it is.
+#[derive(Clone, Copy)]
+enum Piece {
+    Exact { src: usize, t0: f64, t1: f64, a: Vec2, b: Vec2, tag: Tag },
+    Plain(Seg2, Tag),
+}
+
+impl Piece {
+    fn end(&self) -> Vec2 {
+        match self {
+            Piece::Exact { b, .. } => *b,
+            Piece::Plain(s, _) => s.end(),
+        }
+    }
+
+    /// The piece ending at `at` (an exact curve: at its parameter `t`, when given).
+    fn set_end(&mut self, t: Option<f64>, at: Vec2) {
+        match self {
+            Piece::Exact { t1, b, .. } => {
+                if let Some(t) = t {
+                    *t1 = t;
+                }
+                *b = at;
+            }
+            Piece::Plain(s, _) => *s = seg_with_ends(s, s.start(), at),
+        }
+    }
+
+    /// The piece starting at `at` (an exact curve: at its parameter `t`, when given).
+    fn set_start(&mut self, t: Option<f64>, at: Vec2) {
+        match self {
+            Piece::Exact { t0, a, .. } => {
+                if let Some(t) = t {
+                    *t0 = t;
+                }
+                *a = at;
+            }
+            Piece::Plain(s, _) => *s = seg_with_ends(s, at, s.end()),
+        }
+    }
+}
+
+/// `s` running from `a` to `b` instead (points on it or a hair off it): a line between them, an
+/// arc of the same circle, a free-form segment with those end control points.
+fn seg_with_ends(s: &Seg2, a: Vec2, b: Vec2) -> Seg2 {
+    match *s {
+        Seg2::Line { .. } => Seg2::Line { a, b },
+        Seg2::Arc { center, radius, start, sweep } => {
+            let new_start = (a - center).angle();
+            let end = start + sweep;
+            // The same way round, through the same part of the circle.
+            let shift = |x: f64, near: f64| x + ((near - x) / std::f64::consts::TAU).round() * std::f64::consts::TAU;
+            let s0 = shift(new_start, start);
+            let s1 = shift((b - center).angle(), end);
+            Seg2::Arc { center, radius, start: s0, sweep: s1 - s0 }
+        }
+        Seg2::Cubic { p1, p2, .. } => Seg2::Cubic { p0: a, p1, p2, p3: b },
+        Seg2::Conic { apex, w, .. } => Seg2::Conic { a, apex, b, w },
+        Seg2::Bezier { n, mut p } => {
+            if let Some(x) = p.first_mut() {
+                *x = a;
+            }
+            if let Some(x) = p.get_mut(n as usize) {
+                *x = b;
+            }
+            Seg2::Bezier { n, p }
+        }
+    }
+}
+
+/// The exact piece of `src` from parameter `t0` to `t1` (either way round), from `a` to `b`.
+fn trimmed(src: &Seg2, t0: f64, t1: f64, a: Vec2, b: Vec2) -> Seg2 {
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    let mut s = *src;
+    if lo > 1e-12 {
+        s = s.split_at(lo).1;
+    }
+    if hi < 1.0 - 1e-12 {
+        // Splitting a conic renormalises its weights, which moves its parameters: the second
+        // split is found on the piece.
+        let at = closest_param(&s, src.point_at(hi));
+        if at < 1.0 - 1e-12 {
+            s = s.split_at(at).0;
+        }
+    }
+    if t0 <= t1 { seg_with_ends(&s, a, b) } else { seg_with_ends(&s.reversed(), a, b) }
+}
+
+/// Where curve `p` near its parameter `t` meets `q` near its parameter `u`, by Newton's method:
+/// their parameters there, or `None` when the crossing doesn't settle within `near` of `p(t)`.
+fn meet(p: &Seg2, t: f64, q: &Seg2, u: f64, near: f64) -> Option<(f64, f64)> {
+    let (mut t, mut u) = (t, u);
+    let start = p.point_at(t);
+    let scale = 1.0 + start.x.abs().max(start.y.abs());
+    for _ in 0..50 {
+        let f = p.point_at(t) - q.point_at(u);
+        if f.len() < 1e-14 * scale {
+            break;
+        }
+        // P(t) - Q(u) = f; the step solves [P'(t), -Q'(u)] (dt, du) = -f.
+        let (dp, dq) = (p.derivative(t), q.derivative(u));
+        let det = -dp.cross(dq);
+        if !(det.abs() > 1e-300 && det.is_finite()) {
+            return None;
+        }
+        t = (t + f.cross(dq) / det).clamp(0.0, 1.0);
+        u = (u + f.cross(dp) / det).clamp(0.0, 1.0);
+    }
+    let (x, y) = (p.point_at(t), q.point_at(u));
+    (x.dist(y) < 1e-9 * scale && x.dist(start) < near).then_some((t, u))
+}
+
+/// The whole line or circle a line or arc lies on (as a segment reaching past it), what an exact
+/// crossing with a curve is looked for on.
+fn carrier(s: &Seg2) -> Option<Seg2> {
+    match *s {
+        Seg2::Line { a, b } => Some(Seg2::Line { a: a - (b - a), b: b + (b - a) }),
+        Seg2::Arc { center, radius, start, sweep } => {
+            let turn = sweep.signum() * std::f64::consts::PI;
+            Some(Seg2::Arc { center, radius, start: start + sweep * 0.5 - turn, sweep: 2.0 * turn })
+        }
+        _ => None,
+    }
+}
+
+/// The exact curves back in the result of a boolean of [`fitted`] sections: each run of arcs
+/// fitted to one free-form segment becomes that segment's exact piece, and where a run ends on
+/// another segment (a cut across the curve) both end at their exact crossing. Where that
+/// crossing can't be found they end where the arrangement put them, within
+/// [`PLANAR_FIT_TOL`] of it.
+fn exact_again(out: Section, sources: &[Seg2], tol: f64) -> Section {
+    let near = (PLANAR_FIT_TOL + tol) * 10.0;
+    let mut res = Section::default();
+    for (r, reg) in out.regions.iter().enumerate() {
+        let tags = out.region_tags(r);
+        let mut loops = Vec::new();
+        let mut loop_tags = Vec::new();
+        for (l, lp) in std::iter::once(&reg.outer).chain(&reg.holes).enumerate() {
+            let (segs, ts) = exact_loop(lp, tags.get(l).map(Vec::as_slice).unwrap_or(&[]), sources, near);
+            // A sliver the arrangement found where a curve's arcs nearly touch another part of
+            // the outline (at the waist of a 3) closes up to nothing on the exact curves: it
+            // encloses nothing and would make edges with no length, so it is left out.
+            if segs.iter().map(Seg2::length).sum::<f64>() <= near {
+                if l == 0 {
+                    break;
+                }
+                continue;
+            }
+            loops.push(Loop2 { segs });
+            loop_tags.push(ts);
+        }
+        let mut loops = loops.into_iter();
+        let Some(outer) = loops.next() else { continue };
+        res.regions.push(Region2 { outer, holes: loops.collect() });
+        res.tags.push(loop_tags);
+    }
+    res
+}
+
+/// One loop of [`exact_again`]: its segments and their tags.
+fn exact_loop(lp: &Loop2, tags: &[Tag], sources: &[Seg2], near: f64) -> (Vec<Seg2>, Vec<Tag>) {
+    let n = lp.segs.len();
+    let tag = |i: usize| Tag { free: None, ..tags.get(i).copied().unwrap_or(BLANK) };
+    let free = |i: usize| tags.get(i).and_then(|t| t.free);
+    let plain = || (lp.segs.clone(), (0..n).map(tag).collect::<Vec<_>>());
+    // Start at the first segment of a run (a loop that is one run stays as it is).
+    let Some(first) = (0..n).find(|&i| free(i).is_none() || free(i) != free((i + n - 1) % n)) else { return plain() };
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut k = 0;
+    while k < n {
+        let i = (first + k) % n;
+        let Some(seg) = lp.segs.get(i) else { return plain() };
+        let Some((f, src)) = free(i).and_then(|f| sources.get(f).map(|s| (f, s))) else {
+            pieces.push(Piece::Plain(*seg, tag(i)));
+            k += 1;
+            continue;
+        };
+        let mut j = k;
+        while j + 1 < n && free((first + j + 1) % n) == Some(f) {
+            j += 1;
+        }
+        let Some(last) = lp.segs.get((first + j) % n) else { return plain() };
+        // A run reaching the curve's end is the curve to its end, exactly: the same curve the
+        // walls over it are read from, which a parameter found by projection (a hair short of 1)
+        // would cut short into a different one.
+        let at = |p: Vec2| {
+            if p.dist(src.start()) < near {
+                0.0
+            } else if p.dist(src.end()) < near {
+                1.0
+            } else {
+                closest_param(src, p)
+            }
+        };
+        let (t0, t1) = (at(seg.start()), at(last.end()));
+        if (t1 - t0).abs() < 1e-9 {
+            // A sliver of the curve: its arcs as they are, or, shorter than the tolerance (where
+            // a curve lies on another, as when the same letters are cut again), nothing: its
+            // neighbours meet where it was, and as an edge it would have no length.
+            let length: f64 = (k..=j).filter_map(|m| lp.segs.get((first + m) % n)).map(Seg2::length).sum();
+            if length > near {
+                for m in k..=j {
+                    let q = (first + m) % n;
+                    pieces.push(Piece::Plain(*lp.segs.get(q).unwrap_or(seg), tag(q)));
+                }
+            }
+        } else {
+            let t = Tag { end: tag((first + j) % n).end, ..tag(i) };
+            pieces.push(Piece::Exact { src: f, t0, t1, a: src.point_at(t0), b: src.point_at(t1), tag: t });
+        }
+        k = j + 1;
+    }
+    // Each joint at an exact curve: both sides end at the same point, the exact crossing where
+    // the curve is cut, its own end point where it ends.
+    if pieces.is_empty() {
+        return plain();
+    }
+    let m = pieces.len();
+    let inner = |t: f64| t > 1e-9 && t < 1.0 - 1e-9;
+    for i in 0..m {
+        let (Some(p), Some(q)) = (pieces.get(i).copied(), pieces.get((i + 1) % m).copied()) else { continue };
+        let joint = p.end();
+        let src = |f: usize| sources.get(f);
+        let found = match (p, q) {
+            (Piece::Exact { src: f, t1, .. }, Piece::Exact { src: g, t0, .. }) if f != g && (inner(t1) || inner(t0)) => {
+                src(f).zip(src(g)).and_then(|(x, y)| meet(x, t1, y, t0, near).map(|(a, b)| (Some(a), Some(b), x.point_at(a))))
+            }
+            (Piece::Exact { src: f, t1, .. }, Piece::Plain(s, _)) if inner(t1) => src(f)
+                .zip(carrier(&s))
+                .and_then(|(x, c)| meet(x, t1, &c, closest_param(&c, joint), near).map(|(a, _)| (Some(a), None, x.point_at(a)))),
+            (Piece::Plain(s, _), Piece::Exact { src: f, t0, .. }) if inner(t0) => src(f)
+                .zip(carrier(&s))
+                .and_then(|(x, c)| meet(x, t0, &c, closest_param(&c, joint), near).map(|(a, _)| (None, Some(a), x.point_at(a)))),
+            _ => None,
+        };
+        // No crossing to refine (or none found): both end where the curve does.
+        let found = found.or(match (p, q) {
+            (Piece::Exact { b, .. }, _) => Some((None, None, b)),
+            (_, Piece::Exact { a, .. }) => Some((None, None, a)),
+            _ => None,
+        });
+        let Some((x, y, at)) = found else { continue };
+        if let Some(p) = pieces.get_mut(i) {
+            p.set_end(x, at);
+        }
+        if let Some(q) = pieces.get_mut((i + 1) % m) {
+            q.set_start(y, at);
+        }
+    }
+    let mut segs = Vec::with_capacity(m);
+    let mut ts = Vec::with_capacity(m);
+    for p in pieces {
+        match p {
+            Piece::Exact { src, t0, t1, a, b, tag } => match sources.get(src) {
+                Some(s) => {
+                    segs.push(trimmed(s, t0, t1, a, b));
+                    ts.push(tag);
+                }
+                None => return plain(),
+            },
+            Piece::Plain(s, t) => {
+                segs.push(s);
+                ts.push(t);
+            }
+        }
+    }
+    // The loop closed exactly: where a segment ends a hair from where the next starts (a font's
+    // nearly round curve read as an arc ends a few hundredths of a micron off the curve after
+    // it), the one that is not an arc moves its end onto the arc's (an arc's ends stay on its
+    // circle). Two arcs are left as they meet, as a boolean of lines and arcs leaves them.
+    let m = segs.len();
+    for i in 0..m {
+        let j = (i + 1) % m;
+        let (Some(x), Some(y)) = (segs.get(i).copied(), segs.get(j).copied()) else { continue };
+        let gap = x.end().dist(y.start());
+        if gap == 0.0 || gap > near {
+            continue;
+        }
+        let arc = |s: &Seg2| matches!(s, Seg2::Arc { .. });
+        if !arc(&y) {
+            if let Some(s) = segs.get_mut(j) {
+                *s = seg_with_ends(&y, x.end(), y.end());
+            }
+        } else if !arc(&x)
+            && let Some(s) = segs.get_mut(i)
+        {
+            *s = seg_with_ends(&x, x.start(), y.start());
+        }
+    }
+    (segs, ts)
+}
+
+/// The boolean of sections of lines and arcs alone ([`boolean2d_tagged`]).
+fn boolean2d_arcs(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Section> {
     let count =
         |rs: &[Region2]| rs.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).fold(0usize, |n, lp| n.saturating_add(lp.segs.len()));
     let (na, nb) = (count(&a.regions), count(&b.regions));
@@ -1099,7 +1519,7 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
                 continue;
             }
             for p in [t.start(), t.end()] {
-                let u = s.closest_param(p);
+                let u = closest_param(s, p);
                 if s.point_at(u).dist(p) < tol {
                     events += 1;
                     if events > MAX_PLANAR_EVENTS {
@@ -1116,7 +1536,7 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
                 continue;
             }
             for p in [s.start(), s.end()] {
-                let v = t.closest_param(p);
+                let v = closest_param(t, p);
                 if t.point_at(v).dist(p) < tol {
                     events += 1;
                     if events > MAX_PLANAR_EVENTS {
@@ -1127,6 +1547,13 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
             }
         }
     }
+    // The loops below are chained by joining pieces whose ends lie within `near` of each other,
+    // so to them a piece shorter than that runs from a point back to the same point: a cut that
+    // would leave one, at either end of what is left of the segment, is not made. Two edges
+    // 0.57° apart that share a corner up to rounding cross a hundred times that rounding short
+    // of it; split there, the sliver between the crossing and the corner was taken for a
+    // second way out of the corner and closed as a loop of its own.
+    let near = tol * 10.0;
     let pieces = |s: &Seg2, cuts: &mut Vec<f64>| -> Vec<Seg2> {
         cuts.sort_by(f64::total_cmp);
         let mut out = Vec::new();
@@ -1138,7 +1565,7 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
             }
             let local = (c - done) / (1.0 - done);
             let (x, y) = rest.split_at(local);
-            if x.length() > tol {
+            if x.length() > near && y.length() > near {
                 out.push(x);
                 rest = y;
                 done = c;
@@ -1165,7 +1592,7 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
                     BoolOp::Cut => !same,
                 }
             } else {
-                let ins = inside(&b, m);
+                let ins = inside_clear(&b, m, tol);
                 match op {
                     BoolOp::Union | BoolOp::Cut => !ins,
                     BoolOp::Intersect => ins,
@@ -1191,7 +1618,7 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
             if near_dist(&sa, &box_a, m) < tol {
                 continue;
             }
-            let ins = inside(&a, m);
+            let ins = inside_clear(&a, m, tol);
             if kept.len() >= MAX_PLANAR_SEGMENTS {
                 return None;
             }
@@ -1210,7 +1637,6 @@ fn boolean2d_tagged(a: &Section, b: &Section, op: BoolOp, tol: f64) -> Option<Se
     // material meeting only at that point close as loops of their own; returning to its start,
     // a loop closes only when that is the tightest turn too. A loop that still passes a point
     // twice (a hole touching the outline) is split there into simple loops.
-    let near = tol * 10.0;
     let mut loops: Vec<(Loop2, Vec<Tag>)> = Vec::new();
     let mut used = vec![false; kept.len()];
     for start in 0..kept.len() {
@@ -1341,9 +1767,6 @@ fn simple_loops(lp: Loop2, tags: Vec<Tag>, near: f64) -> Vec<(Loop2, Vec<Tag>)> 
 }
 
 fn split_seg(seg: &Seg2, pts: &[Vec2], tol: f64) -> Option<Vec<Seg2>> {
-    if !matches!(seg, Seg2::Line { .. } | Seg2::Arc { .. }) {
-        return None;
-    }
     let mut ts: Vec<f64> = pts
         .iter()
         .filter_map(|p| {
@@ -1354,7 +1777,12 @@ fn split_seg(seg: &Seg2, pts: &[Vec2], tol: f64) -> Option<Vec<Seg2>> {
             {
                 return None;
             }
-            let t = seg.closest_param(*p);
+            // A point within `tol` of an end is that end (the sewing welds them into one): a cut
+            // there would leave a piece with no length.
+            if p.dist(seg.start()) < tol || p.dist(seg.end()) < tol {
+                return None;
+            }
+            let t = closest_param(seg, *p);
             (t > 1e-9 && t < 1.0 - 1e-9 && seg.point_at(t).dist(*p) < tol).then_some(t)
         })
         .collect();
@@ -1366,7 +1794,7 @@ fn split_seg(seg: &Seg2, pts: &[Vec2], tol: f64) -> Option<Vec<Seg2>> {
         out.push(match *seg {
             Seg2::Line { .. } => Seg2::Line { a: seg.point_at(t0), b: seg.point_at(t1) },
             Seg2::Arc { center, radius, start, sweep } => Seg2::Arc { center, radius, start: start + sweep * t0, sweep: sweep * (t1 - t0) },
-            _ => return None,
+            _ => trimmed(seg, t0, t1, seg.point_at(t0), seg.point_at(t1)),
         });
         t0 = t1;
     }
@@ -1504,6 +1932,23 @@ fn wall_key(s: &Seg2) -> Option<[u64; 6]> {
     match s {
         Seg2::Line { a, b } => Some([0, bits(a.x)?, bits(a.y)?, bits(b.x)?, bits(b.y)?, 0]),
         Seg2::Arc { center, radius, start, sweep } => Some([1, bits(center.x)?, bits(center.y)?, bits(*radius)?, bits(*start)?, bits(*sweep)?]),
+        // Its ends and a point between them: free-form segments with the same ones are the same
+        // curve as far as a wall over it goes.
+        _ => {
+            let (a, m, b) = (s.start(), s.point_at(0.5), s.end());
+            let h = |x: f64, y: f64| bits(x).zip(bits(y)).map(|(x, y)| x ^ y.rotate_left(17));
+            Some([2, h(a.x, a.y)?, h(m.x, m.y)?, h(b.x, b.y)?, bits(m.x)?, bits(m.y)?])
+        }
+    }
+}
+
+/// A free-form segment as the control points of the cubic Bézier it is (a quadratic raised to
+/// a cubic); `None` for those no cubic is exactly (rational conics, higher degrees).
+fn cubic_of(s: &Seg2) -> Option<[Vec2; 4]> {
+    match *s {
+        Seg2::Cubic { p0, p1, p2, p3 } => Some([p0, p1, p2, p3]),
+        Seg2::Conic { a, apex, b, w } if (w - 1.0).abs() < 1e-12 => Some([a, a + (apex - a) * (2.0 / 3.0), b + (apex - b) * (2.0 / 3.0), b]),
+        Seg2::Bezier { n: 3, p } => Some([p[0], p[1], p[2], p[3]]),
         _ => None,
     }
 }
@@ -1545,12 +1990,100 @@ fn sew_connected_sections(
             pts.push(sg.end());
         }
     }
-    let at = |u: Vec2, z: f64| plane.to_world(u) + d * z;
-    let edge = |sg: &Seg2, z: f64| -> EdgeSpec {
-        match sg {
-            Seg2::Arc { .. } => EdgeSpec::Arc { a: at(sg.start(), z), b: at(sg.end(), z), mid: at(sg.point_at(0.5), z) },
-            _ => EdgeSpec::Line { a: at(sg.start(), z), b: at(sg.end(), z) },
+    // Ends within `tol` of each other are one point. The 2D boolean closes its loops within
+    // `tol`, not exactly: where a font's nearly round curve was read as an arc, the arc ends a
+    // few hundredths of a micron from the curve next to it. Sewing joins only ends at the same
+    // point, so such a loop would not close.
+    let cell = |u: Vec2| ((u.x / tol).floor() as i64, (u.y / tol).floor() as i64);
+    let mut ends: Vec<Vec2> = Vec::new();
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    let weld = |ends: &[Vec2], grid: &std::collections::HashMap<(i64, i64), Vec<usize>>, u: Vec2| -> Option<Vec2> {
+        let (cx, cy) = cell(u);
+        (cx - 1..=cx + 1)
+            .flat_map(|x| (cy - 1..=cy + 1).map(move |y| (x, y)))
+            .filter_map(|c| grid.get(&c))
+            .flatten()
+            .filter_map(|&i| ends.get(i).copied())
+            .find(|e| e.dist(u) <= tol)
+    };
+    for &u in &pts {
+        if weld(&ends, &grid, u).is_none() {
+            grid.entry(cell(u)).or_default().push(ends.len());
+            ends.push(u);
         }
+    }
+    // Welding above keeps its original encounter order. Side splitting needs
+    // only the distinct stations, whose resulting parameters are sorted anyway.
+    // Deduplicate in place, with bounded sorting work and no extra point list.
+    if pts.len() <= MAX_PLANAR_SEGMENTS * 8 {
+        pts.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        pts.dedup_by_key(|p| (p.x.to_bits(), p.y.to_bits()));
+    }
+    // A piece of a free-form curve whose ends weld into one point (a font's curve cut a hair from
+    // its end) is no edge and has no wall: the pieces on either side meet there. (Lines and arcs
+    // are left as they were: such a piece of one fails the sewing, as before.)
+    let short = |s: &Seg2| {
+        !s.is_line_or_arc()
+            && s.length() <= 2.0 * tol
+            && matches!((weld(&ends, &grid, s.start()), weld(&ends, &grid, s.end())), (Some(p), Some(q)) if p == q)
+    };
+    // One curve between two ends, as the walls and the caps beside them each read it: their
+    // sections come from different booleans, which split it from different pieces, so the
+    // control points can differ by a hair, and sewing tells edges apart by them. The first
+    // reading stands for all of them.
+    let chains: std::cell::RefCell<Vec<[Vec3; 4]>> = std::cell::RefCell::new(Vec::new());
+    let same_chain = |c: [Vec3; 4]| -> [Vec3; 4] {
+        let mid = |k: &[Vec3; 4]| (k[0] + (k[1] + k[2]) * 3.0 + k[3]) * 0.125;
+        let mut known = chains.borrow_mut();
+        for k in known.iter() {
+            if mid(k).dist(mid(&c)) <= tol * 10.0 {
+                if k[0] == c[0] && k[3] == c[3] {
+                    return *k;
+                }
+                if k[0] == c[3] && k[3] == c[0] {
+                    return [k[3], k[2], k[1], k[0]];
+                }
+            }
+        }
+        known.push(c);
+        c
+    };
+    let at = |u: Vec2, z: f64| plane.to_world(u) + d * z;
+    let welded = |u: Vec2, z: f64| at(weld(&ends, &grid, u).unwrap_or(u), z);
+    // One edge between two ends, whichever way a wall or a cap reads the curve there: a piece of
+    // a font's curve so short that one section reads it as an arc within the tolerance, where
+    // another has the curve itself (the same letters cut again), is one edge. The first reading
+    // stands for all of them.
+    let readings: std::cell::RefCell<Vec<(Vec3, Vec3, Vec3, EdgeSpec)>> = std::cell::RefCell::new(Vec::new());
+    let same_edge = |spec: EdgeSpec, a: Vec3, b: Vec3, mid: Vec3| -> EdgeSpec {
+        let mut known = readings.borrow_mut();
+        for (ka, kb, km, k) in known.iter() {
+            if km.dist(mid) <= tol * 10.0 {
+                if *ka == a && *kb == b {
+                    return k.clone();
+                }
+                if *ka == b && *kb == a {
+                    return k.reversed();
+                }
+            }
+        }
+        known.push((a, b, mid, spec.clone()));
+        spec
+    };
+    let edge = |sg: &Seg2, z: f64| -> Option<EdgeSpec> {
+        Some(match sg {
+            Seg2::Line { .. } => EdgeSpec::Line { a: welded(sg.start(), z), b: welded(sg.end(), z) },
+            Seg2::Arc { .. } => {
+                let (a, b, mid) = (welded(sg.start(), z), welded(sg.end(), z), at(sg.point_at(0.5), z));
+                same_edge(EdgeSpec::Arc { a, b, mid }, a, b, mid)
+            }
+            _ => {
+                let [p0, p1, p2, p3] = cubic_of(sg)?;
+                let c = same_chain([welded(p0, z), at(p1, z), at(p2, z), welded(p3, z)]);
+                let mid = (c[0] + (c[1] + c[2]) * 3.0 + c[3]) * 0.125;
+                same_edge(EdgeSpec::Chain { degree: 3, ctrl: c.to_vec().into() }, c[0], c[3], mid)
+            }
+        })
     };
     // Exact oriented generated segments alone define a run. No support fitting,
     // proximity matching, or old face lineage is used here.
@@ -1568,6 +2101,9 @@ fn sew_connected_sections(
                     let pieces = split_seg(sg0, &pts, tol)?;
                     let (n, tag) = (pieces.len(), slab.tag(r, l, si));
                     for (k, sg) in pieces.into_iter().enumerate() {
+                        if short(&sg) {
+                            continue;
+                        }
                         remaining = remaining.checked_sub(1)?;
                         let key = wall_key(&sg)?;
                         let prior = if coalesce { last.get(&key).copied() } else { None };
@@ -1616,20 +2152,22 @@ fn sew_connected_sections(
         let (z0, z1) = (levels[first], levels[end]);
         let (a, b) = (sg.start(), sg.end());
         let mut lp3 = Vec::with_capacity(2 + 2 * (end - first));
-        lp3.push(edge(&sg, z0));
+        lp3.push(edge(&sg, z0)?);
         // Keep station vertices at both ends: neighboring stepped walls/caps
         // must share complete edges rather than create T-junctions.
         for k in first..end {
-            lp3.push(EdgeSpec::Line { a: at(b, levels[k]), b: at(b, levels[k + 1]) });
+            lp3.push(EdgeSpec::Line { a: welded(b, levels[k]), b: welded(b, levels[k + 1]) });
         }
-        lp3.push(edge(&sg.reversed(), z1));
+        lp3.push(edge(&sg.reversed(), z1)?);
         for k in (first..end).rev() {
-            lp3.push(EdgeSpec::Line { a: at(a, levels[k + 1]), b: at(a, levels[k]) });
+            lp3.push(EdgeSpec::Line { a: welded(a, levels[k + 1]), b: welded(a, levels[k]) });
         }
         let outward = plane.dir_to_world(sg.derivative(0.5)).cross(d).normalized()?;
         let surface = match sg {
+            Seg2::Line { .. } => SurfSpec::Plane,
             Seg2::Arc { .. } => SurfSpec::Extruded { a: at(a, z0), b: at(b, z0), mid: at(sg.point_at(0.5), z0), dir: d * (z1 - z0) },
-            _ => SurfSpec::Plane,
+            // A free-form wall: the lines along `d` joining the curve at both levels.
+            _ => SurfSpec::Ruled { a: edge(&sg, z0)?, b: edge(&sg, z1)? },
         };
         faces.push(FaceSpec { loops: vec![lp3], surface, probe: Some((at(sg.point_at(0.5), (z0 + z1) / 2.0), outward)) });
         // Axis-aligned generated lines have a common oriented support frame
@@ -1662,10 +2200,10 @@ fn sew_connected_sections(
             for lp in std::iter::once(&r.outer).chain(&r.holes) {
                 let mut segs: Vec<Seg2> = Vec::new();
                 for sg in &lp.segs {
-                    segs.extend(split_seg(sg, &pts, tol)?);
+                    segs.extend(split_seg(sg, &pts, tol)?.into_iter().filter(|s| !short(s)));
                 }
                 let segs: Vec<Seg2> = if *up { segs } else { segs.iter().rev().map(Seg2::reversed).collect() };
-                loops.push(segs.iter().map(|sg| edge(sg, *z)).collect::<Vec<_>>());
+                loops.push(segs.iter().map(|sg| edge(sg, *z)).collect::<Option<Vec<_>>>()?);
             }
             faces.push(FaceSpec { loops, surface: SurfSpec::Plane, probe: None });
             sources.push(None);
@@ -1694,24 +2232,9 @@ fn simple_prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<
 fn simple_prism_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> Option<Result<Option<Body>>> {
     let size = a.size().max(b.size());
     let tol = (size * 1e-7).max(1e-9) * 10.0;
-    // Candidate directions: a's planar face normals (each line once).
-    let mut dirs: Vec<Vec3> = Vec::new();
-    let mut remaining_direction_faces = MAX_PLANAR_SEGMENTS * 2;
-    for f in a.solid.face_iter() {
-        remaining_direction_faces = remaining_direction_faces.checked_sub(1)?;
-        if let mt::Surface::Plane(p) = f.oriented_surface() {
-            let n = p.normal();
-            if let Some(n) = Vec3::new(n.x, n.y, n.z).normalized()
-                && !dirs.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-9)
-            {
-                dirs.push(if n.dot(Vec3::new(1e-3, 1e-6, 1.0)) < 0.0 { -n } else { n });
-                if dirs.len() == 8 {
-                    break;
-                }
-            }
-        }
-    }
-    let (d, plane, pa, pb) = dirs.into_iter().take(8).find_map(|d| {
+    // Candidate directions (each line once, pointing up).
+    let dirs: Vec<Vec3> = directions(a, b)?.into_iter().map(|n| if n.dot(Vec3::new(1e-3, 1e-6, 1.0)) < 0.0 { -n } else { n }).collect();
+    let (d, plane, pa, pb) = dirs.into_iter().find_map(|d| {
         let plane = Plane::from_normal(Vec3::ZERO, d)?;
         let pa = prism_tagged(a, d, &plane, tol, ia)?;
         let pb = prism_tagged(b, d, &plane, tol, ib)?;
@@ -1737,10 +2260,16 @@ fn simple_prism_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2
     if regions.is_empty() {
         return Some(Ok(None));
     }
+    let (u, x, y) = (area(regions), area(&pa.section.regions), area(&pb.section.regions));
+    let alike = |v: f64| (u - v).abs() <= tol * (1.0 + u);
+    // A tool that misses its target (or an intersection that is one operand whole) leaves it
+    // as it is: the B-rep boolean reuses that operand itself, where this would rebuild it.
+    if matches!(op, BoolOp::Cut | BoolOp::Intersect) && (same_area(u, x, tol) || (op == BoolOp::Intersect && same_area(u, y, tol))) {
+        return None;
+    }
     let (lo, hi) = if stacked {
         // Different sections (a boss hanging over a plate's edge): sewn slab by slab.
-        let (u, x, y) = (area(regions), area(&pa.section.regions), area(&pb.section.regions));
-        if (u - x).abs() > tol * (1.0 + u) || (u - y).abs() > tol * (1.0 + u) {
+        if !alike(x) || !alike(y) {
             return sew_stack(&plane, d, &pa, &pb, tol, &history).map(|r| r.map(Some));
         }
         // One outline end to end: also slab by slab, so the history follows each operand's
@@ -1776,6 +2305,74 @@ fn simple_prism_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2
         );
     }
     Some(Ok(Some(history.attach(last.0.clone(), &[last]))))
+}
+
+/// The directions to try the operands as prisms along: the first eight plane directions of the
+/// target (in its face order), then those of the tool's caps (a pair of opposite plane faces)
+/// that the target has further on. A target cut many times over (a line of text, a group of
+/// letters at a time) has more plane directions than eight, its walls' among them: in face
+/// order its caps' direction can come too late. `None` past the face budget.
+fn directions(a: &Body, b: &Body) -> Option<Vec<Vec3>> {
+    if a.face_count().saturating_add(b.face_count()) > MAX_PLANAR_SEGMENTS * 2 {
+        return None;
+    }
+    let normals = |x: &Body| -> Vec<Vec3> {
+        x.solid
+            .face_iter()
+            .filter_map(|f| match f.oriented_surface() {
+                mt::Surface::Plane(p) => {
+                    let n = p.normal();
+                    Vec3::new(n.x, n.y, n.z).normalized()
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut target: Vec<Vec3> = Vec::new();
+    for n in normals(a) {
+        if !target.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-9) {
+            target.push(n);
+        }
+    }
+    let tool = normals(b);
+    let capped = |d: &Vec3| tool.iter().any(|n| n.dot(*d) > 1.0 - 1e-9) && tool.iter().any(|n| n.dot(*d) < -1.0 + 1e-9);
+    let mut dirs: Vec<Vec3> = target.iter().take(8).copied().collect();
+    dirs.extend(target.iter().skip(8).filter(|d| capped(d)).take(8));
+    Some(dirs)
+}
+
+/// The direction `b` is a prism (or a stack of prisms) along: the first of its planar faces'
+/// normals along which it is one. `None` when there is none.
+pub(crate) fn prism_axis(b: &Body) -> Option<Vec3> {
+    if b.face_count() > MAX_PLANAR_SEGMENTS {
+        return None;
+    }
+    let tol = (b.size() * 1e-7).max(1e-9) * 10.0;
+    let index = LazyIndex::new(b, 1);
+    let mut tried: Vec<Vec3> = Vec::new();
+    for f in b.solid.face_iter() {
+        let mt::Surface::Plane(p) = f.oriented_surface() else { continue };
+        let n = p.normal();
+        let Some(n) = Vec3::new(n.x, n.y, n.z).normalized() else { continue };
+        if tried.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-9) {
+            continue;
+        }
+        tried.push(n);
+        if tried.len() > 16 {
+            return None;
+        }
+        let plane = Plane::from_normal(Vec3::ZERO, n)?;
+        if stack_tagged(b, n, &plane, tol, &index).is_some() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Whether a boolean of sections left one of area `v` as it was (area `u` after): the same to
+/// within rounding, as the very same outline gives (a change is at least a sliver `tol` wide).
+fn same_area(u: f64, v: f64, tol: f64) -> bool {
+    (u - v).abs() <= 1e-9 * u.abs().max(v.abs()) + tol * tol
 }
 
 /// A stepped extrusion (case floor plus walls), recovered from its cap events.
@@ -1860,11 +2457,13 @@ fn stack_tagged(b: &Body, d: Vec3, plane: &Plane, tol: f64, index: &LazyIndex) -
 
 #[cfg(test)]
 fn stack_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
-    stack_indexed(a, b, op, [&LazyIndex::new(a, 0), &LazyIndex::new(b, 1)])
+    stack_indexed(a, b, op, [&LazyIndex::new(a, 0), &LazyIndex::new(b, 1)], true)
 }
 
-/// [`prism_boolean`] of stepped prisms, the operands' indexes given.
-fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> Option<Result<Option<Body>>> {
+/// [`prism_boolean`] of stepped prisms, the operands' indexes given. A union is taken of
+/// operands that end at a common level when `common_cap` is set, else of those that don't (see
+/// [`prism_union_between_caps`]).
+fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2], common_cap: bool) -> Option<Result<Option<Body>>> {
     // Common-cap joins and overlapping partial-depth cuts of aligned stepped prisms can
     // retain their exact section boundaries instead of intersecting meshes.
     // Nonaligned bodies retain their existing B-rep path.
@@ -1878,25 +2477,16 @@ fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> O
         ps.iter().find(|p| p.lo <= lo + tol && p.hi >= hi - tol).map(|p| p.section.clone()).unwrap_or_default()
     }
     let tol = (a.size().max(b.size()) * 1e-7).max(1e-9) * 10.0;
-    let mut dirs: Vec<Vec3> = Vec::new();
-    for f in a.solid.face_iter() {
-        if let mt::Surface::Plane(p) = f.oriented_surface() {
-            let n = p.normal();
-            if let Some(n) = Vec3::new(n.x, n.y, n.z).normalized()
-                && !dirs.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-9)
-            {
-                dirs.push(n);
-            }
-        }
-    }
+    let dirs = directions(a, b)?;
     let ends = |ps: &[Prism]| ps.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.lo), hi.max(p.hi)));
-    let (d, plane, pa, pb) = dirs.into_iter().take(8).find_map(|d| {
+    let (d, plane, pa, pb) = dirs.into_iter().find_map(|d| {
         let plane = Plane::from_normal(Vec3::ZERO, d)?;
         let pa = stack_tagged(a, d, &plane, tol, ia)?;
         let pb = stack_tagged(b, d, &plane, tol, ib)?;
         let (ea, eb) = (ends(&pa), ends(&pb));
+        let shared = (ea.0 - eb.0).abs() < tol || (ea.1 - eb.1).abs() < tol;
         match op {
-            BoolOp::Union if (ea.0 - eb.0).abs() >= tol && (ea.1 - eb.1).abs() >= tol => return None,
+            BoolOp::Union if shared != common_cap => return None,
             // A cut tool may extend past a cap into empty space. Exact slab sections
             // discard that space rather than intersecting coincident cylinder walls.
             BoolOp::Cut if ea.1 <= eb.0 + tol || eb.1 <= ea.0 + tol => return None,
@@ -1910,10 +2500,15 @@ fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> O
     let mut slabs = Vec::new();
     let mut work = 0usize;
     let mut output_edges = 0usize;
+    let area =
+        |rs: &[Region2]| rs.iter().map(|r| r.outer.signed_area().abs() - r.holes.iter().map(|h| h.signed_area().abs()).sum::<f64>()).sum::<f64>();
+    // Whether some slab's section came out other than the target's (else the tool missed it).
+    let mut changed = false;
     let edges = |regions: &[Region2]| regions.iter().flat_map(|r| std::iter::once(&r.outer).chain(&r.holes)).map(|l| l.segs.len()).sum::<usize>();
     for w in levels.windows(2) {
         let (lo, hi) = (*w.first()?, *w.get(1)?);
         let (x, y) = (section(&pa, lo, hi, tol), section(&pb, lo, hi, tol));
+        let before = area(&x.regions);
         if op == BoolOp::Cut {
             let count = edges(&x.regions).saturating_add(edges(&y.regions));
             work = work.saturating_add(count.saturating_mul(count));
@@ -1927,6 +2522,7 @@ fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> O
             (_, true, _) => x,
             _ => boolean2d_tagged(&x, &y, op, tol)?,
         };
+        changed |= !same_area(area(&s.regions), before, tol);
         if op == BoolOp::Cut {
             output_edges = output_edges.saturating_add(edges(&s.regions));
             if output_edges > 8192 {
@@ -1937,6 +2533,11 @@ fn stack_indexed(a: &Body, b: &Body, op: BoolOp, [ia, ib]: [&LazyIndex; 2]) -> O
     }
     if slabs.iter().all(|s| s.regions.is_empty()) {
         return Some(Ok(None));
+    }
+    // A cut that takes nothing leaves the target as it is: the B-rep boolean reuses it itself,
+    // where this would rebuild it.
+    if op == BoolOp::Cut && !changed {
+        return None;
     }
     let history = lineage::Context::new(op, [a, b], [ia.get(), ib.get()], plane, tol, None);
     let coalesce = op == BoolOp::Cut
@@ -1976,12 +2577,80 @@ pub(crate) fn prism_boolean_free_form(a: &Body, b: &Body, op: BoolOp) -> Option<
 pub(crate) fn prism_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
     // Each operand's index is built once, and only if it is read as a prism.
     let index = [&LazyIndex::new(a, 0), &LazyIndex::new(b, 1)];
-    crate::guard("prism boolean", || Ok(simple_prism_indexed(a, b, op, index).or_else(|| stack_indexed(a, b, op, index)))).ok().flatten()
+    crate::guard("prism boolean", || Ok(simple_prism_indexed(a, b, op, index).or_else(|| stack_indexed(a, b, op, index, true)))).ok().flatten()
+}
+
+/// [`prism_boolean`] of a union of stepped prisms along one direction that end at different
+/// levels (a barrel joined between two faces of a wider part, its ends flush with them), which
+/// that route leaves to the B-rep boolean: for when that boolean has failed. `None` for other
+/// operations and operands.
+pub(crate) fn prism_union_between_caps(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
+    if op != BoolOp::Union {
+        return None;
+    }
+    let index = [&LazyIndex::new(a, 0), &LazyIndex::new(b, 1)];
+    crate::guard("prism boolean", || Ok(stack_indexed(a, b, op, index, false))).ok().flatten()
 }
 
 #[cfg(test)]
 mod planar_tests {
     use super::*;
+    #[test]
+    fn shared_arc_line_endpoint_roundoff_does_not_open_a_union() {
+        let a = Region2 { outer: Loop2::polygon(&[Vec2::new(-2., 0.), Vec2::new(2., 0.), Vec2::new(2., 2.), Vec2::new(-2., 2.)]), holes: vec![] };
+        let line = |a: (f64, f64), b: (f64, f64)| Seg2::Line { a: Vec2::new(a.0, a.1), b: Vec2::new(b.0, b.1) };
+        for epsilon in [-4e-14, 4e-14] {
+            let b = Region2 {
+                outer: Loop2 {
+                    segs: vec![
+                        line((1.15, epsilon), (-1.15, -epsilon)),
+                        Seg2::Arc { center: Vec2::new(-1.35, epsilon), radius: 0.2, start: 0., sweep: -std::f64::consts::FRAC_PI_2 },
+                        line((-1.35, -0.2), (-2.4, -0.2)),
+                        line((-2.4, -0.2), (-2.4, -1.)),
+                        line((-2.4, -1.), (2.4, -1.)),
+                        line((2.4, -1.), (2.4, -0.2)),
+                        line((2.4, -0.2), (1.35, -0.2)),
+                        Seg2::Arc {
+                            center: Vec2::new(1.35, -epsilon),
+                            radius: 0.2,
+                            start: -std::f64::consts::FRAC_PI_2,
+                            sweep: -std::f64::consts::FRAC_PI_2,
+                        },
+                    ],
+                },
+                holes: vec![],
+            };
+            let result = planar_regions_boolean(std::slice::from_ref(&a), std::slice::from_ref(&b), BoolOp::Union, 1e-5).unwrap();
+            assert_eq!(result.len(), 1);
+            assert!(result[0].outer.is_closed(1e-4));
+            assert!((result[0].area() - a.area() - b.area()).abs() < 1e-6);
+        }
+    }
+    #[test]
+    fn analytic_projection_keeps_clamped_lines_and_wrapped_arcs() {
+        let line = Seg2::Line { a: Vec2::new(2., 3.), b: Vec2::new(5., 7.) };
+        for (point, expected) in [(Vec2::new(-1., -1.), 0.), (Vec2::new(3.5, 5.), 0.5), (Vec2::new(8., 11.), 1.)] {
+            assert!((closest_param(&line, point) - expected).abs() < 1e-12);
+        }
+        for start in [-7., -0.5, 3., 7.] {
+            for sweep in [-std::f64::consts::TAU, -5., -0.2, 0.2, 5., std::f64::consts::TAU] {
+                let arc = Seg2::Arc { center: Vec2::new(2., -3.), radius: 4., start, sweep };
+                for index in 0..128 {
+                    let angle = index as f64 * std::f64::consts::TAU / 128.;
+                    let point = Vec2::new(2., -3.) + Vec2::new(angle.cos(), angle.sin()) * 6.;
+                    let nearest = arc.point_at(closest_param(&arc, point));
+                    // Includes both signs, sweeps over pi, seam crossings and endpoint clamps.
+                    for sample in 0..=128 {
+                        assert!(nearest.dist(point) <= arc.point_at(sample as f64 / 128.).dist(point) + 1e-10);
+                    }
+                }
+                for t in [0., 0.25, 0.5, 0.75, 1.] {
+                    let point = arc.point_at(t);
+                    assert!(arc.point_at(closest_param(&arc, point)).dist(point) < 1e-10);
+                }
+            }
+        }
+    }
     fn rectangle(a: Vec2, b: Vec2) -> Region2 {
         Region2 { outer: Loop2::polygon(&[a, Vec2::new(b.x, a.y), b, Vec2::new(a.x, b.y)]), holes: vec![] }
     }
@@ -2742,6 +3411,56 @@ mod planar_tests {
                 let taken = planar_regions_boolean(std::slice::from_ref(&plate), std::slice::from_ref(&cut), BoolOp::Intersect, 1e-7).unwrap();
                 assert!(taken.len() == 1 && taken[0].outer.segs.len() == 3, "{k} r {r}: {taken:?}");
                 assert!((taken[0].area() - r * r * (1.0 - std::f64::consts::FRAC_PI_4)).abs() < 1e-9, "{k} r {r}");
+            }
+        }
+    }
+
+    /// A 55 x 30 plate whose bottom edge bends up by `slope` over its last 5 mm before the
+    /// corner at (100, 50), and a strip 3 wide below the straight 50 mm, as a sheet's bend zone
+    /// lies against its base: the strip's corners on that edge rounded to the nanometre, as a
+    /// flange keeps them, and moved by `off`. Both turned by `theta` about the origin.
+    fn plate_and_strip_by_a_bent_edge(theta: f64, slope: f64, off: Vec2) -> (Region2, Region2) {
+        let (sn, cs) = theta.sin_cos();
+        let rot = |x: f64, y: f64| Vec2::new(x * cs - y * sn, x * sn + y * cs);
+        let nm = |p: Vec2| Vec2::new((p.x * 1e9).round() / 1e9, (p.y * 1e9).round() / 1e9) + off;
+        let plate = [rot(95.0, 50.0 + 5.0 * slope), rot(100.0, 50.0), rot(150.0, 50.0), rot(150.0, 80.0), rot(95.0, 80.0)];
+        let strip = [nm(rot(100.0, 50.0)), rot(100.0, 47.0), rot(150.0, 47.0), nm(rot(150.0, 50.0))];
+        (Region2 { outer: Loop2::polygon(&plate), holes: vec![] }, Region2 { outer: Loop2::polygon(&strip), holes: vec![] })
+    }
+
+    /// The bent piece of the plate's edge, a hair from the strip's edge, crosses it short of
+    /// the corner they share: the corners a nanometre apart at most, the crossing up to a
+    /// hundred times that before it at a slope of 1 in 100, a thousand at 1 in 1000. A split
+    /// there left a sliver of edge shorter than the distance within which the loops join their
+    /// pieces; the chaining took it for a second way out of the corner, and a loop of that one
+    /// sliver is open, its area not zero away from the origin: a hole no outline held (no
+    /// result at all) or a region of its own. The union is the plate and the strip, whole.
+    #[test]
+    fn a_bent_edge_crossing_its_neighbour_by_their_corner_leaves_no_sliver() {
+        let union_is_whole = |(plate, strip): (Region2, Region2), what: &str| {
+            let want = plate.area() + strip.area();
+            for (a, b) in [(&plate, &strip), (&strip, &plate)] {
+                let out = planar_regions_boolean(std::slice::from_ref(a), std::slice::from_ref(b), BoolOp::Union, 1e-7)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert_eq!(out.len(), 1, "{what}: {out:?}");
+                let lp = &out[0].outer;
+                let shortest = lp.segs.iter().map(Seg2::length).fold(f64::MAX, f64::min);
+                assert!(out[0].holes.is_empty() && lp.segs.len() == 7 && shortest > 2.9, "{what}: {} edges, shortest {shortest:e}", lp.segs.len());
+                assert!((out[0].area() - want).abs() < 1e-6, "{what}: {} vs {want}", out[0].area());
+            }
+        };
+        for k in 0..360 {
+            for slope in [0.01, 0.001] {
+                union_is_whole(plate_and_strip_by_a_bent_edge((k as f64 * 0.25).to_radians(), slope, Vec2::ZERO), &format!("{k} slope {slope}"));
+            }
+        }
+        // Corners a few nanometres apart, any way round: the sliver is then longer than the
+        // tolerance (1e-7 with the strip 1e-9 into the plate) but shorter than the joining
+        // distance (1e-6).
+        for k in 0..16 {
+            for d in [1e-9, 4e-9] {
+                let off = Vec2::from_angle(k as f64 * std::f64::consts::TAU / 16.0) * d;
+                union_is_whole(plate_and_strip_by_a_bent_edge(0.0, 0.01, off), &format!("off {off:?}"));
             }
         }
     }

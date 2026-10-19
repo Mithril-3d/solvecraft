@@ -227,13 +227,36 @@ impl NotPlanar {
     }
 }
 
+/// The kind of curved surface `face` lies on, or None when it lies on a plane. `flat`: whether
+/// its mesh is flat. The meshes here are as coarse as a thousandth of the body, which spans a
+/// round much smaller than that (a 2 mm corner of a 1.2 m channel) with one flat strip of
+/// facets: the surface decides, and the mesh only for a surface none of these kinds fits.
+fn curved_kind(face: &mt::Face, flat: bool, tol: f64) -> Option<&'static str> {
+    use crate::offset::{Surf, surf_of};
+    if matches!(face.surface(), mt::Surface::Plane(_)) {
+        return None;
+    }
+    match surf_of(face, tol) {
+        Some(Surf::Plane { .. }) => None,
+        Some(Surf::Cylinder { .. }) => Some("cylinder"),
+        Some(Surf::Cone { .. }) => Some("cone"),
+        Some(Surf::Sphere { .. }) => Some("sphere"),
+        Some(Surf::Torus { .. }) => Some("torus"),
+        None => (!flat).then_some("freeform"),
+    }
+}
+
+/// The tolerance [`curved_kind`] tells surfaces apart by: face_surface's, with the body's
+/// bounds computed once. Walking to each indexed face separately made curved-body diagnostics
+/// quadratic.
+fn kind_tol(b: &Body) -> f64 {
+    (b.size() * 1e-7).max(1e-9) * 100.0
+}
+
 /// The plane of each face (from its mesh, which must be flat), or what stands in the way: the
 /// curved faces by the kind of surface they lie on.
 fn face_planes(b: &Body, faces: &[crate::FaceInfo]) -> std::result::Result<Vec<PlaneEq>, NotPlanar> {
-    use crate::offset::{Surf, surf_of};
-    // Match face_surface's classification tolerance, but compute the body bounds only
-    // once. Walking to each indexed face separately made curved-body diagnostics quadratic.
-    let surface_tol = (b.size() * 1e-7).max(1e-9) * 100.0;
+    let surface_tol = kind_tol(b);
     let mut surfaces = b.solid.face_iter();
     let mut curved: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
     let mut out = Vec::with_capacity(faces.len());
@@ -247,19 +270,10 @@ fn face_planes(b: &Body, faces: &[crate::FaceInfo]) -> std::result::Result<Vec<P
         if f.area <= 0.0 {
             return Err(NotPlanar::Other(format!("face {} could not be meshed", f.index)));
         }
-        match f.plane_normal {
-            Some(n) => out.push(PlaneEq { n, w: n.dot(f.centroid) }),
-            None => {
-                let kind = match surf_of(surface, surface_tol) {
-                    Some(Surf::Cylinder { .. }) => "cylinder",
-                    Some(Surf::Cone { .. }) => "cone",
-                    Some(Surf::Sphere { .. }) => "sphere",
-                    Some(Surf::Torus { .. }) => "torus",
-                    Some(Surf::Plane { .. }) => return Err(NotPlanar::Other(format!("face {} is planar but its mesh is not flat", f.index))),
-                    None => "freeform",
-                };
-                *curved.entry(kind).or_insert(0) += 1;
-            }
+        match (f.plane_normal, curved_kind(surface, f.plane_normal.is_some(), surface_tol)) {
+            (Some(n), None) => out.push(PlaneEq { n, w: n.dot(f.centroid) }),
+            (None, None) => return Err(NotPlanar::Other(format!("face {} is planar but its mesh is not flat", f.index))),
+            (_, Some(kind)) => *curved.entry(kind).or_insert(0) += 1,
         }
     }
     if surfaces.next().is_some() {
@@ -329,6 +343,10 @@ fn faceted_polys(b: &Body, tol: f64, operand: usize) -> Option<Vec<Poly>> {
 /// triangles of `b`; an edge between facets of one face of `a`, or between triangles of `b`,
 /// has no origin.
 pub fn faceted_boolean(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Option<Body>> {
+    crate::profile::timed(crate::profile::Kind::Boolean, || faceted_boolean_untimed(a, b, op, tol))
+}
+
+fn faceted_boolean_untimed(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Option<Body>> {
     a.require_brep("a boolean")?;
     if !(tol.is_finite() && tol > 0.0) {
         return Err(KernelError::Invalid("facet tolerance".into()));
@@ -356,6 +374,11 @@ pub fn faceted_boolean(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Optio
     // whether the pieces' boundaries come out consistent: try a few tolerances, and take the
     // first whose result is watertight and agrees with the complementary boolean (A − B and
     // A ∩ B add up to A; A ∪ B is A plus B less A ∩ B).
+    // The BSP takes each list's first polygon as its splitting plane. Facets in sweep order
+    // (a thread's groove, turn after turn) make every splitter cut nothing, so the tree is as
+    // deep as the list is long: quadratic time and memory, and a long thread ran out of depth
+    // (#1250). The same lists in a fixed shuffled order give a shallow tree.
+    let (pa, pb) = (shuffled(pa), shuffled(pb));
     let (va, vb) = (polys_volume(&pa), polys_volume(&pb));
     let mut last = KernelError::Failed("faceted boolean".into());
     for rel in [1e-8, 1e-7, 3e-8, 1e-9, 3e-7] {
@@ -381,6 +404,23 @@ pub fn faceted_boolean(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Optio
         }
     }
     Err(last)
+}
+
+/// `polys` in a fixed pseudo-random order (the same every run, so results are reproducible).
+fn shuffled(mut polys: Vec<Poly>) -> Vec<Poly> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ polys.len() as u64;
+    let mut next = || {
+        // SplitMix64.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..polys.len()).rev() {
+        polys.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    polys
 }
 
 /// Boolean of two all-planar bodies.
@@ -409,21 +449,30 @@ pub fn planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
 /// two parallel planes holds `b` and none of `a`'s curved faces (a pocket cut beside a round
 /// hole): `a` is split across the slab, the middle piece takes the exact boolean, and the
 /// pieces outside are joined back on. `None` when no such slab exists.
-fn sliced_planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
+pub(crate) fn sliced_planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option<Body>>> {
     let pb = planar_polys(b, 1).ok()?;
     let size = a.size().max(b.size());
     let tol = (a.size() * 1e-3).max(1e-3);
     let infos = a.faces(tol).ok()?;
     let mesh = a.tessellate(tol).ok()?;
+    // Each face's plane normal where it is planar (see [`curved_kind`]): a small round meshed
+    // flat is no plane, and taken for one the middle piece would rebuild it as a chamfer.
+    let surface_tol = kind_tol(a);
+    let planes: Vec<Option<Vec3>> =
+        a.solid.face_iter().zip(&infos).map(|(f, info)| info.plane_normal.filter(|_| curved_kind(f, true, surface_tol).is_none())).collect();
     let mut curved: BTreeMap<u32, solidcraft_geom::Aabb3> = BTreeMap::new();
     for (t, fi) in mesh.triangles.iter().zip(&mesh.tri_face) {
-        if infos.get(*fi as usize)?.plane_normal.is_some() {
+        if planes.get(*fi as usize)?.is_some() {
             continue;
         }
         let bx = curved.entry(*fi).or_insert(solidcraft_geom::Aabb3::EMPTY);
         for p in mesh.tri(t)? {
             bx.add(p);
         }
+    }
+    // All planar: the exact boolean itself, not this.
+    if curved.is_empty() {
+        return None;
     }
     let mut tool = solidcraft_geom::Aabb3::EMPTY;
     for p in pb.iter().flat_map(|p| &p.v) {
@@ -432,7 +481,7 @@ fn sliced_planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option
     let at = |v: Vec3, k: usize| [v.x, v.y, v.z].get(k).copied().unwrap_or(0.0);
     let axes = [Vec3::X, Vec3::Y, Vec3::Z];
     // Planar faces of `a` square to an axis: a cut must not land in one of their planes.
-    let flat: Vec<(Vec3, Vec3)> = infos.iter().filter_map(|f| Some((f.plane_normal?, f.centroid))).collect();
+    let flat: Vec<(Vec3, Vec3)> = planes.iter().zip(&infos).filter_map(|(n, f)| Some(((*n)?, f.centroid))).collect();
     let gap = size * 1e-4;
     let place = |k: usize, near: f64, far: f64| -> Option<f64> {
         let axis = *axes.get(k)?;
@@ -482,6 +531,13 @@ fn sliced_planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option
         for (slot, (cut, keep_positive)) in [(2, (lo, true)), (4, (hi, false))] {
             let Some(x) = cut else { continue };
             let plane = solidcraft_geom::Plane::new(axis * x, u, w).ok_or_else(|| fail("plane"))?;
+            // Split along the plane (an imprint: no boolean); two booleans with half boxes
+            // where the split can't be sorted into one piece kept and the rest away.
+            if let Some((away, kept)) = split_beside(&middle, &plane, axis, x, keep_positive) {
+                outside.extend(away);
+                middle = kept;
+                continue;
+            }
             let (away, kept) = (crate::ops::half_box(&middle.0, &plane, !keep_positive)?, crate::ops::half_box(&middle.0, &plane, keep_positive)?);
             let (h_away, h_kept) = (recorded::kept(&away, slot, n), recorded::kept(&kept, slot + 1, n));
             if let Some(o) = crate::ops::boolean(&middle.0, &away, BoolOp::Intersect)? {
@@ -494,72 +550,126 @@ fn sliced_planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Option<Result<Option
         }
         let pm = planar_polys(&middle.0, 0).map_err(|e| fail(&e.describe("middle piece")))?;
         let r = polys_boolean(pm, pb, size, op, size * 1e-9, &Sources::of(&[&middle.0, b]))?;
-        let h_b = recorded::kept(b, 1, n);
-        let counts = record::counts(&[a, b]);
-        if op == BoolOp::Intersect {
-            return Ok(r.map(|r| {
-                let h = dropped(recorded::of_pair(&r, &middle.1, &h_b));
-                r.with_checked_history(h, &counts)
-            }));
-        }
-        // The rebuild leaves the cut faces' edges split where other polygons were cut; healed,
-        // they match the pieces outside edge for edge.
-        let pieces: Vec<Traced> = match r {
-            Some(m) => {
-                let healed = recorded::heal_body(&m, m.deep_copy(), size, a.split_keep(), &record::counts(&[&middle.0, b]))?;
-                let h = recorded::of_pair(&healed, &middle.1, &h_b);
-                vec![(healed, h)]
-            }
-            None => Vec::new(),
-        };
-        // Each piece in its lumps: a cut plane crossing a frame or a ring leaves the middle (or
-        // a piece outside) in several parts, which meet the others along several cut faces.
-        let lumps = |(whole, h): Traced| -> Result<Vec<Traced>> {
-            if whole.solid.boundaries().len() == 1 {
-                return Ok(vec![(whole, h)]);
-            }
-            let parts = whole.lumps()?;
-            let histories = recorded::parts_of(&parts, &whole);
-            Ok(parts
-                .into_iter()
-                .zip(histories)
-                .map(|(p, hp)| {
-                    let h = match (hp, h.as_ref()) {
-                        (Some(hp), Some(h)) => recorded::composed(hp.substituted(0, h)),
-                        _ => None,
-                    };
-                    (p, h)
-                })
-                .collect())
-        };
-        let mut all: Vec<Traced> = Vec::new();
-        for piece in pieces.into_iter().chain(outside) {
-            all.extend(lumps(piece)?);
-        }
-        // Glue pieces that meet along their cut faces until one is left; every cut face pair
-        // goes (a pair left behind would be a slit through the result).
-        let mut joined: Vec<Traced> = Vec::new();
-        while let Some(mut cur) = all.pop() {
-            loop {
-                let found = all.iter().enumerate().find_map(|(i, (o, _))| Some((i, crate::coplanar::glue(&cur.0, o)?.ok()?)));
-                let Some((i, j)) = found else { break };
-                let other = all.swap_remove(i);
-                let h = recorded::of_pair(&j, &cur.1, &other.1);
-                cur = (j, h);
-            }
-            joined.push(cur);
-        }
-        if joined.iter().any(|(x, _)| x.solid.boundaries().len() != 1) {
-            return Err(fail("a piece in several parts"));
-        }
-        // A join onto one piece is one piece: anything apart is a cut face that did not glue.
-        if op == BoolOp::Union && a.solid.boundaries().len() == 1 && joined.len() != 1 {
-            return Err(fail("a piece does not join back"));
-        }
-        let pieces = joined;
-        recorded::join(pieces.into_iter().map(|(p, h)| (p, dropped(h))).collect(), &counts)
+        reassembled(a, b, op, &middle, r, outside, n, &fail)
     };
     Some(run())
+}
+
+/// The middle piece's boolean with `b` (`r`, over `[middle, b]`) and the pieces of `a` split
+/// away from the middle (`outside`) glued back into one result over `[a, b]`: the operands past
+/// the second (`n` in all, the boxes a piece was cut with) are dropped. `fail` names the route
+/// in its errors. Shared with [`crate::prism_local`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reassembled(
+    a: &Body,
+    b: &Body,
+    op: BoolOp,
+    middle: &Traced,
+    r: Option<Body>,
+    outside: Vec<Traced>,
+    n: usize,
+    fail: &dyn Fn(&str) -> KernelError,
+) -> Result<Option<Body>> {
+    let size = a.size().max(b.size());
+    let h_b = recorded::kept(b, 1, n);
+    let counts = record::counts(&[a, b]);
+    if op == BoolOp::Intersect {
+        return Ok(r.map(|r| {
+            let h = dropped(recorded::of_pair(&r, &middle.1, &h_b));
+            r.with_checked_history(h, &counts)
+        }));
+    }
+    // The rebuild leaves the cut faces' edges split where other polygons were cut; healed,
+    // they match the pieces outside edge for edge.
+    let pieces: Vec<Traced> = match r {
+        Some(m) => {
+            let healed = recorded::heal_body(&m, m.deep_copy(), size, a.split_keep(), &record::counts(&[&middle.0, b]))?;
+            let h = recorded::of_pair(&healed, &middle.1, &h_b);
+            vec![(healed, h)]
+        }
+        None => Vec::new(),
+    };
+    // Each piece in its lumps: a cut plane crossing a frame or a ring leaves the middle (or
+    // a piece outside) in several parts, which meet the others along several cut faces.
+    let lumps = |(whole, h): Traced| -> Result<Vec<Traced>> {
+        if whole.solid.boundaries().len() == 1 {
+            return Ok(vec![(whole, h)]);
+        }
+        let parts = whole.lumps()?;
+        let histories = recorded::parts_of(&parts, &whole);
+        Ok(parts
+            .into_iter()
+            .zip(histories)
+            .map(|(p, hp)| {
+                let h = match (hp, h.as_ref()) {
+                    (Some(hp), Some(h)) => recorded::composed(hp.substituted(0, h)),
+                    _ => None,
+                };
+                (p, h)
+            })
+            .collect())
+    };
+    let mut all: Vec<Traced> = Vec::new();
+    for piece in pieces.into_iter().chain(outside) {
+        all.extend(lumps(piece)?);
+    }
+    // Glue pieces that meet along their cut faces until one is left; every cut face pair
+    // goes (a pair left behind would be a slit through the result).
+    let mut joined: Vec<Traced> = Vec::new();
+    while let Some(mut cur) = all.pop() {
+        loop {
+            let found = all.iter().enumerate().find_map(|(i, (o, _))| Some((i, crate::coplanar::glue(&cur.0, o)?.ok()?)));
+            let Some((i, j)) = found else { break };
+            let other = all.swap_remove(i);
+            let h = recorded::of_pair(&j, &cur.1, &other.1);
+            cur = (j, h);
+        }
+        joined.push(cur);
+    }
+    if joined.iter().any(|(x, _)| x.solid.boundaries().len() != 1) {
+        return Err(fail("a piece in several parts"));
+    }
+    // A join onto one piece is one piece: anything apart is a cut face that did not glue.
+    if op == BoolOp::Union && a.solid.boundaries().len() == 1 && joined.len() != 1 {
+        return Err(fail("a piece does not join back"));
+    }
+    let pieces = joined;
+    recorded::join(pieces.into_iter().map(|(p, h)| (p, dropped(h))).collect(), &counts)
+}
+
+/// `piece` split by `plane` (at `x` along `axis`): the parts on the side away from the tool
+/// and the one part on its side (positive along `axis` when `keep_positive`), each with its
+/// history over the operands `piece`'s is over. `None` when the split leaves no part on either
+/// side, or several on the tool's.
+pub(crate) fn split_beside(piece: &Traced, plane: &solidcraft_geom::Plane, axis: Vec3, x: f64, keep_positive: bool) -> Option<(Vec<Traced>, Traced)> {
+    let parts = crate::splitface::split_body(&piece.0, &crate::splitface::SplitTool::Plane(*plane)).ok()?;
+    if parts.len() < 2 {
+        return None;
+    }
+    let tol = piece.0.size() * 1e-6 + 1e-9;
+    let (mut away, mut kept) = (Vec::new(), Vec::new());
+    for part in parts {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for v in part.solid.vertex_iter() {
+            let t = from_p3(v.point()).dot(axis) - x;
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        let h = match (part.history(), piece.1.as_ref()) {
+            (Some(hp), Some(h)) => recorded::composed(hp.clone().substituted(0, h)),
+            _ => None,
+        };
+        let positive = if lo >= -tol {
+            true
+        } else if hi <= tol {
+            false
+        } else {
+            return None;
+        };
+        if positive == keep_positive { kept.push((part, h)) } else { away.push((part, h)) }
+    }
+    let kept = kept.pop().filter(|_| kept.is_empty())?;
+    (!away.is_empty()).then_some((away, kept))
 }
 
 /// `h` over `[a, b]`: the operands after them (the boxes a piece was cut with) dropped, which
@@ -1134,5 +1244,61 @@ mod diagnostic_tests {
         assert_eq!(face_planes(&body, &faces).err().unwrap(), NotPlanar::Other("face 0 could not be meshed".into()));
         faces[0].index = 999;
         assert_eq!(face_planes(&body, &faces).err().unwrap(), NotPlanar::Other("mesh is inconsistent".into()));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod small_round_tests {
+    use std::f64::consts::FRAC_PI_2;
+
+    use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2};
+
+    use super::*;
+
+    /// An `l` x `w` x 1 plate on XY with its four corners rounded (radius `r`), and a hole of
+    /// diameter 4 through it 100 from one end when `hole`.
+    fn rounded_plate(l: f64, w: f64, r: f64, hole: bool) -> Body {
+        let (x, y) = (l / 2.0, w / 2.0);
+        let corners = [(x - r, y - r), (r - x, y - r), (r - x, r - y), (x - r, r - y)];
+        let mut segs = Vec::new();
+        for (k, (cx, cy)) in corners.iter().enumerate() {
+            let start = k as f64 * FRAC_PI_2;
+            let at = |t: f64| Vec2::new(cx + r * t.cos(), cy + r * t.sin());
+            segs.push(Seg2::Arc { center: Vec2::new(*cx, *cy), radius: r, start, sweep: FRAC_PI_2 });
+            let (nx, ny) = corners[(k + 1) % 4];
+            let next = start + FRAC_PI_2;
+            segs.push(Seg2::Line { a: at(next), b: Vec2::new(nx + r * next.cos(), ny + r * next.sin()) });
+        }
+        let holes = if hole { vec![Loop2::circle(Vec2::new(x - 100.0, 0.0), 2.0).reversed()] } else { Vec::new() };
+        crate::extrude_planar_regions(&Plane::XY, &[Region2 { outer: Loop2 { segs }, holes }], 0.0, 1.0).unwrap()
+    }
+
+    /// Faces of `b` on cylinders of radius `r`.
+    fn cylinders(b: &Body, r: f64) -> usize {
+        (0..b.face_count())
+            .filter(|&i| matches!(crate::face_surface(b, i), Some(crate::FaceSurface::Cylinder { radius, .. }) if (radius - r).abs() < 1e-9))
+            .count()
+    }
+
+    /// A pocket cut into the middle of a long plate by the exact fallback leaves the plate's
+    /// small corner rounds round. Meshed at a thousandth of the 1200 mm plate (1.2 mm), each
+    /// 2 mm quarter round (its chord 0.59 mm inside the arc) is one flat strip of facets, which
+    /// was taken for a plane: the whole plate went to the polygon boolean (and, beside a round
+    /// hole, the rounds went into the planar slab around the pocket), and the rounds came back
+    /// flat chamfers, each taking r^2 (pi/4 - 1/2) = 1.14 mm^3 more than its round.
+    #[test]
+    fn a_long_plates_small_rounds_stay_round_beside_a_pocket() {
+        for hole in [false, true] {
+            let plate = rounded_plate(1200.0, 40.0, 2.0, hole);
+            assert_eq!(cylinders(&plate, 2.0), 4 + 2 * usize::from(hole));
+            // 10 x 5, 0.1 deep from the top.
+            let tool = crate::box_solid(Vec3::new(-5.0, -2.5, 0.9), Vec3::new(5.0, 2.5, 1.0)).unwrap();
+            let r = planar_boolean(&plate, &tool, BoolOp::Cut).unwrap().unwrap();
+            assert_eq!(cylinders(&r, 2.0), 4 + 2 * usize::from(hole), "hole {hole}");
+            // The pocket's 10 x 5 x 0.1 and nothing else (a flattened round takes 1.14 more).
+            let removed = crate::measure(&plate).unwrap().volume - crate::measure(&r).unwrap().volume;
+            assert!((removed - 5.0).abs() < 1e-3, "hole {hole}: removed {removed}");
+        }
     }
 }

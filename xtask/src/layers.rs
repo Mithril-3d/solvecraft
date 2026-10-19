@@ -36,6 +36,12 @@ impl Class {
 /// prefix.
 pub const TABLE: &[(&str, Class)] = &[
     ("geom", Class::Layer(0)),
+    // 3D mouse descriptors and reports (no workspace dependencies; the apps read the device)
+    ("space-mouse", Class::Layer(0)),
+    // the derive macros (proc-macro, no workspace dependencies)
+    ("derive", Class::Standalone),
+    // the 3Dconnexion driver's client API on macOS (no workspace dependencies)
+    ("3dx-client", Class::Standalone),
     ("sketch", Class::Layer(1)),
     ("kernel", Class::Layer(1)),
     ("render", Class::Layer(1)),
@@ -54,8 +60,9 @@ pub const TABLE: &[(&str, Class)] = &[
 ];
 
 /// Explicit orderings *within* a layer (earlier may be used by later).
-/// The viewport draws display plans the GPU crate evaluates.
-pub const INTRA_LAYER_ORDER: &[&[&str]] = &[&["gpu", "ui-egui"]];
+/// The viewport draws display plans the GPU crate evaluates and draws with its pipelines; the MCP
+/// server's tests draw screenshots with them.
+pub const INTRA_LAYER_ORDER: &[&[&str]] = &[&["gpu", "ui-egui"], &["gpu", "mcp"]];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {
     let (from, to) = (short_name(from), short_name(to));

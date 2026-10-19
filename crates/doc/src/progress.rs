@@ -21,7 +21,22 @@ pub struct Progress {
     work_stage: std::sync::Mutex<&'static str>,
     work_done: AtomicUsize,
     work_total: AtomicUsize,
+    /// A window wants the model as far as it is built, to show while the rest is ([`Progress::want_partial`]).
+    partial_wanted: AtomicBool,
+    /// The latest such model and when it was offered.
+    partial: std::sync::Mutex<(Option<Partial>, Option<web_time::Instant>)>,
 }
+
+/// The model as far as an evaluation has built it, placed in the world as the design places it.
+#[derive(Clone, Debug)]
+pub struct Partial {
+    /// Features evaluated.
+    pub features: usize,
+    pub world: Arc<crate::ModelState>,
+}
+
+/// How often an evaluation offers the model built so far.
+const PARTIAL_EVERY: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Default for Progress {
     fn default() -> Self {
@@ -33,6 +48,8 @@ impl Default for Progress {
             work_stage: std::sync::Mutex::new(""),
             work_done: AtomicUsize::new(0),
             work_total: AtomicUsize::new(0),
+            partial_wanted: AtomicBool::new(false),
+            partial: std::sync::Mutex::new((None, None)),
         }
     }
 }
@@ -53,6 +70,14 @@ impl Progress {
     /// Features evaluated so far and the timeline's length (0 before evaluation starts).
     pub fn features(&self) -> (usize, usize) {
         (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
+    }
+    /// Ask the watched evaluation to offer the model as far as it is built, now and then.
+    pub fn want_partial(&self) {
+        self.partial_wanted.store(true, Ordering::Relaxed);
+    }
+    /// The model as far as it was built when last offered, once (`None` until there is a newer one).
+    pub fn take_partial(&self) -> Option<Partial> {
+        self.partial.lock().ok().and_then(|mut p| p.0.take())
     }
     /// Long work inside a feature, such as reading a large STEP file: (step, done, total);
     /// `None` while there is none to show.
@@ -146,6 +171,37 @@ impl Evaluation {
     }
 }
 
+impl Evaluation {
+    /// The outer evaluation has built the model up to feature `features`: a watcher that wants
+    /// partial models gets it, placed by `doc`, at most every [`PARTIAL_EVERY`] (the first one
+    /// after one interval, so a design that opens quickly offers none).
+    pub(crate) fn offer(&self, features: usize, doc: &crate::Document, state: &Arc<crate::ModelState>) {
+        if !self.outer {
+            return;
+        }
+        let progress = CURRENT.with(|c| c.borrow().as_ref().map(|cur| cur.progress.clone()));
+        let Some(progress) = progress.filter(|p| p.partial_wanted.load(Ordering::Relaxed) && !p.is_cancelled()) else { return };
+        let now = web_time::Instant::now();
+        let due = match progress.partial.lock() {
+            Ok(mut p) => match p.1 {
+                None => {
+                    p.1 = Some(now);
+                    false
+                }
+                Some(last) => now.duration_since(last) >= PARTIAL_EVERY,
+            },
+            Err(_) => false,
+        };
+        if !due {
+            return;
+        }
+        let world = Arc::new(crate::world_state(doc, state));
+        if let Ok(mut p) = progress.partial.lock() {
+            *p = (Some(Partial { features, world }), Some(web_time::Instant::now()));
+        }
+    }
+}
+
 impl Drop for Evaluation {
     fn drop(&mut self) {
         CURRENT.with(|c| {
@@ -184,5 +240,45 @@ mod tests {
         });
         assert_eq!(p.features(), (5, 5));
         assert!(!begin(1).step(0), "the watch ends with its scope");
+    }
+
+    /// A watcher that asks for partial models gets the model built so far, placed, now and then;
+    /// one that doesn't ask, or an unwatched evaluation, never pays for it.
+    #[test]
+    fn partial_models_go_only_to_a_watcher_that_wants_them() {
+        let mut doc = crate::Document::new("partial");
+        let block = crate::FeatureKind::Box {
+            corner: crate::point_expr(solidcraft_geom::Vec3::ZERO),
+            length: "2 mm".into(),
+            width: "3 mm".into(),
+            height: "4 mm".into(),
+            operation: crate::Operation::NewBody,
+        };
+        doc.add_feature(block, Some("Block")).unwrap();
+        let mut model = crate::Model::default();
+        model.evaluate(&doc);
+        let state = model.state();
+        let offer = |p: &Arc<Progress>| {
+            watch(p.clone(), || {
+                let e = begin(1);
+                e.offer(1, &doc, &state);
+            })
+        };
+        let p = Arc::new(Progress::default());
+        offer(&p);
+        assert!(p.take_partial().is_none(), "not asked for");
+        p.want_partial();
+        offer(&p);
+        assert!(p.take_partial().is_none(), "nothing in the first interval: a quick open offers none");
+        if let Ok(mut g) = p.partial.lock() {
+            g.1 = web_time::Instant::now().checked_sub(PARTIAL_EVERY * 2);
+        }
+        offer(&p);
+        let partial = p.take_partial().unwrap();
+        assert_eq!(partial.features, 1);
+        assert_eq!(partial.world.bodies.len(), 1);
+        assert!(p.take_partial().is_none(), "taken once");
+        offer(&p);
+        assert!(p.take_partial().is_none(), "not again within the interval");
     }
 }

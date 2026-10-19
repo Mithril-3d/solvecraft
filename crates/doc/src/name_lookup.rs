@@ -271,6 +271,25 @@ pub fn locate_face(st: &ModelState, name: &str, p: Vec3) -> Option<FaceHit> {
     locate_in(st.bodies.iter().enumerate().filter(|(_, b)| !b.body.is_mesh()), name, p)
 }
 
+/// [`locate_face`] for a feature that works on the faces of the body called `body` (a shell, a
+/// draft…): the one face of that body with the very name, found without working out the names
+/// of every other body (a body named from geometry is meshed for it: seconds in a large model).
+/// Else as [`locate_face`], over every body: the name moved to another body (a combine took the
+/// face), or on this body it names a piece of a split face or a merged one. The same face on
+/// another body (a copy of this one) is not a piece of this body's face.
+pub(crate) fn locate_face_on_body(st: &ModelState, body: Option<&str>, name: &str, p: Vec3) -> Option<FaceHit> {
+    if legacy_name(name).is_none()
+        && let Some(i) = body.and_then(|n| st.bodies.iter().position(|b| b.name == n))
+        && let Some(b) = st.bodies.get(i).filter(|b| !b.body.is_mesh())
+        && let Some(hit) = locate_in(std::iter::once((i, b)), name, p)
+        && !hit.split
+        && naming::names(b).faces.get(hit.face).is_some_and(|n| n == name)
+    {
+        return Some(hit);
+    }
+    locate_face(st, name, p)
+}
+
 /// [`locate_face`] among `bodies` (with their indices).
 fn locate_in<'a>(bodies: impl Iterator<Item = (usize, &'a ModelBody)>, name: &str, p: Vec3) -> Option<FaceHit> {
     if let Some(old) = legacy_name(name) {
@@ -370,4 +389,31 @@ pub fn faces_with_stem(b: &ModelBody, name: &str) -> Vec<usize> {
 /// [`locate_face`] on one body.
 pub(crate) fn locate_on(body: &ModelBody, name: &str, p: Vec3) -> Option<FaceHit> {
     locate_in(std::iter::once((0, body)), name, p)
+}
+
+/// The one face a name `model.faces` lists finds, on the body called `body` or, without one, on
+/// any body. `Err` says why there is no such face, or why the name does not name just one (the
+/// pieces of a split face, or the same face on several bodies): a command that takes a face by
+/// its name has no point to tell the pieces apart by.
+pub fn locate_one(st: &ModelState, body: Option<&str>, name: &str) -> Result<FaceHit, String> {
+    if let Some(n) = body
+        && !st.bodies.iter().any(|b| b.name == n)
+    {
+        return Err(format!("no body `{n}`"));
+    }
+    let bodies: Vec<(usize, &ModelBody)> =
+        st.bodies.iter().enumerate().filter(|(_, b)| !b.body.is_mesh() && body.is_none_or(|n| b.name == n)).collect();
+    // As [`locate_face`]: the names of several bodies are worked out on all cores first.
+    if bodies.len() > 1 && legacy_name(name).is_none() {
+        solidcraft_kernel::for_each_on_threads(&bodies, 16, |(_, b)| {
+            let _ = naming::names(b);
+        });
+    }
+    let hit = locate_in(bodies.into_iter(), name, Vec3::ZERO).ok_or_else(|| format!("no face is named `{name}` (`model.faces` lists the names)"))?;
+    if hit.split {
+        return Err(format!(
+            "`{name}` names more than one face (pieces of a split face, or faces of several bodies): give `body`, or the name of one piece"
+        ));
+    }
+    Ok(hit)
 }

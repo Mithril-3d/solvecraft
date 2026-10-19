@@ -50,9 +50,44 @@
    ]
   }
  },
- {"click": {"sketch": [20, -8]}},
+ {
+  "click": {
+   "sketch": [
+    20,
+    -8
+   ]
+  }
+ },
  {
   "text": "50"
+ },
+ {
+  "key": "Enter"
+ },
+ {
+  "key": "Escape"
+ },
+ {
+  "start": "sketch.dimension"
+ },
+ {
+  "click": {
+   "sketch": [
+    50,
+    15
+   ]
+  }
+ },
+ {
+  "click": {
+   "sketch": [
+    58,
+    15
+   ]
+  }
+ },
+ {
+  "text": "30"
  },
  {
   "key": "Enter"
@@ -64,7 +99,8 @@
   "expect": {
    "dialog": null,
    "param": {
-    "d1": 50
+    "d1": 50,
+    "d2": 30
    }
   }
  },

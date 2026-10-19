@@ -2,7 +2,8 @@
 //! LWPOLYLINE, POLYLINE/VERTEX, POINT, ELLIPSE, SPLINE, TEXT and MTEXT, scaled to millimetres by
 //! `$INSUNITS`. Block references (INSERT, with scale, rotation and arrays) are expanded,
 //! nested blocks too; paper-space entities are skipped. The writer emits an R12-style file of lines, circles,
-//! arcs and points (free-form curves as polylines).
+//! arcs and points (free-form curves as polylines); the flat pattern's drawing, with ELLIPSE and SPLINE, is
+//! [`crate::write_dxf_drawing`].
 
 use std::collections::HashMap;
 
@@ -454,6 +455,39 @@ pub fn write_dxf(geom: &[Geom2]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A DXF is group codes and values the user did not write, and blocks recurse. None of these
+    /// may panic (solidcraft#469).
+    #[test]
+    fn hostile_dxf_never_panics() {
+        let good = write_dxf(&[Geom2::Line(Vec2::ZERO, Vec2::new(10.0, 0.0)), Geom2::Circle(Vec2::new(5.0, 5.0), 2.0)]);
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "0".into(),
+            "0\n".into(),
+            "garbage".into(),
+            "0\nSECTION\n2\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nEOF\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n90\n4\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n90\n-1\n0\nENDSEC\n0\nEOF\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n90\n99999999\n0\nENDSEC\n0\nEOF\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nCIRCLE\n10\nnan\n20\ninf\n40\n-1\n0\nENDSEC\n0\nEOF\n".into(),
+            "0\nSECTION\n2\nENTITIES\n0\nCIRCLE\n10\n1e400\n20\n1e400\n40\n1e400\n0\nENDSEC\n0\nEOF\n".into(),
+            format!("0\nSECTION\n2\nBLOCKS\n{}0\nENDSEC\n0\nEOF\n", "0\nBLOCK\n2\nb\n0\nENDBLK\n".repeat(300)),
+            "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\na\n1\nINSERT\n2\na\n0\nENDBLK\n0\nENDSEC\n0\nEOF\n".into(),
+            format!("0\nSECTION\n2\nENTITIES\n{}0\nENDSEC\n0\nEOF\n", "0\nLINE\n10\n0\n20\n0\n11\n1\n21\n1\n".repeat(5000)),
+        ];
+        for cut in (0..good.len()).step_by(11) {
+            cases.push(good.get(..cut).unwrap_or("").to_string());
+        }
+        for (from, to) in [("0\n", "1\n"), ("SECTION", "SECTI0N"), ("EOF", "EOFF")] {
+            cases.push(good.replacen(from, to, 3));
+        }
+        for c in &cases {
+            let r = std::panic::catch_unwind(|| read_dxf(c));
+            assert!(r.is_ok(), "panicked on {:?}", c.get(..c.len().min(200)));
+        }
+    }
 
     #[test]
     fn round_trip_and_polyline_bulges() {

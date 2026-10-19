@@ -36,7 +36,7 @@ thread_local! {
     static DEFERRED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Commands registered on one panel that Fusion also lists on another: the analyses (sketch
+/// Commands registered on one panel that another panel also lists: the analyses (sketch
 /// INSPECT) on SOLID INSPECT, and Interference (SOLID INSPECT) on sketch INSPECT.
 const ALSO_IN: &[(&str, &str, &str)] = &[
     ("SOLID", "INSPECT", "inspect.zebra"),
@@ -84,6 +84,45 @@ fn analysis(app: &mut SolveApp, cmd: &str, p: Value) {
     }
 }
 
+/// A seam from an `inspect.continuity` reply as a marker label: its class and the measure that
+/// decided it (the gap, the angle between the faces' normals, or the curvature jump).
+fn continuity_label(app: &SolveApp, seam: &Value) -> String {
+    let deg = |key: &str| seam[key]["value"].as_f64().map(|x| format!("{x:.3}\u{b0}")).unwrap_or_default();
+    let jump = seam["curvature_jump_per_mm"]["value"].as_f64().map(|k| format!("\u{394}k {k:.4}/mm")).unwrap_or_default();
+    match seam["verdict"].as_str().unwrap_or_default() {
+        "gap" => format!("Gap {}", seam["gap_mm"]["value"].as_f64().map(|g| crate::prefs::show_mm(app, g, 1)).unwrap_or_default()),
+        "sharp" => format!("G0 {}", deg("normal_angle_deg")),
+        "curvature_jump" => format!("G1 {} {jump}", deg("normal_angle_deg")),
+        "smooth" => format!("G2 {} {jump}", deg("normal_angle_deg")),
+        other => other.to_string(),
+    }
+}
+
+/// The Continuity Analysis legend in the viewport's lower left corner: each class in its
+/// colour, while seams are shaded.
+fn continuity_legend(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
+    if app.session.continuity.is_empty() {
+        return;
+    }
+    let tk = crate::theme::Tokens::get();
+    let [smooth, jump, sharp, gap] = tk.continuity;
+    // Stable ids: this Gap is a hole between faces, not the sheet-metal gap (`ui.sheet_gap`).
+    let tr = crate::i18n::tr;
+    let rows = [(tr("ui.continuity_g2"), smooth), (tr("ui.continuity_g1"), jump), (tr("ui.continuity_g0"), sharp), (tr("ui.continuity_gap"), gap)];
+    let font = egui::FontId::proportional(12.0);
+    let (row, pad, swatch) = (18.0, 8.0, 22.0);
+    let text_width = rows.iter().map(|(label, _)| painter.layout_no_wrap(label.to_string(), font.clone(), tk.text).size().x).fold(0.0, f32::max);
+    let size = egui::vec2(pad + swatch + 8.0 + text_width + pad, rows.len() as f32 * row + 2.0 * pad);
+    let frame = egui::Rect::from_min_size(proj.rect.left_bottom() + egui::vec2(16.0, -(size.y + 16.0)), size);
+    painter.rect_filled(frame, 4.0, tk.panel.gamma_multiply(0.9));
+    crate::scenario::publish_rect("continuity_legend", frame);
+    for (i, (label, col)) in rows.iter().enumerate() {
+        let y = frame.top() + pad + row * (i as f32 + 0.5);
+        painter.line_segment([egui::pos2(frame.left() + pad, y), egui::pos2(frame.left() + pad + swatch, y)], Stroke::new(3.0, *col));
+        painter.text(egui::pos2(frame.left() + pad + swatch + 8.0, y), egui::Align2::LEFT_CENTER, *label, font.clone(), tk.text);
+    }
+}
+
 /// Isocurve analysis lines.
 fn iso_lines(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     if app.tool.as_ref().map(|t| t.cmd) != Some("inspect.isocurve") {
@@ -104,7 +143,7 @@ fn iso_lines(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
 
 /// Analysis markers: a target with its label.
 fn marks(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
-    if !app.tool.as_ref().is_some_and(|t| matches!(t.cmd, "inspect.minimum_radius" | "inspect.center_of_mass")) {
+    if !app.tool.as_ref().is_some_and(|t| matches!(t.cmd, "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.continuity")) {
         MARKS.with(|m| m.borrow_mut().clear());
         return;
     }
@@ -149,6 +188,25 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
         }
         return false;
     }
+    if id == "inspect.continuity" {
+        // Every edge of the shown bodies at once; the tool stays for clicking single edges. With
+        // seams shaded, the button turns the analysis off.
+        MARKS.with(|m| m.borrow_mut().clear());
+        if !app.session.continuity.is_empty() {
+            if app.run(id, json!({"clear": true})).is_ok() {
+                app.set_status("Analysis off", false);
+            }
+            return false;
+        }
+        let Ok(v) = app.run(id, json!({})) else { return false };
+        let summary = &v["summary"];
+        let counts: Vec<String> = [("smooth", "G2"), ("curvature_jump", "G1"), ("sharp", "G0"), ("gap", "gap")]
+            .iter()
+            .filter_map(|(key, class)| summary[*key].as_u64().filter(|n| *n > 0).map(|n| format!("{n} {class}")))
+            .collect();
+        app.set_status(format!("Continuity: {} (click the button again to turn it off)", counts.join(", ")), false);
+        return true;
+    }
     if id == "inspect.center_of_mass" {
         // The whole model at once; the tool stays for picking single bodies.
         MARKS.with(|m| m.borrow_mut().clear());
@@ -165,10 +223,15 @@ pub fn start_hook(app: &mut SolveApp, id: &str) -> bool {
     if !matches!(id, "canvas.insert" | "canvas.decal") {
         return true;
     }
-    let path = app.services.pick_open.as_ref().and_then(|f| f());
-    let ok = path.is_some();
-    IMAGE.with(|i| *i.borrow_mut() = path);
-    ok
+    let command = id.to_string();
+    app.pick_open(move |app, path| {
+        if let Some(path) = path {
+            IMAGE.with(|i| *i.borrow_mut() = Some(path));
+            app.last_command = solidcraft_engine::find_command(&command).map(|spec| (spec.id.into(), spec.label.into()));
+            app.tool = crate::tools::Tool::for_command(&command);
+        }
+    });
+    false
 }
 
 fn v3(v: &Value) -> Option<Vec3> {
@@ -195,7 +258,7 @@ fn combs(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     });
 }
 
-/// Snap a cursor point on the sketch plane to what Fusion infers while drawing: a line's
+/// Snap a cursor point on the sketch plane to what is inferred while drawing: a line's
 /// midpoint, or alignment (horizontal/vertical) with the previous point of the tool. None:
 /// nothing near, use the grid.
 pub fn refine_snap(
@@ -341,11 +404,21 @@ enum Mode {
     Steps,
 }
 
+/// Whether a click with tool `id` acts on `hit`: what is under the pointer lights up only when
+/// the tool takes it, so the hover shows what a click does and lights nothing over a view the
+/// tool draws (Continuity Analysis's seam colours on a face the tool ignores).
+pub fn takes(id: &str, hit: &Hit) -> bool {
+    match id {
+        "inspect.continuity" => matches!(hit, Hit::Edge { .. }),
+        _ => true,
+    }
+}
+
 fn mode(id: &str) -> Option<Mode> {
     Some(match id {
         "sketch.project" | "sketch.intersect" | "sketch.include_3d" | "sketch.fit_curves_to_section" | "sketch.isoparametric_curve" => Mode::ModelRef,
         "inspect.curvature_comb" | "canvas.insert" | "canvas.decal" => Mode::ModelRef,
-        "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.isocurve" => Mode::ModelRef,
+        "inspect.minimum_radius" | "inspect.center_of_mass" | "inspect.isocurve" | "inspect.continuity" => Mode::ModelRef,
         "sketch.trim" | "sketch.extend" | "sketch.break" => Mode::CurveAt,
         "sketch.line.midpoint" => Mode::Points(2),
         "sketch.arc.tangent" => Mode::Points(2),
@@ -393,6 +466,7 @@ pub fn hint(id: &str) -> Option<String> {
             "inspect.minimum_radius" => "Minimum radius: click sketch curves, edges or faces",
             "inspect.center_of_mass" => "Center of mass of all bodies; click a body for its own",
             "inspect.isocurve" => "Isocurves: click faces",
+            "inspect.continuity" => "Continuity: click an edge for its numbers (the button again turns the colours off)",
             "canvas.insert" => "Canvas: click a plane or a planar face where the image's centre goes",
             "canvas.decal" => "Decal: click a planar face where the image's centre goes",
             "sketch.trim" => "Trim: click the piece of a curve to remove",
@@ -455,17 +529,18 @@ fn sketch_entity(app: &SolveApp, hits: &[Hit]) -> Option<(String, bool)> {
 }
 
 /// The two editable curves that meet at sketch point `pi`, in curve order, which is the order
-/// the corner commands resolve them in from a `point` parameter. None unless exactly two meet
-/// there and each is one the command can work on: a line always, an arc only for a fillet.
+/// the corner commands resolve them in from a `point` parameter. Construction curves are
+/// ignored when more than two meet. Each side must be a line, or an arc for a fillet.
 pub(crate) fn corner_curves(sk: &solidcraft_engine::sketch::Sketch, pi: usize, arcs_ok: bool) -> Option<(usize, usize)> {
     use solidcraft_engine::sketch::CurveKind;
-    let curves: Vec<_> = sk
-        .curves
-        .iter()
-        .enumerate()
-        .filter(|(ci, c)| !sk.is_linked_curve(*ci) && c.kind.ends().is_some_and(|(a, b)| a == pi || b == pi))
-        .take(3)
-        .collect();
+    let candidates =
+        sk.curves.iter().enumerate().filter(|(ci, c)| !sk.is_linked_curve(*ci) && c.kind.ends().is_some_and(|(a, b)| a == pi || b == pi));
+    let mut curves: Vec<_> = candidates.clone().take(3).collect();
+    // Center rectangles have construction diagonals at their corners. Match the engine's
+    // corner selection: when more than two curves meet, use the profile sides.
+    if curves.len() > 2 {
+        curves = candidates.filter(|(_, c)| !c.construction).take(3).collect();
+    }
     if curves.iter().any(|(_, c)| !matches!(c.kind, CurveKind::Line { .. }) && !(arcs_ok && matches!(c.kind, CurveKind::Arc { .. }))) {
         return None;
     }
@@ -588,6 +663,17 @@ pub fn on_click(app: &mut SolveApp, tool: &mut Tool, proj: &Proj, pos: Pos2) {
                     let teeth: Vec<[Vec3; 2]> = pts.windows(2).map(|w| [w[0], w[1]]).collect();
                     ISO.with(|i| i.borrow_mut().push(teeth));
                 }
+            }
+        }
+        Mode::ModelRef if cmd == "inspect.continuity" => {
+            // The edge measured again, added to the seams shown, and its numbers pinned there.
+            let edge = hits.iter().filter(|h| takes(cmd, h)).find_map(|h| if let Hit::Edge { mid, .. } = h { Some(*mid) } else { None });
+            if let Some(mid) = edge
+                && let Ok(v) = app.run(cmd, json!({"edges": [[mid.x, mid.y, mid.z]], "add": true}))
+                && let Some(seam) = v["bodies"][0]["edges"].get(0)
+            {
+                let label = continuity_label(app, seam);
+                MARKS.with(|m| m.borrow_mut().push((mid, label)));
             }
         }
         Mode::ModelRef if matches!(cmd, "inspect.minimum_radius" | "inspect.center_of_mass") => {
@@ -930,6 +1016,13 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
         if c.kind.is_dimension() {
             continue;
         }
+        if matches!(
+            c.kind,
+            solidcraft_engine::sketch::ConstraintKind::PatternPoint { .. } | solidcraft_engine::sketch::ConstraintKind::PatternRadius { .. }
+        ) && !ss.sketch.patterns.iter().any(|p| p.instances.first().and_then(|i| i.constraints.first()) == Some(&c.id))
+        {
+            continue;
+        }
         for (at, dir) in glyph_anchors(&ss.sketch, &c.kind) {
             let Some(base) = proj.to_screen(ss.plane.to_world(at)) else { continue };
             // The entity's direction on screen, and its side.
@@ -1001,7 +1094,14 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
         let r = egui::Rect::from_center_size(*sp, egui::vec2(GLYPH, GLYPH));
         painter.rect_filled(r, 3.0, if lit { tk.accent_soft } else { tk.glyph_bg });
         painter.rect_stroke(r, 3.0, Stroke::new(1.0, if failing || lit { col } else { tk.glyph_edge }), egui::StrokeKind::Inside);
-        match glyph_icon(c.kind.name()) {
+        let pattern_icon = ss.sketch.patterns.iter().find(|p| p.instances.first().and_then(|i| i.constraints.first()) == Some(id)).map(|p| {
+            if matches!(p.kind, solidcraft_engine::sketch::SketchPatternKind::Circular { .. }) {
+                "sketch_circ_pattern"
+            } else {
+                "sketch_rect_pattern"
+            }
+        });
+        match pattern_icon.or_else(|| glyph_icon(c.kind.name())) {
             Some(icon) => crate::icons::paint(painter, r.shrink(2.0), icon, col, tk.glyph_bg, col),
             None => {
                 painter.text(*sp, egui::Align2::CENTER_CENTER, glyph_letter(c.kind.name()), egui::FontId::proportional(10.5), col);
@@ -1030,6 +1130,10 @@ fn constraint_entities(k: &solidcraft_engine::sketch::ConstraintKind) -> (Vec<us
     use solidcraft_engine::sketch::ConstraintKind::*;
     match *k {
         Coincident { p, q } | HorizontalPoints { p, q } | VerticalPoints { p, q } => (vec![], vec![p, q]),
+        PatternPoint { p, q, center, directions, .. } => {
+            (directions.into_iter().flatten().map(|(l, _)| l).collect(), vec![p, q].into_iter().chain(center).collect())
+        }
+        PatternRadius { a, b } => (vec![a, b], vec![]),
         Fix { p } => (vec![], vec![p]),
         Midpoint { p, l } => (vec![l], vec![p]),
         PointOnCurve { p, c } => (vec![c], vec![p]),
@@ -1067,6 +1171,8 @@ fn glyph_anchors(sk: &solidcraft_engine::sketch::Sketch, k: &solidcraft_engine::
     let pt = |p: usize| sk.point(p).map(|q| (q, None));
     match *k {
         Coincident { p, .. } | Fix { p } | Midpoint { p, .. } | PointOnCurve { p, .. } => pt(p).into_iter().collect(),
+        PatternPoint { p, center, .. } => pt(center.unwrap_or(p)).into_iter().collect(),
+        PatternRadius { .. } => Vec::new(),
         HorizontalPoints { p, q } | VerticalPoints { p, q } | Symmetric { p, q, .. } => {
             sk.point(p).zip(sk.point(q)).map(|(a, b)| ((a + b) * 0.5, None)).into_iter().collect()
         }
@@ -1108,8 +1214,13 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
     }
     marks(app, painter, proj);
     iso_lines(app, painter, proj);
+    continuity_legend(app, painter, proj);
 }
 
 #[cfg(test)]
 #[path = "sketch_corner_ui_tests.rs"]
 mod corner_ui_tests;
+
+#[cfg(test)]
+#[path = "sketch_continuity_tests.rs"]
+mod continuity_tests;

@@ -78,7 +78,13 @@ mod tests {
             (vec!["bad\nname".into()], 0, crate::IDENTITY),
             (vec!["Block".into()], 0, scaled),
         ] {
-            assert!(doc.add_feature(crate::FeatureKind::BodyTransfer { bodies, from, to: 0, transform }, None).is_err());
+            assert!(
+                doc.add_feature(
+                    crate::FeatureKind::BodyTransfer { bodies: bodies.into_iter().map(crate::BodyName).collect(), from, to: 0, transform },
+                    None
+                )
+                .is_err()
+            );
             assert_eq!(doc.to_json(), before);
         }
     }

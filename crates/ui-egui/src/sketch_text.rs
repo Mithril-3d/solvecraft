@@ -23,6 +23,8 @@ const KINDS: [ValueKind; FIELDS] =
 const FIELDS: usize = 6;
 /// The field shown in degrees, and the one without a unit.
 const ANGLE: usize = 3;
+/// The fields before this one (X, Y, Height, Angle) can hold an expression of parameters.
+const ANGLE_END: usize = 4;
 const LINE_SPACING: usize = 5;
 
 /// No input is active: a click on the canvas picks no path until the Path chip is clicked.
@@ -43,6 +45,9 @@ pub struct Tx {
     initial: [String; FIELDS],
     /// The saved source: x, y, height (mm), angle (rad), letter spacing (mm) and line spacing.
     original: [f64; FIELDS],
+    /// The expressions saved behind x, y, height and angle (a field shows its expression, and
+    /// keeps it while untouched).
+    exprs: [Option<String>; FIELDS],
     /// Bold, italic, alignment, the path (the Path input's curve) and its direction as chosen.
     pub(crate) style: TextStyle,
     initial_style: TextStyle,
@@ -64,8 +69,9 @@ pub struct Tx {
     shown: Option<Source>,
 }
 
-/// A text source as the dialog sees it: text, font (empty: built-in), its values and its style.
-type Source = (String, String, [f64; FIELDS], TextStyle);
+/// A text source as the dialog sees it: text, font (empty: built-in), its values, its style and
+/// the expressions behind its values.
+type Source = (String, String, [f64; FIELDS], TextStyle, [Option<String>; FIELDS]);
 
 /// What the Text tool puts down, ready to be typed over.
 const PLACEHOLDER: &str = "Text";
@@ -177,6 +183,13 @@ pub(crate) fn selected_entity(app: &SolveApp) -> Option<String> {
     selected
 }
 
+/// The link of the one text the selection belongs to (see [`selected_entity`]).
+pub(crate) fn selected_link(app: &SolveApp) -> Option<String> {
+    let entity = selected_entity(app)?;
+    let sk = app.session.doc.sketch(app.session.active_sketch?).ok()?;
+    sk.curves.iter().find(|curve| curve.id == entity)?.link.clone()
+}
+
 /// Show every outline affected by the open editor without changing feature selections.
 pub(crate) fn highlighted(app: &SolveApp) -> Vec<Sel> {
     let Some(Kind::Text(tx)) = app.dialog.as_ref().map(|dialog| &dialog.kind) else { return Vec::new() };
@@ -200,13 +213,18 @@ fn source(app: &SolveApp, sketch: u64, link: &str) -> Option<Source> {
     }
     let sk = app.session.doc.sketch(sketch).ok()?;
     let source = sk.link(link).filter(|source| source.kind == LinkKind::Text)?;
-    let LinkSource::Text { text, at, height, angle, font, style } = &source.source else { return None };
+    let LinkSource::Text { text, at, height, angle, font, style, exprs } = &source.source else { return None };
     let values = [at.x, at.y, *height, *angle, style.letter_spacing, style.line_spacing];
-    Some((text.clone(), font.clone().unwrap_or_default(), values, style.clone()))
+    let exprs = [exprs.x.clone(), exprs.y.clone(), exprs.height.clone(), exprs.angle.clone(), None, None];
+    Some((text.clone(), font.clone().unwrap_or_default(), values, style.clone(), exprs))
 }
 
-fn fields(original: &[f64; FIELDS], unit: &'static str, scale: f64) -> [String; FIELDS] {
+/// The fields as shown: a value, or the expression behind it.
+fn fields(original: &[f64; FIELDS], exprs: &[Option<String>; FIELDS], unit: &'static str, scale: f64) -> [String; FIELDS] {
     std::array::from_fn(|i| {
+        if let Some(Some(e)) = exprs.get(i) {
+            return e.clone();
+        }
         let value = original.get(i).copied().unwrap_or_default();
         match i {
             ANGLE => shown(value.to_degrees(), "deg"),
@@ -252,9 +270,9 @@ fn kind_for(app: &SolveApp, entity: &str) -> Option<Kind> {
     let sketch = app.session.active_sketch?;
     let sk = app.session.doc.sketch(sketch).ok()?;
     let link = sk.curves.iter().find(|curve| curve.id == entity).and_then(|curve| curve.link.clone())?;
-    let (text, font, original, style) = source(app, sketch, &link)?;
+    let (text, font, original, style, exprs) = source(app, sketch, &link)?;
     let (scale, unit) = crate::prefs::unit_scale(&app.session.doc.units);
-    let values = fields(&original, unit, scale);
+    let values = fields(&original, &exprs, unit, scale);
     let mut tx = Tx {
         sketch,
         link,
@@ -265,6 +283,7 @@ fn kind_for(app: &SolveApp, entity: &str) -> Option<Kind> {
         initial: values.clone(),
         values,
         original,
+        exprs,
         unit,
         initial_style: style.clone(),
         style,
@@ -388,16 +407,16 @@ pub(crate) fn refresh(app: &SolveApp, k: &mut Tx) -> bool {
     if k.shown.as_ref() == Some(&current) {
         return true;
     }
-    let (text, font, original, style) = current;
+    let (text, font, original, style, exprs) = current;
     if style != k.initial_style {
         if k.style == k.initial_style {
             k.style = style.clone();
         }
         k.initial_style = style;
     }
-    if original != k.original {
+    if original != k.original || exprs != k.exprs {
         let (scale, unit) = crate::prefs::unit_scale(&app.session.doc.units);
-        let fresh = fields(&original, unit, scale);
+        let fresh = fields(&original, &exprs, unit, scale);
         for ((value, initial), new) in k.values.iter_mut().zip(k.initial.iter_mut()).zip(fresh) {
             if value == initial {
                 *value = new.clone();
@@ -405,6 +424,7 @@ pub(crate) fn refresh(app: &SolveApp, k: &mut Tx) -> bool {
             *initial = new;
         }
         k.original = original;
+        k.exprs = exprs;
         k.unit = unit;
     }
     if text != k.initial_text {
@@ -497,7 +517,7 @@ fn path_row(ui: &mut egui::Ui, k: &mut Tx, inputs: &mut [SelInput], active: &mut
         };
         let stroke = if k.picking { egui::Stroke::new(1.5, t.accent) } else { egui::Stroke::new(1.0, t.dialog_border.gamma_multiply(1.6)) };
         let chip = egui::Button::new(text).fill(if on { t.chip } else { egui::Color32::TRANSPARENT }).stroke(stroke).min_size(egui::vec2(0.0, 22.0));
-        let chip = ui.add(chip).on_hover_text(crate::i18n::tr("sketch_text.path_hint"));
+        let chip = crate::frame::add_outlined(ui, chip, stroke.width).on_hover_text(crate::i18n::tr("sketch_text.path_hint"));
         crate::scenario::publish_handle("dialog:Path", chip.rect.center());
         if chip.clicked() {
             k.picking = true;
@@ -525,7 +545,7 @@ fn path_row(ui: &mut egui::Ui, k: &mut Tx, inputs: &mut [SelInput], active: &mut
 }
 
 /// The installed font families, listed once in the background (none on the web).
-fn families(ctx: &egui::Context) -> Option<Arc<Vec<String>>> {
+pub(crate) fn families(ctx: &egui::Context) -> Option<Arc<Vec<String>>> {
     static FAMILIES: OnceLock<Arc<Vec<String>>> = OnceLock::new();
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if let Some(list) = FAMILIES.get() {
@@ -631,41 +651,53 @@ pub(crate) fn commands(app: &SolveApp, k: &Tx) -> Result<Vec<(String, Value)>, S
     Ok(vec![("sketch.edit_text".into(), edit_params(app, k)?)])
 }
 
-/// `sketch.edit_text`'s parameters for the fields as they are.
+/// `sketch.edit_text`'s parameters for the fields as they are. X, Y, Height and Angle go as
+/// numbers, or as their expressions when these name parameters (the text then follows them): an
+/// untouched field that holds one keeps it.
 fn edit_params(app: &SolveApp, k: &Tx) -> Result<Value, String> {
     let doc = &app.session.doc;
     let mut out = [0.0; FIELDS];
+    let mut sent: [Value; FIELDS] = std::array::from_fn(|_| Value::Null);
     for (i, slot) in out.iter_mut().enumerate() {
         let (Some(value), Some(initial), Some(original), Some(kind), Some(label)) =
             (k.values.get(i), k.initial.get(i), k.original.get(i), KINDS.get(i), LABELS.get(i))
         else {
             return Err("missing value".into());
         };
+        let given = k.exprs.get(i).and_then(Option::as_ref).filter(|_| value == initial);
         *slot = if value == initial {
             *original
         } else {
-            let v = doc.eval(&doc.with_design_unit(value.trim(), *kind), *kind).map_err(|e| format!("{label}: {e}"))?;
+            let typed = doc.with_design_unit(value.trim(), *kind);
+            let v = doc.eval(&typed, *kind).map_err(|e| format!("{label}: {e}"))?;
             if !v.is_finite() {
                 return Err(format!("{label}: not a finite number"));
             }
             v
         };
+        let names_parameters = i < ANGLE_END && !solidcraft_engine::doc::expr::references(value).is_empty();
+        sent[i] = match given {
+            Some(e) => json!(e),
+            None if value != initial && names_parameters => json!(value.trim()),
+            None => json!(if i == ANGLE { slot.to_degrees() } else { *slot }),
+        };
     }
-    let [x, y, height, angle, letter_spacing, line_spacing] = out;
+    let [_, _, _, _, letter_spacing, line_spacing] = out;
+    let [sent_x, sent_y, sent_height, sent_angle, ..] = sent;
     let align = match k.style.align {
         TextAlign::Left => "left",
         TextAlign::Center => "center",
         TextAlign::Right => "right",
     };
     let mut params = json!({
-        "link": k.link, "text": k.text, "at": [x, y], "height": height,
+        "link": k.link, "text": k.text, "at": [sent_x, sent_y], "height": sent_height,
         "bold": k.style.bold, "italic": k.style.italic, "align": align,
         "letter_spacing": letter_spacing, "line_spacing": line_spacing,
         "path": k.style.path.clone().unwrap_or_default(), "reverse": k.style.reverse,
     });
-    // Omitting an unchanged angle keeps its exact saved radians.
-    if k.values.get(3) != k.initial.get(3) {
-        params["angle"] = json!(angle.to_degrees());
+    // Omitting an unchanged angle keeps its exact saved radians (or its expression).
+    if k.values.get(ANGLE) != k.initial.get(ANGLE) {
+        params["angle"] = sent_angle;
     }
     // An untouched font stays as saved; an emptied one is the built-in font.
     if k.font.trim() != k.initial_font.trim() {
@@ -725,6 +757,45 @@ mod tests {
         }
         h.step(&json!({"widget":"Cancel"})).unwrap();
         assert!(highlighted(&h.app).is_empty());
+    }
+
+    /// Explode Text (#1842): the text's outlines stay where they are as ordinary sketch curves,
+    /// the text itself goes, and one undo brings it back.
+    #[test]
+    fn explode_text_leaves_its_outlines_as_normal_curves() {
+        let (mut h, link, _) = setup();
+        h.app.run("sketch.edit_text", json!({"link":link,"text":"TO"})).unwrap();
+        let sid = h.app.session.active_sketch.unwrap();
+        let outline = |h: &Harness| {
+            let sk = h.app.session.doc.sketch(sid).unwrap();
+            let mut ids: Vec<(String, Option<String>)> = sk.curves.iter().map(|c| (c.id.clone(), c.link.clone())).collect();
+            ids.sort();
+            ids
+        };
+        let before = outline(&h);
+        assert!(before.len() > 4 && before.iter().all(|(_, l)| l.as_deref() == Some(link.as_str())));
+        let profiles = h.app.session.world_state().sketch(sid).unwrap().profiles.len();
+        h.app.session.selection = vec![Sel::SketchCurve { id: before[0].0.clone() }];
+        let undo = h.app.session.undo.len();
+        let item = crate::context_menu::items(&h.app, &crate::context_menu::Target::Viewport)
+            .into_iter()
+            .find(|item| item.label == "Explode Text")
+            .expect("Explode Text is offered for a selected text");
+        assert!(item.enabled);
+        crate::context_menu::run_item(&mut h.app, &item, egui::Pos2::ZERO);
+        h.frames(2);
+        let after = outline(&h);
+        assert_eq!(after.iter().map(|c| &c.0).collect::<Vec<_>>(), before.iter().map(|c| &c.0).collect::<Vec<_>>(), "every outline stays");
+        assert!(after.iter().all(|(_, l)| l.is_none()), "no outline belongs to the text");
+        let sk = h.app.session.doc.sketch(sid).unwrap();
+        assert!(sk.link(&link).is_none(), "the text is gone");
+        assert_eq!(h.app.session.world_state().sketch(sid).unwrap().profiles.len(), profiles, "the letters still make the same profiles");
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        // No longer text: nothing to edit or explode.
+        assert!(selected_entity(&h.app).is_none());
+        assert!(!crate::context_menu::items(&h.app, &crate::context_menu::Target::Viewport).iter().any(|item| item.label == "Explode Text"));
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(outline(&h), before, "undo brings the text back");
     }
 
     #[test]
@@ -812,6 +883,7 @@ mod tests {
             angle: std::f64::consts::FRAC_PI_2,
             font: None,
             style: TextStyle::default(),
+            exprs: Default::default(),
         };
         assert_eq!(sk.link(&link).unwrap().source, expected);
         assert!(!h.app.session.world_state().sketch(sid).unwrap().profiles.is_empty());
@@ -839,7 +911,7 @@ mod tests {
         let LinkSource::Text { at, height, angle, .. } = original else { panic!("text source") };
         assert_eq!(
             h.app.session.doc.sketch(sid).unwrap().link(&link).unwrap().source,
-            LinkSource::Text { text: "O".into(), at, height, angle, font: None, style: TextStyle::default() }
+            LinkSource::Text { text: "O".into(), at, height, angle, font: None, style: TextStyle::default(), exprs: Default::default() }
         );
         h.app.session.selection = vec![Sel::SketchCurve { id: h.app.session.doc.sketch(sid).unwrap().curves[0].id.clone() }];
         h.app.start("sketch.edit_text");
@@ -1018,6 +1090,89 @@ mod tests {
         let sid = h.app.session.active_sketch.unwrap();
         let sk = h.app.session.doc.sketch(sid).unwrap();
         assert!(sk.links.iter().any(|l| matches!(&l.source, LinkSource::Text { text, .. } if text == "Pending text")));
+    }
+
+    /// Selects the text `link` again (an edit makes its outlines anew).
+    fn select_text(h: &mut Harness, link: &str) {
+        let sid = h.app.session.active_sketch.unwrap();
+        let sk = h.app.session.doc.sketch(sid).unwrap();
+        let id = sk.curves[sk.link_curves(link)[0]].id.clone();
+        h.app.session.selection = vec![Sel::SketchCurve { id }];
+        h.frames(3);
+    }
+
+    fn exprs_of(h: &Harness, link: &str) -> solidcraft_engine::sketch::TextExprs {
+        let sid = h.app.session.active_sketch.unwrap();
+        let LinkSource::Text { exprs, .. } = h.app.session.doc.sketch(sid).unwrap().link(link).unwrap().source.clone() else { panic!("text source") };
+        exprs
+    }
+
+    #[test]
+    fn a_field_that_names_parameters_stays_an_expression_and_is_shown_as_typed() {
+        let (mut h, link, _) = setup();
+        h.app.run("parameters.add", json!({"name":"tall","expression":"20 mm"})).unwrap();
+        h.app.run("parameters.add", json!({"name":"turn","expression":"90 deg"})).unwrap();
+        h.app.start("sketch.edit_text");
+        h.frames(3);
+        replace(&mut h, "dialog:X", "tall + 5 mm");
+        replace(&mut h, "dialog:Height", "tall / 2");
+        replace(&mut h, "dialog:Angle", "turn");
+        ok(&mut h);
+        assert!(!editing(&h.app), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+        let sid = h.app.session.active_sketch.unwrap();
+        let LinkSource::Text { at, height, angle, exprs, .. } = h.app.session.doc.sketch(sid).unwrap().link(&link).unwrap().source.clone() else {
+            panic!("text source")
+        };
+        assert_eq!(
+            (exprs.x.as_deref(), exprs.y.as_deref(), exprs.height.as_deref(), exprs.angle.as_deref()),
+            (Some("tall + 5 mm"), None, Some("tall / 2"), Some("turn"))
+        );
+        assert!((at.x - 25.0).abs() < 1e-9 && (height - 10.0).abs() < 1e-9 && (angle - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+
+        // Opened again, the fields show the expressions; a number typed in one of the others
+        // leaves them alone.
+        select_text(&mut h, &link);
+        h.app.start("sketch.edit_text");
+        h.frames(3);
+        assert_eq!(tx(&h.app).values[0], "tall + 5 mm");
+        assert_eq!((tx(&h.app).values[2].as_str(), tx(&h.app).values[3].as_str()), ("tall / 2", "turn"));
+        replace(&mut h, "dialog:Y", "7");
+        ok(&mut h);
+        let exprs = exprs_of(&h, &link);
+        assert_eq!(
+            (exprs.x.as_deref(), exprs.y.as_deref(), exprs.height.as_deref(), exprs.angle.as_deref()),
+            (Some("tall + 5 mm"), None, Some("tall / 2"), Some("turn"))
+        );
+
+        // A parameter changes while the saved numbers are not yet worked out again: OK on an
+        // untouched dialog keeps the expressions, and the numbers follow the parameter.
+        h.app.run("parameters.change", json!({"name":"tall","expression":"40 mm"})).unwrap();
+        select_text(&mut h, &link);
+        h.app.start("sketch.edit_text");
+        h.frames(3);
+        ok(&mut h);
+        let LinkSource::Text { at, height, exprs, .. } = h.app.session.doc.sketch(sid).unwrap().link(&link).unwrap().source.clone() else {
+            panic!("text source")
+        };
+        assert_eq!((exprs.x.as_deref(), exprs.height.as_deref()), (Some("tall + 5 mm"), Some("tall / 2")));
+        assert!((at.x - 45.0).abs() < 1e-9 && (at.y - 7.0).abs() < 1e-9 && (height - 20.0).abs() < 1e-9, "{at:?} {height}");
+
+        // A number typed over an expression replaces it.
+        select_text(&mut h, &link);
+        h.app.start("sketch.edit_text");
+        h.frames(3);
+        replace(&mut h, "dialog:Height", "6");
+        ok(&mut h);
+        let exprs = exprs_of(&h, &link);
+        assert_eq!((exprs.height, exprs.x.as_deref()), (None, Some("tall + 5 mm")));
+        // A name that is no parameter is an error in the dialog; nothing changes.
+        select_text(&mut h, &link);
+        h.app.start("sketch.edit_text");
+        h.frames(3);
+        replace(&mut h, "dialog:Height", "nope * 2");
+        h.frames(2);
+        ok(&mut h);
+        assert!(editing(&h.app), "the dialog stays open on a field that cannot be used");
     }
 
     #[test]

@@ -1,0 +1,13 @@
+[
+  {"note":"#226: a cap created before a wall touches only the edge of the wall's outward extrusion. Picking the wall face in Extrude must extend Wall and preserve Cap as a separate body."},
+  {"call":"engine.execute","params":{"command":"solid.box","params":{"corner":[0,0,20],"length":40,"width":30,"height":5,"body_name":"Cap"}}},
+  {"call":"engine.execute","params":{"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Wall"}}},
+  {"call":"ui.camera","params":{"target":[20,15,12.5],"yaw":-0.785398,"pitch":0.61548,"distance":110}},
+  {"start":"solid.extrude"},
+  {"click":{"world":[40,15,10]}},
+  {"text":"10"},
+  {"key":"Enter"},
+  {"expect":{"dialog":null,"bodies":2,"errors":0,"body_volume":{"body":"Wall","volume":30000},"bbox":{"body":"Wall","min":[0,0,0],"max":[50,30,20]}}},
+  {"expect":{"body_volume":{"body":"Cap","volume":6000},"bbox":{"body":"Cap","min":[0,0,20],"max":[40,30,25]}}},
+  {"shot":"face_join_keeps_cap"}
+]

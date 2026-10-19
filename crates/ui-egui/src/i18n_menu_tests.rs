@@ -49,17 +49,18 @@ fn take(app: &SolveApp, out: &mut BTreeSet<String>) {
     }
     for id in &features {
         take_items(out, &context_menu::items(app, &Target::Sketch { id: *id }));
+        take_items(out, &context_menu::items(app, &Target::Plane { id: *id }));
     }
     for id in &components {
         take_items(out, &context_menu::items(app, &Target::Component { id: *id }));
         for folder in ["bodies", "sketches", "construction"] {
-            take_items(out, &context_menu::items(app, &Target::Folder { component: *id, folder: folder.to_string() }));
-            take_items(out, &browser::folder_items(app, *id, folder));
+            take_items(out, &context_menu::items(app, &Target::Folder { component: *id, folder: folder.to_string(), scope: "c0".into() }));
+            take_items(out, &browser::folder_items(app, *id, folder, "c0"));
         }
     }
     for id in &groups {
-        take_items(out, &context_menu::items(app, &Target::Group { id: *id }));
-        take_items(out, &browser::group_items(app, *id));
+        take_items(out, &context_menu::items(app, &Target::Group { id: *id, scope: "c0".into() }));
+        take_items(out, &browser::group_items(app, *id, "c0"));
     }
     for spec in solidcraft_engine::command_specs().iter() {
         let target = Target::ToolbarCommand { id: spec.id.to_string() };

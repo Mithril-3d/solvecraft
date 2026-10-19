@@ -18,9 +18,9 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("decal")
         .params("path | data; face: [x,y,z] on a planar face (the image is centred there); width?: mm; angle?: deg; opacity?: (default 1)"),
     CommandSpec::new("canvas.edit", "Edit Canvas", edit_canvas).at("SKETCH", "INSERT").icon("canvas").params("canvas: id or name; center?, width?, angle?: deg, opacity?, flip?, visible?, name?"),
-    CommandSpec::new("canvas.calibrate", "Calibrate Canvas", calibrate)
+    CommandSpec::new("canvas.calibrate", "Calibrate Canvas", calibrate).icon("measure")
         .params("canvas: id or name; a, b: two points on the canvas plane [x,y]; distance: their true distance (mm): scales the image about a"),
-    CommandSpec::new("canvas.delete", "Delete Canvas", delete_canvas).params("canvas: id or name"),
+    CommandSpec::new("canvas.delete", "Delete Canvas", delete_canvas).icon("delete").params("canvas: id or name"),
 ];
 
 fn image_bytes(p: &Value, cmd: &str) -> Result<Vec<u8>> {
@@ -56,7 +56,7 @@ fn make(s: &mut Session, p: &Value, cmd: &str, decal: bool) -> Result<Value> {
     // It belongs to the active component (its plane is in that frame) and moves with it.
     let component = s.active_component;
     let doc = s.doc_mut();
-    let id = doc.canvases.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+    let id = super::next_free_id(cmd, doc.canvases.iter().map(|c| c.id))?;
     let base = if decal { "Decal" } else { "Canvas" };
     let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("{base}{id}"));
     doc.canvases.push(Canvas {

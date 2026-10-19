@@ -44,12 +44,13 @@ pub fn fillet_radii(body: &Body, edges: &[(Vec3, f64)]) -> Result<Body> {
             Ok(b) => return Ok(crate::record::after(b, &cur, &counts)),
             Err(e) => e,
         };
-        let rounds = rounds_at(&cur, &sel);
+        let rounds = guard("recognise earlier rounds", || rounds_at(&cur, &sel))?;
         if rounds.is_empty() {
             return Err(first.unwrap_or(err));
         }
         first.get_or_insert(err);
         let idx: Vec<usize> = rounds.iter().map(|r| r.0).collect();
+        sel = guard("map picks across earlier rounds", || surviving_picks(&cur, &sel, &idx))?;
         cur = crate::record::after(crate::delete_faces(&cur, &idx)?, &cur, &counts);
         sel.extend(rounds.iter().map(|r| (r.1, r.2)));
     }
@@ -793,9 +794,35 @@ fn crease(a: &Sel, b: &Sel, q: Vec3, end: Vec3, size: f64) -> Result<mt::Curve> 
     crate::splitface::fit(&pts, size)
 }
 
-/// Faces at the filleted edges' ends that are rounds of a straight edge between planar faces:
+/// Keep selected sharp edges while consuming a selected mitre that is on the same smooth
+/// chain as one of them. After removing the rounds, that mitre no longer exists; using its
+/// old point would silently choose a different nearby edge, possibly with a different radius.
+fn surviving_picks(cur: &Body, sel: &[(Vec3, f64)], removed: &[usize]) -> Result<Vec<(Vec3, f64)>> {
+    let solid = &*cur.solid;
+    let edges = Body::unique_edges(solid);
+    let faces: Vec<_> = solid.face_iter().collect();
+    let mut selected = Vec::new();
+    for (p, r) in sel {
+        let (idx, _) = cur.nearest_edge(*p, (cur.size() * 2e-3).max(1e-3))?.ok_or_else(|| unsupported("no edge at a fillet pick"))?;
+        let e = edges.get(idx).ok_or_else(|| unsupported("no edge at a fillet pick"))?;
+        let count = removed.iter().filter_map(|i| faces.get(*i)).filter(|f| f.edge_iter().any(|x| x.id() == e.id())).count();
+        selected.push((e, *p, *r, count));
+    }
+    for (e, _, r, count) in &selected {
+        if *count == 0 {
+            continue;
+        }
+        let chain = crate::blend::smooth_chain(solid, e).unwrap_or_default();
+        if *count != 2 || !selected.iter().any(|(other, _, rr, n)| *n == 0 && (r - rr).abs() <= r * 1e-9 && chain.contains(&other.id())) {
+            return Err(unsupported("a selected earlier-round boundary cannot be mapped to a sharp edge"));
+        }
+    }
+    Ok(selected.into_iter().filter(|(_, _, _, n)| *n == 0).map(|(_, p, r, _)| (p, r)).collect())
+}
+
+/// Connected faces at the filleted edges' ends that are rounds of straight edges between planar faces:
 /// (face index, a point on the sharp edge it replaced, its radius).
-fn rounds_at(cur: &Body, sel: &[(Vec3, f64)]) -> Vec<(usize, Vec3, f64)> {
+fn rounds_at(cur: &Body, sel: &[(Vec3, f64)]) -> Result<Vec<(usize, Vec3, f64)>> {
     let size = cur.size();
     let tol = (size * 2e-3).max(1e-3);
     let solid = &*cur.solid;
@@ -810,16 +837,43 @@ fn rounds_at(cur: &Body, sel: &[(Vec3, f64)]) -> Vec<(usize, Vec3, f64)> {
         }
     }
     let faces: Vec<&mt::Face> = solid.face_iter().collect();
-    let mut out = Vec::new();
+    let mut neighbours: HashMap<mt::EdgeID, Vec<usize>> = HashMap::new();
     for (fi, f) in faces.iter().enumerate() {
-        if plane_normal(f).is_some() || !f.vertex_iter().any(|v| ends.iter().any(|p| p.dist(vtx(&v)) <= size * 1e-9)) {
+        for e in f.edge_iter() {
+            neighbours.entry(e.id()).or_default().push(fi);
+        }
+    }
+    let mut pending: Vec<usize> = faces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.vertex_iter().any(|v| ends.iter().any(|p| p.dist(vtx(&v)) <= size * 1e-9)))
+        .map(|(fi, _)| fi)
+        .collect();
+    let mut visited = HashSet::new();
+    let mut out = Vec::new();
+    while let Some(fi) = pending.pop() {
+        if !visited.insert(fi) {
+            continue;
+        }
+        let Some(f) = faces.get(fi) else { continue };
+        if plane_normal(f).is_some() {
             continue;
         }
         if let Some((p, r)) = round_of(&faces, f, size) {
+            if out.len() + sel.len() >= 1000 {
+                return Err(unsupported("too many connected earlier rounds to rebuild"));
+            }
             out.push((fi, p, r));
+            // Healing requires planar neighbours. Include the other recognised rounds
+            // sharing this one's mitres, rather than leaving a curved neighbour across
+            // the gap. A closed ring must be restored and reblended as a whole (#1557).
+            for e in f.edge_iter() {
+                pending.extend(neighbours.get(&e.id()).into_iter().flatten().copied().filter(|i| !visited.contains(i)));
+            }
         }
     }
-    out
+    out.sort_by_key(|r| r.0);
+    Ok(out)
 }
 
 /// A round between two planes: two parallel straight boundary edges on planar faces, the
@@ -1272,6 +1326,76 @@ mod tests {
         // Equal radii: the mitre, as the local blend makes it.
         let e = fillet(&ra, &[b], 2.0).unwrap();
         assert!((vol(&e) - strips(2.0, 2.0, 0.0)).abs() < 0.05);
+    }
+
+    #[test]
+    fn issue1557_vertical_after_bottom_rounds() {
+        let b = box_solid(Vec3::ZERO, Vec3::new(25.0, 25.0, 10.0)).unwrap();
+        let bottom = [Vec3::new(12.5, 0.0, 0.0), Vec3::new(25.0, 12.5, 0.0), Vec3::new(12.5, 25.0, 0.0), Vec3::new(0.0, 12.5, 0.0)];
+        let rounded = fillet(&b, &bottom, 2.0).unwrap();
+        let vertical = Vec3::new(25.0, 0.0, 6.0);
+        let seam = Vec3::new(24.287266336668306, 0.7127336633316916, 0.48266373325510686);
+        let mut together = bottom.to_vec();
+        together.push(vertical);
+        let reference = fillet(&b, &together, 2.0).unwrap();
+        for picks in [vec![vertical], vec![vertical, seam], vec![seam, vertical]] {
+            let result = fillet(&rounded, &picks, 2.0).unwrap();
+            assert_eq!(result.face_count(), reference.face_count());
+            assert_eq!(result.unmeshed_faces(), 0);
+            assert!(result.validity().is_empty(), "{:?}", result.validity());
+            assert!((vol(&result) - vol(&reference)).abs() < 0.05);
+            assert!(!result.contains(Vec3::new(24.9, 0.1, 5.0)));
+            assert!(result.contains(Vec3::new(24.0, 1.0, 5.0)));
+        }
+    }
+
+    #[test]
+    fn issue1557_connected_rounds_keep_their_radii() {
+        let b = box_solid(Vec3::ZERO, Vec3::new(25.0, 25.0, 10.0)).unwrap();
+        let bottom = [Vec3::new(12.5, 0.0, 0.0), Vec3::new(25.0, 12.5, 0.0), Vec3::new(12.5, 25.0, 0.0), Vec3::new(0.0, 12.5, 0.0)];
+        let rounded = fillet(&b, &bottom, 2.0).unwrap();
+        let vertical = Vec3::new(25.0, 0.0, 6.0);
+        let seam = Vec3::new(24.287266336668306, 0.7127336633316916, 0.48266373325510686);
+        for radius in [0.5, 1.0, 3.0] {
+            let mut together: Vec<_> = bottom.iter().map(|p| (*p, 2.0)).collect();
+            together.push((vertical, radius));
+            let reference = fillet_radii(&b, &together).unwrap();
+            let result = fillet(&rounded, &[seam, vertical], radius).unwrap();
+            assert!(result.validity().is_empty(), "{:?}", result.validity());
+            assert!((vol(&result) - vol(&reference)).abs() < 0.05, "radius {radius}");
+            // The old bottom radius is still 2, away from the newly rounded corner.
+            assert!(!result.contains(Vec3::new(12.5, 0.5, 0.5)));
+            assert!(result.contains(Vec3::new(12.5, 1.0, 1.0)));
+        }
+        // A tangent boundary of an earlier round is not a sharp edge, and cannot be
+        // reinterpreted as the sharp edge exposed when that round is taken off.
+        assert!(fillet(&rounded, &[Vec3::new(12.5, 0.0, 2.0)], 1.0).is_err());
+        // Consuming a mitre must not silently discard its independently requested radius,
+        // or turn a mitre-only selection into a different sharp edge.
+        assert!(fillet_radii(&rounded, &[(vertical, 1.0), (seam, 2.0)]).is_err());
+        assert!(fillet_radii(&rounded, &[(seam, 2.0)]).is_err());
+    }
+
+    #[test]
+    fn issue1557_all_vertical_corners_match_analytic_volume() {
+        let origin = Vec3::new(10.0, -5.0, 7.0);
+        let b = box_solid(origin, origin + Vec3::new(25.0, 25.0, 10.0)).unwrap();
+        let bottom =
+            [Vec3::new(12.5, 0.0, 0.0), Vec3::new(25.0, 12.5, 0.0), Vec3::new(12.5, 25.0, 0.0), Vec3::new(0.0, 12.5, 0.0)].map(|p| p + origin);
+        let vertical =
+            [Vec3::new(0.0, 0.0, 6.0), Vec3::new(25.0, 0.0, 6.0), Vec3::new(25.0, 25.0, 6.0), Vec3::new(0.0, 25.0, 6.0)].map(|p| p + origin);
+        let rounded = fillet(&b, &bottom, 2.0).unwrap();
+        let result = fillet(&rounded, &vertical, 2.0).unwrap();
+        assert!(result.validity().is_empty(), "{:?}", result.validity());
+        assert!(kink(&result) < 0.05);
+        // Integrate rounded-square horizontal sections. Above z=r the area is
+        // L²-(4-π)r²; below, a square of side L-2r plus a disk offset of radius
+        // sqrt(r²-(z-r)²). This includes the four spherical bottom corners.
+        let (l, h, r) = (25.0, 10.0, 2.0);
+        let pi = std::f64::consts::PI;
+        let a = l - 2.0 * r;
+        let expected = (h - r) * (l * l - (4.0 - pi) * r * r) + a * a * r + pi * a * r * r + 2.0 * pi * r * r * r / 3.0;
+        assert!((vol(&result) - expected).abs() < 0.1, "{} vs {expected}", vol(&result));
     }
 
     #[test]

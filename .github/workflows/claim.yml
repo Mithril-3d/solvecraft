@@ -1,0 +1,52 @@
+# `/claim` and `/unclaim` on issues (CONTRIBUTING.md, "Sending a change"), and a daily sweep that
+# frees claims nobody is working on. A pull request that references an issue (`<summary> (#N)`,
+# `Fixes #N`) claims it too. The logic is in scripts/claim/claim.js (tested in ci.yml).
+name: Claim
+
+on:
+  issue_comment:
+    types: [created]
+  # pull_request_target so PRs from forks can label and assign. It runs the base branch's
+  # scripts/claim and only reads the PR's title, body and author; the PR's code is never checked out.
+  pull_request_target:
+    types: [opened, reopened]
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read # to check out scripts/claim
+  issues: write
+  pull-requests: read
+
+# One run at a time per issue, so two simultaneous /claim comments can't both win.
+concurrency:
+  group: claim-${{ github.event.issue.number || github.event.pull_request.number || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  claim:
+    name: Claim bot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (!github.event.issue.pull_request && github.event.comment.user.type != 'Bot' &&
+      (startsWith(github.event.comment.body, '/claim') || startsWith(github.event.comment.body, '/unclaim')))
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/claim
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const claim = require('./scripts/claim/claim.js');
+            if (context.eventName === 'issue_comment') {
+              await claim.handleComment({ github, context });
+            } else if (context.eventName === 'pull_request_target') {
+              const claimed = await claim.handlePull({ github, context });
+              core.info(`Claimed: ${claimed.join(', ') || 'none'}`);
+            } else {
+              const released = await claim.sweep({ github, context });
+              core.info(`Released: ${released.join(', ') || 'none'}`);
+            }

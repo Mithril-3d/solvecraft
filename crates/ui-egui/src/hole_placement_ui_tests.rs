@@ -1,5 +1,6 @@
 //! Hole placement on the canvas. A Single hole picked on or near a sketch point on the face (a
-//! circle's centre) goes to that point, as a Multiple pick of the same point does (#657); a pick
+//! circle's centre) goes to that point, as a Multiple pick of the same point does (#657), and
+//! follows it when the sketch changes (#2110); a pick
 //! away from sketch points, or near one off the face under the cursor, stays where it was clicked.
 //! Only points the sketch shows are snapped to (not lettering's outline points), and Select Other
 //! looks the face up once for every point near the cursor.
@@ -77,7 +78,7 @@ fn hovered_face_point(h: &mut Harness, at: [f64; 2]) -> Vec3 {
 fn hole(h: &Harness) -> (u64, Vec3, bool) {
     let f = h.app.session.doc.features.last().unwrap();
     match &f.kind {
-        FeatureKind::Hole { position, points, .. } => (f.id, *position, points.is_some()),
+        FeatureKind::Hole { position, points, .. } => (f.id, position.0, points.is_some()),
         other => panic!("the last feature is not a hole: {}", other.type_name()),
     }
 }
@@ -118,7 +119,7 @@ fn a_single_hole_picked_near_a_circle_centre_goes_to_the_centre() {
     h.step(&json!({"key": "Enter"})).unwrap();
     assert!(h.app.dialog.is_none(), "OK closed the dialog: {:?}", h.app.dialog.as_ref().map(|d| &d.error));
     let (id, position, at_points) = hole(&h);
-    assert!(!at_points, "a Single hole is placed on its face");
+    assert!(at_points, "a Single hole snapped to the centre keeps the point");
     assert!(position.dist(centre) < 1e-9, "the hole is at the circle centre {centre:?}, not at {position:?}");
     assert!(h.app.session.model.result(id).is_some_and(|r| r.error.is_none() && r.warning.is_none()));
     // The bore (5 mm across, 10 mm deep) is round about the centre: empty on its axis and up to
@@ -144,8 +145,67 @@ fn a_single_hole_picked_near_a_circle_centre_goes_to_the_centre() {
     assert!(h.app.dialog.is_none(), "OK closed the dialog: {:?}", h.app.dialog.as_ref().map(|d| &d.error));
     let (again, position, at_points) = hole(&h);
     assert_eq!(again, id, "the same feature");
-    assert!(!at_points && position.dist(centre) < 1e-9, "{position:?}");
+    assert!(at_points && position.dist(centre) < 1e-9, "{position:?}");
     bore(&h);
+}
+
+#[test]
+fn a_single_hole_at_a_circle_centre_follows_the_circle() {
+    let (mut h, centre) = block_with_circle();
+    let click = near(&mut h, centre);
+    h.step(&json!({"start": "solid.hole"})).unwrap();
+    h.step(&json!({"click": click})).unwrap();
+    h.step(&json!({"key": "Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "OK closed the dialog: {:?}", h.app.dialog.as_ref().map(|d| &d.error));
+    let (id, _, _) = hole(&h);
+    let sketch = h.app.session.world_state().sketches.first().unwrap().feature;
+    let circle = h
+        .app
+        .session
+        .world_state()
+        .sketches
+        .first()
+        .unwrap()
+        .sketch
+        .curves
+        .iter()
+        .find(|c| matches!(c.kind, CurveKind::Circle { .. }))
+        .unwrap()
+        .id
+        .clone();
+    // The circle's centre moves 8 mm along the sketch's first axis: the hole goes with it.
+    h.app.run("sketch.edit", json!({ "sketch": sketch })).unwrap();
+    h.app.run("sketch.move_point", json!({"point": format!("{circle}.center"), "to": [20, 9]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.settle();
+    let st = h.app.session.world_state();
+    let ss = st.sketches.first().unwrap();
+    let moved = ss
+        .sketch
+        .curves
+        .iter()
+        .find_map(|c| match c.kind {
+            CurveKind::Circle { c, .. } => Some(ss.plane.to_world(ss.sketch.points[c].pos)),
+            _ => None,
+        })
+        .unwrap();
+    assert!((moved.dist(centre) - 8.0).abs() < 1e-6, "the centre moved 8 mm: {centre:?} -> {moved:?}");
+    assert!(h.app.session.model.result(id).is_some_and(|r| r.error.is_none() && r.warning.is_none()));
+    let down = Vec3::new(0.0, 0.0, 5.0);
+    assert!(!solid_at(&h, moved - down), "the hole is at the moved centre {moved:?}");
+    assert!(solid_at(&h, centre - down), "the old centre {centre:?} is solid again");
+    // Edit Feature shows it as Single, picked where the centre is now, and OK keeps it there.
+    h.step(&json!({"call": "ui.editFeature", "params": {"feature": id}})).unwrap();
+    h.frames(4);
+    let d = h.app.dialog.as_ref().expect("the hole dialog");
+    assert!(matches!(&d.kind, Kind::Hole { opts, .. } if !opts.multiple), "{:?}", d.kind);
+    let places = face_places(&h);
+    assert!(matches!(places.as_slice(), [(_, p)] if p.dist(moved) < 1e-6), "{places:?}");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "OK closed the dialog: {:?}", h.app.dialog.as_ref().map(|d| &d.error));
+    let (again, _, at_points) = hole(&h);
+    assert!(again == id && at_points, "the same feature, still at the point");
+    assert!(!solid_at(&h, moved - down));
 }
 
 #[test]

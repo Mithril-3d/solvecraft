@@ -13,6 +13,26 @@ advanced rendering. The result reports `analysis_solver_available: false` and
 
 ## Contract (standalone card schema 1)
 
+### Candidate review window
+
+Search for **Validate Physical Material Data** in the command palette (or use
+`ui.start` with `material.properties.validate`) to open the candidate reviewer.
+Paste a schema-1 card object and choose **Review card**. The existing engine
+validator checks it; the window shows known properties in SI units, unknown
+properties, per-property conditions and source claims as inert text. Material-local
+axes do not assign a frame to a body. Isotropic G/K come from the engine report.
+
+Editing the input clears the previous review. Invalid input shows its refusal
+without retaining a stale valid result. Input is capped at 262,144 characters and
+256 KiB before JSON parsing; the validator's tighter structural and text budgets
+still apply. The window does not read files, fetch references, assign properties,
+replace density, modify history or save the candidate. Close discards it. Calling
+the engine's JSON command still returns its report without opening a dialog.
+
+This main-based review unit is independent of assigned-card persistence, local
+file import and the design-owned inspector follow-up in #1094. No dataset or
+rendering capability is supplied by reviewing a candidate.
+
 A card has `schema_version: 1`, `designation`, `family` (`wood`, `polymer`, `glass`,
 `metal`, `other`), `sources` and `properties`. Source IDs are exact, case-sensitive
 local references. Each source has `id`, `title`, `kind` (`user_supplied`,
@@ -58,6 +78,16 @@ isotropic derived response and its reciprocals must also remain finite/positive.
 Moisture is kg water / kg dry material and can exceed one. It is not a wet-mass
 fraction. Unspecified temperature/state, wood moisture or polymer strain rate are
 reported in `unspecified_conditions`; they are not guessed or replaced by zero.
+The validation report also returns `missing_condition_fields`, a map from each
+incomplete property kind to its exact absent field names. Temperature and state
+apply to every family; wood additionally checks dry-basis moisture and polymers
+strain rate, following the same reporting policy as `unspecified_conditions`.
+For example, a wood density with temperature and state but no moisture reports
+`{"density":["moisture_dry_basis_kg_kg"]}`. Complete properties are omitted;
+an empty card returns an empty map, without inventing properties or conditions.
+This detail is read-only and does not change admission or the saved card schema.
+Older serialized validation reports without the map deserialize with an empty
+map; regenerate validation from the card to obtain the missing-field detail.
 The family label does not certify that a chosen constitutive model fits a material.
 Scalar strengths are individual measurements, not a three-dimensional failure
 envelope. Typed strength directions and test methods remain a separate extension.
@@ -125,3 +155,37 @@ specimen properties and graded design values. No handbook data/table is bundled.
 The [Khronos PBR material model](https://www.khronos.org/gltf/pbr) is a reference for
 the separate optical track. No third-party code, engineering dataset or asset is
 added by this implementation.
+
+## Directional elasticity query
+
+`material.properties.directional {card, direction: [x,y,z]}` reports Young's modulus
+in Pa for a uniaxial, small-strain constitutive test along a material-local direction.
+It returns the safely normalized direction, declared axes (`null` for isotropy), and
+the full validation/source/condition report. It neither assigns axes to a body nor
+predicts a part's displacement, failure, strength or safety factor. No solver or
+render capability is enabled. Missing elasticity refuses instead of inventing data.
+
+For orthotropy, let n=(x,y,z) be the unit direction. With engineering shear
+compliance 1/G and the reciprocal Poisson convention above:
+
+```
+1/E(n) = x^4/E1 + y^4/E2 + z^4/E3
+       + x²y²(1/G12 - 2 nu12/E1)
+       + y²z²(1/G23 - 2 nu23/E2)
+       + z²x²(1/G31 - 2 nu31/E3).
+```
+
+This follows by applying stress sigma = n tensor n, computing strain with the
+symmetric compliance, then contracting n with strain and n. The implementation
+uses a Cholesky sum of squares for the normal contribution, avoiding cancellation
+between the positive diagonal and negative coupling terms. Shear contributions
+are also nonnegative. Isotropy returns E directly, independent of orientation.
+
+Input directions must contain exactly three finite numbers and be nonzero; arbitrary
+magnitude is allowed. Max-component scaling avoids overflow or underflow while
+normalizing very large or tiny vectors. Unrepresentable compliance/modulus refuses;
+this finite-precision check does not establish a condition-number certificate.
+The card's test conditions still apply; changing direction does not extrapolate
+temperature, moisture, process, rate, damage or nonlinear behavior. Synthetic analytic
+tests cover principal axes, the isotropic limit and off-axis shear/coupling terms.
+No physical dataset or external implementation is included.

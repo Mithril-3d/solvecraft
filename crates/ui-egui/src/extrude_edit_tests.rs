@@ -46,6 +46,7 @@ fn unchanged_actual_editor_preserves_all_extents_and_parameter_identities() {
         json!({"direction":"negative","distance":"10"}),
         json!({"direction":"negative","distance":"-10 mm"}),
         json!({"direction":"symmetric","distance":"5 mm"}),
+        json!({"direction":"symmetric","distance":"5 mm","convention":"legacy_per_side"}),
         json!({"distance":"10 mm","distance2":"3 mm"}),
         json!({"from":[0,0,5],"start_offset":"0 mm"}),
         json!({"to":[0,0,10],"to_offset":"3 mm"}),
@@ -277,4 +278,178 @@ fn rotated_second_occurrence_keeps_saved_from_and_to_points_exact() {
     assert_eq!(extent(&h), original);
     let after: Vec<_> = h.app.session.world_state().bodies.iter().map(|b| (b.name.clone(), b.mesh().bounds())).collect();
     assert_eq!(after, before);
+}
+
+#[test]
+fn dragging_to_update_value_reselects_whole_value_box_text() {
+    let mut h = make(json!({"distance":"4 mm"}));
+    open(&mut h);
+    let id = egui::Id::new("sc_canvas_value");
+    let selection = |h: &Harness| {
+        let range = egui::text_edit::TextEditState::load(&h.ctx, id).unwrap().cursor.char_range().unwrap();
+        let (a, b) = (range.primary.index, range.secondary.index);
+        (a.min(b).0, a.max(b).0)
+    };
+    assert_eq!(selection(&h), (0, 4), "the pick selects all of \"4 mm\"");
+    h.step(&json!({"drag":[{"handle":"arrow"},{"world":[5,5,15]}]})).unwrap();
+    let Some(crate::dialogs::Dialog { kind: crate::dialogs::Kind::Extrude { distance, .. }, .. }) = &h.app.dialog else { panic!("extrude dialog") };
+    assert_eq!(distance, "15 mm");
+    assert_eq!(selection(&h), (0, 5), "the drag grew the text length; the selection must cover all of it");
+}
+
+#[test]
+fn symmetric_total_distance_preview_handle_drag_apply_and_reopen_agree() {
+    for (convention, cap, total_after_drag) in [("total_distance", 50.0, 120.0), ("legacy_per_side", 100.0, 60.0)] {
+        let mut h = make(json!({"direction":"symmetric","distance":"100 mm","convention":convention}));
+        h.call("ui.view", json!({"view":"fit"}));
+        h.frames(4);
+        open(&mut h);
+        let expected_tip = h.at(&json!({"world":[5,5,cap]})).unwrap();
+        let handle = h.at(&json!({"handle":"arrow"})).unwrap();
+        assert!((handle[0] - expected_tip[0]).hypot(handle[1] - expected_tip[1]) < 1.0, "{convention}: {handle:?} expected {expected_tip:?}");
+        h.step(&json!({"drag":[{"handle":"arrow"},{"world":[5,5,60]}]})).unwrap();
+        let d = h.app.dialog.as_ref().unwrap();
+        let crate::dialogs::Kind::Extrude { distance, .. } = &d.kind else { panic!("extrude") };
+        assert_eq!(h.app.session.doc.eval(distance, solidcraft_engine::doc::expr::Kind::Length).unwrap(), total_after_drag);
+        let commands = crate::dialogs::apply_commands(&h.app, d).unwrap();
+        let preview = h.app.session.preview(&commands).unwrap();
+        let preview_bounds = preview.after.body("Main").unwrap().mesh().bounds();
+        assert!((preview_bounds.min.z + 60.0).abs() < 1e-7 && (preview_bounds.max.z - 60.0).abs() < 1e-7);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.world_state().body("Main").unwrap().mesh().bounds(), preview_bounds);
+        let path = h.dir.join("symmetric.solidcraft");
+        h.app.run("file.save_as", json!({"path":path})).unwrap();
+        h.app.run("doc.open", json!({"path":path})).unwrap();
+        assert_eq!(h.app.session.world_state().body("Main").unwrap().mesh().bounds(), preview_bounds);
+        open(&mut h);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.world_state().body("Main").unwrap().mesh().bounds(), preview_bounds);
+    }
+}
+
+#[test]
+fn switching_one_side_to_symmetric_in_actual_editor_keeps_total_thickness() {
+    for convention in ["total_distance", "legacy_per_side"] {
+        let mut h = make(json!({"convention":convention}));
+        open(&mut h);
+        h.step(&json!({"widget":"One Side"})).unwrap();
+        h.step(&json!({"widget":"Symmetric"})).unwrap();
+        let commands = crate::dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+        let preview = h.app.session.preview(&commands).unwrap();
+        let bounds = preview.after.body("Main").unwrap().mesh().bounds();
+        assert!((bounds.min.z + 5.0).abs() < 1e-7 && (bounds.max.z - 5.0).abs() < 1e-7);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.world_state().body("Main").unwrap().mesh().bounds(), bounds);
+        assert_eq!(extent(&h).convention, solidcraft_engine::doc::ExtrudeConvention::TotalDistance);
+    }
+}
+
+#[test]
+fn symmetric_through_all_handle_drag_switches_to_total_distance() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":100,"corner":[0,0,-50],"body_name":"Reference"})).unwrap();
+    let mut h = make_in(h, json!({"direction":"symmetric","through_all":true}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.frames(4);
+    open(&mut h);
+    h.step(&json!({"drag":[{"handle":"arrow"},{"world":[5,5,60]}]})).unwrap();
+    let d = h.app.dialog.as_ref().unwrap();
+    let crate::dialogs::Kind::Extrude { distance, all, .. } = &d.kind else { panic!("extrude") };
+    assert!(!all);
+    assert_eq!(h.app.session.doc.eval(distance, solidcraft_engine::doc::expr::Kind::Length).unwrap(), 120.0);
+    h.step(&json!({"widget":"OK"})).unwrap();
+    let bounds = h.app.session.world_state().body("Main").unwrap().mesh().bounds();
+    assert!((bounds.min.z + 60.0).abs() < 1e-7 && (bounds.max.z - 60.0).abs() < 1e-7);
+}
+
+/// Inspect each held frame, not just the settled end of the drag: the displayed arrow must
+/// be at the distance the pointer just wrote, rather than the previous frame's distance.
+#[test]
+fn extrusion_arrow_tracks_the_current_drag_frame() {
+    let mut h = make(json!({"distance":10}));
+    open(&mut h);
+    let at = h.at(&json!({"handle":"arrow"})).unwrap();
+    let at = egui::pos2(at[0] as f32, at[1] as f32);
+    h.app.synthetic_mods.ctrl = true;
+    h.app.synthetic.push(egui::Event::PointerMoved(at));
+    h.frame();
+    h.app.synthetic.push(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: h.app.synthetic_mods,
+    });
+    h.frame();
+    for dy in [-20.0, -40.0, -60.0] {
+        h.app.synthetic.push(egui::Event::PointerMoved(at + egui::vec2(0.0, dy)));
+        h.frame();
+        let d = h.app.dialog.as_ref().unwrap();
+        let crate::dialogs::Kind::Extrude { distance, .. } = &d.kind else { panic!("extrude") };
+        let distance = h.app.session.doc.eval(distance, solidcraft_engine::doc::expr::Kind::Length).unwrap();
+        assert!(distance > 10.0);
+        let (base, normal) = crate::canvas::anchor(&h.app, d).unwrap();
+        let world = base + normal.unwrap() * distance;
+        let expected = h.at(&json!({"world":[world.x, world.y, world.z]})).unwrap();
+        let drawn = h.at(&json!({"handle":"arrow"})).unwrap();
+        assert!((drawn[0] - expected[0]).hypot(drawn[1] - expected[1]) < 0.1, "arrow {drawn:?} trails current value {expected:?}");
+    }
+}
+
+/// The world point `at` mm along the open extrude's arrow.
+fn on_arrow(h: &Harness, at: f64) -> Value {
+    let d = h.app.dialog.as_ref().unwrap();
+    let (base, normal) = crate::canvas::anchor(&h.app, d).unwrap();
+    let p = base + normal.unwrap() * at;
+    json!({"world":[p.x, p.y, p.z]})
+}
+
+fn dialog_distance(h: &Harness) -> f64 {
+    let d = h.app.dialog.as_ref().unwrap();
+    let crate::dialogs::Kind::Extrude { distance, .. } = &d.kind else { panic!("extrude") };
+    h.app.session.doc.eval(distance, solidcraft_engine::doc::expr::Kind::Length).unwrap()
+}
+
+/// The arrow's stem takes the drag as its tip does (#1740): pressed 4 mm along a 10 mm arrow and
+/// moved to 9 mm, it grows by the 5 mm the pointer moved, not to where the pointer is.
+#[test]
+fn the_extrude_arrow_drags_from_its_stem() {
+    let mut h = make(json!({"distance":10}));
+    open(&mut h);
+    let (from, to) = (on_arrow(&h, 4.0), on_arrow(&h, 9.0));
+    h.step(&json!({"drag":[from, to]})).unwrap();
+    assert!((dialog_distance(&h) - 15.0).abs() < 1e-9, "{}", dialog_distance(&h));
+    h.step(&json!({"widget":"OK"})).unwrap();
+    let bounds = h.app.session.world_state().body("Main").unwrap().mesh().bounds();
+    assert!((bounds.max.z - 15.0).abs() < 1e-7, "{bounds:?}");
+}
+
+/// A click on the arrow's stem is the arrow's (#1740): a new extrude of a square sketched on a
+/// block keeps its profile picked and its distance. Before, the click went through to the square
+/// under the stem and unpicked it.
+#[test]
+fn a_click_on_the_extrude_arrow_stem_keeps_the_profile() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    for (id, p) in [
+        ("sketch.create", json!({"plane": "XY"})),
+        ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 20]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance": 10})),
+        ("sketch.create", json!({"plane": {"origin": [0, 0, 10], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}})),
+        ("sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [15, 15]})),
+    ] {
+        h.app.run(id, p).unwrap();
+    }
+    h.app.finish_sketch();
+    h.app.start("solid.extrude");
+    h.frames(4);
+    let picked = |h: &Harness| h.app.dialog.as_ref().unwrap().inputs.iter().map(|i| i.items.len()).collect::<Vec<_>>();
+    let before = picked(&h);
+    assert!(before.iter().any(|n| *n > 0), "{before:?}");
+    let distance = dialog_distance(&h);
+    let at = on_arrow(&h, distance * 0.3);
+    h.step(&json!({"click": at})).unwrap();
+    h.frames(2);
+    assert_eq!(picked(&h), before);
+    assert!((dialog_distance(&h) - distance).abs() < 1e-9, "{} for {distance}", dialog_distance(&h));
 }

@@ -25,7 +25,8 @@ feature to the timeline and let the document evaluate it; they validate their in
 (units, ranges, references) and return `BadParams` instead of building a broken feature.
 
 Only the registry's own dotted ids name commands (matched ignoring case); any other id fails
-with `unknown command`.
+with `unknown command`, which names up to three close ids: a typo's (`solid.extrud`), or one
+ending in the same word (`file.open`: did you mean `doc.open`?).
 
 ## Adding a command
 

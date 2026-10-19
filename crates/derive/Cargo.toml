@@ -1,0 +1,17 @@
+[package]
+name = "solidcraft-derive"
+description = "SolidCraft derive macros: the walk over a feature's geometry, from role attributes on its fields"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

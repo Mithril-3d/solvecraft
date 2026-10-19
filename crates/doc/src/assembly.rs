@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use solidcraft_geom::{Plane, Vec3};
 
-use crate::{AxisRef, DocError, Document, FeatureKind, PatternKind, PlaneRef, Result};
+use crate::{DocError, Document, FeatureKind, PlaneRef, Result};
 
 /// Column-major 4×4 affine transform (`m[col][row]`).
 pub type Mat = [[f64; 4]; 4];
@@ -136,11 +136,16 @@ fn map_plane(m: &Mat, p: &Plane) -> Plane {
 fn map_plane_ref(m: &Mat, p: &mut PlaneRef) {
     match p {
         PlaneRef::Custom { plane } => *plane = map_plane(m, plane),
+        PlaneRef::Placed { origin, x_dir, y_dir } => {
+            map_point_expr(m, origin);
+            *x_dir = apply_vector(m, *x_dir);
+            *y_dir = apply_vector(m, *y_dir);
+        }
         PlaneRef::Face { plane, at, .. } => {
             *plane = map_plane(m, plane);
             *at = apply_point(m, *at);
         }
-        PlaneRef::Offset { base, .. } => map_plane_ref(m, base),
+        PlaneRef::Offset { base, .. } | PlaneRef::Flipped { base, .. } => map_plane_ref(m, base),
         PlaneRef::AtAngle { base, axis_origin, axis_dir, .. } => {
             map_plane_ref(m, base);
             *axis_origin = apply_point(m, *axis_origin);
@@ -171,7 +176,7 @@ fn map_geo_ref(m: &Mat, g: &mut crate::construct::GeoRef) {
 /// Map a point given as expressions by `m`: numbers stay numbers; a coordinate that is an
 /// expression stays one (`m · (x, y, z) + t`, written out), so it still follows its parameters.
 pub fn map_point_expr(m: &Mat, p: &mut crate::PointExpr) {
-    let num = |e: &String| e.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let num = |e: &crate::Expr| e.trim().parse::<f64>().ok().filter(|v| v.is_finite());
     if let [Some(x), Some(y), Some(z)] = [num(&p[0]), num(&p[1]), num(&p[2])] {
         *p = crate::point_expr(apply_point(m, Vec3::new(x, y, z)));
         return;
@@ -197,164 +202,24 @@ pub fn map_point_expr(m: &Mat, p: &mut crate::PointExpr) {
         } else if constant.abs() >= 1e-12 {
             e = format!("{e} {} {} mm", if constant < 0.0 { '-' } else { '+' }, constant.abs());
         }
-        *out = e;
+        *out = e.into();
     }
 }
 
 impl FeatureKind {
     /// Map the feature's world geometry (points, directions, explicit planes) by `m`.
     pub fn transform_geometry(&mut self, m: &Mat) {
-        let pt = |p: &mut Vec3| *p = apply_point(m, *p);
-        let dir = |v: &mut Vec3| *v = apply_vector(m, *v);
-        match self {
-            FeatureKind::Sketch { plane, .. } | FeatureKind::ConstructionPlane { plane } | FeatureKind::Mirror { plane, .. } => {
-                map_plane_ref(m, plane)
-            }
-            FeatureKind::ConstructionAxis { def } => def.refs_mut().into_iter().for_each(|r| map_geo_ref(m, r)),
-            FeatureKind::ConstructionPoint { def } => def.refs_mut().into_iter().for_each(|r| map_geo_ref(m, r)),
-            FeatureKind::Split { plane, tool, .. } => {
-                map_plane_ref(m, plane);
-                if let Some(t) = tool {
-                    pt(&mut t.point);
-                }
-            }
-            FeatureKind::SplitFace { faces, plane, tool, .. } => {
-                faces.iter_mut().for_each(pt);
-                map_plane_ref(m, plane);
-                if let Some(t) = tool {
-                    pt(&mut t.point);
-                }
-            }
-            FeatureKind::Revolve { axis: AxisRef::Line { origin, dir: d }, .. }
-            | FeatureKind::SurfaceRevolve { axis: AxisRef::Line { origin, dir: d }, .. } => {
-                pt(origin);
-                dir(d);
-            }
-            FeatureKind::Fillet { edges, style, .. } => {
-                edges.iter_mut().for_each(pt);
-                if let crate::FilletStyle::Variable { start, .. } | crate::FilletStyle::Spline { start, .. } = style {
-                    pt(start);
-                }
-            }
-            FeatureKind::Chamfer { edges, .. } => edges.iter_mut().for_each(pt),
-            FeatureKind::Shell { faces, .. }
-            | FeatureKind::OffsetFace { faces, .. }
-            | FeatureKind::DeleteFace { faces, .. }
-            | FeatureKind::SurfaceOffset { faces, .. } => faces.iter_mut().for_each(pt),
-            FeatureKind::Draft { faces, neutral, pull, .. } => {
-                faces.iter_mut().for_each(pt);
-                map_plane_ref(m, neutral);
-                dir(pull);
-            }
-            FeatureKind::Box { corner, .. } => map_point_expr(m, corner),
-            FeatureKind::Cylinder { base, axis, .. } => {
-                map_point_expr(m, base);
-                dir(axis);
-            }
-            FeatureKind::Sphere { center, .. } | FeatureKind::Torus { center, .. } => map_point_expr(m, center),
-            FeatureKind::Pattern { pattern: PatternKind::Rectangular { dir1, dir2, .. }, .. } => {
-                dir(dir1);
-                if let Some(d) = dir2 {
-                    dir(d);
-                }
-            }
-            FeatureKind::Pattern { pattern: PatternKind::Circular { origin, axis, .. }, .. } => {
-                pt(origin);
-                dir(axis);
-            }
-            // Follows its sketch.
-            FeatureKind::Pattern { pattern: PatternKind::Path { .. }, .. } => {}
-            FeatureKind::Hole { position, direction, .. } => {
-                pt(position);
-                dir(direction);
-            }
-            FeatureKind::Thread { face, .. } => pt(face),
-            FeatureKind::SheetFlange { edges, .. } => edges.iter_mut().for_each(|e| pt(&mut e.point)),
-            FeatureKind::SheetHem { edges, .. } => edges.iter_mut().for_each(pt),
-            FeatureKind::SheetConvert { face, bends, .. } => {
-                pt(face);
-                bends.iter_mut().for_each(pt);
-            }
-            FeatureKind::SheetFold { a, b, fixed, .. } => {
-                pt(a);
-                pt(b);
-                if let Some(f) = fixed {
-                    pt(f);
-                }
-            }
-            FeatureKind::Boss { position, direction, .. } => {
-                pt(position);
-                dir(direction);
-            }
-            FeatureKind::Lip { face, .. } => pt(face),
-            FeatureKind::BoundaryFill { cells, .. } => cells.iter_mut().for_each(pt),
-            FeatureKind::Rest { position, direction, along, .. } => {
-                pt(position);
-                dir(direction);
-                if let Some(a) = along {
-                    dir(a);
-                }
-            }
-            FeatureKind::SnapFit { position, direction, hook, .. } => {
-                pt(position);
-                dir(direction);
-                dir(hook);
-            }
-            FeatureKind::SheetBase { .. } | FeatureKind::SheetContour { .. } | FeatureKind::SheetUnfold { .. } => {}
-            FeatureKind::Coil { base, axis, .. } => {
-                map_point_expr(m, base);
-                dir(axis);
-            }
-            FeatureKind::ReplaceFace { faces, target, .. } => {
-                faces.iter_mut().for_each(pt);
-                map_plane_ref(m, target);
-            }
-            FeatureKind::Align { from, to, from_normal, to_normal, .. } => {
-                pt(from);
-                pt(to);
-                if let Some(n) = from_normal {
-                    dir(n);
-                }
-                if let Some(n) = to_normal {
-                    dir(n);
-                }
-            }
-            FeatureKind::Scale { origin, .. } => pt(origin),
-            FeatureKind::Move { rotate_axis, .. } => {
-                if let Some(a) = rotate_axis {
-                    dir(a);
-                }
-            }
-            FeatureKind::Revolve { .. }
-            | FeatureKind::Extrude { .. }
-            | FeatureKind::SurfaceExtrude { .. }
-            | FeatureKind::SurfaceRevolve { .. }
-            | FeatureKind::SurfaceSweep { .. }
-            | FeatureKind::SurfaceLoft { .. }
-            | FeatureKind::Combine { .. }
-            | FeatureKind::Loft { .. }
-            | FeatureKind::Sweep { .. }
-            | FeatureKind::BoundingSolid { .. }
-            | FeatureKind::Pipe { .. }
-            | FeatureKind::Emboss { .. }
-            | FeatureKind::Rib { .. }
-            | FeatureKind::Remove { .. }
-            | FeatureKind::Stitch { .. }
-            | FeatureKind::Thicken { .. }
-            | FeatureKind::Import { .. }
-            | FeatureKind::MeshImport { .. }
-            | FeatureKind::MeshConvert { .. }
-            | FeatureKind::BodyTransfer { .. } => {}
-            FeatureKind::Patch { edges, .. } | FeatureKind::SurfaceExtend { edges, .. } => edges.iter_mut().for_each(pt),
-            FeatureKind::Unstitch { faces, .. } | FeatureKind::ReverseNormal { faces, .. } => faces.iter_mut().for_each(pt),
-            FeatureKind::SurfaceTrim { plane, tool, keep, .. } => {
-                map_plane_ref(m, plane);
-                if let Some(t) = tool {
-                    pt(&mut t.point);
-                }
-                pt(keep);
-            }
-        }
+        use crate::feature_geometry::Geo;
+        use crate::walk::Walk;
+        self.walk_geometry_mut(&mut |g| match g {
+            Geo::Pick(p) | Geo::Pos(p) => *p = apply_point(m, *p),
+            Geo::Dir(v) => *v = apply_vector(m, *v),
+            Geo::Plane(p) => map_plane_ref(m, p),
+            Geo::Construct(r) => map_geo_ref(m, r),
+            Geo::Placement(e) => map_point_expr(m, e),
+            // An Emboss cylinder is picked in its component's frame (`EmbossFace`).
+            Geo::Pinned(_) | Geo::Profiles(..) => {}
+        });
     }
 }
 
@@ -377,6 +242,21 @@ impl Document {
             c = o.parent;
         }
         m
+    }
+
+    /// World transform of one placement of `component`: the occurrence `path` from the root
+    /// (empty for the root itself). `None` when the path no longer leads to that component.
+    pub fn path_transform(&self, component: u64, path: &[u64]) -> Option<Mat> {
+        if path.len() > MAX_PLACEMENT_DEPTH + 1 {
+            return None;
+        }
+        let (mut m, mut c) = (IDENTITY, 0);
+        for id in path {
+            let o = self.occurrences.iter().find(|o| o.id == *id && o.parent == c)?;
+            m = mat_mul(&m, &o.transform);
+            c = o.component;
+        }
+        (c == component).then_some(m)
     }
 
     /// Every placement of each component: (component, occurrence path ids, world transform).
@@ -507,7 +387,7 @@ impl Document {
             return Err(DocError::Invalid("too many occurrences".into()));
         }
         let id = self.next_id.max(1);
-        self.next_id = id + 1;
+        self.next_id = id.checked_add(1).ok_or_else(|| DocError::Invalid("too many items in the design".into()))?;
         let cname = self.components.iter().find(|c| c.id == component).map(|c| c.name.clone()).unwrap_or_default();
         let k = self.occurrences.iter().filter(|o| o.component == component).count() + 1;
         self.occurrences.push(crate::Occurrence { id, component, parent, name: format!("{cname}:{k}"), transform, grounded: false });

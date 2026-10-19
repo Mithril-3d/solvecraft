@@ -36,6 +36,13 @@ fn control_points(s: &mt::Surface) -> Option<Vec<Vec3>> {
     }
 }
 
+/// The least and the greatest `along · p` over the control points of a B-spline or NURBS surface; the surface lies
+/// between them (it is in the convex hull of its control net). `None` for any other surface.
+pub(crate) fn control_net_span(s: &mt::Surface, along: Vec3) -> Option<(f64, f64)> {
+    let pts = control_points(s)?;
+    pts.iter().map(|p| along.dot(*p)).fold(None, |acc, h| Some(acc.map_or((h, h), |(lo, hi): (f64, f64)| (lo.min(h), hi.max(h)))))
+}
+
 /// A point and the unit normal of the plane every point lies within `tol` of, if there is one.
 fn common_plane(pts: &[Vec3], tol: f64) -> Option<(Vec3, Vec3)> {
     let p0 = *pts.first()?;

@@ -1,0 +1,344 @@
+{
+  "commands": [
+    {
+      "command": "file.new",
+      "params": {
+        "name": "Render studio enclosure"
+      }
+    },
+    {
+      "command": "component.create",
+      "params": {
+        "name": "Tray"
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "Base",
+        "corner": [
+          -32,
+          -22,
+          0
+        ],
+        "length": 64,
+        "height": 4,
+        "width": 44
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "LeftWall",
+        "corner": [
+          -32,
+          -22,
+          4
+        ],
+        "length": 3,
+        "height": 19,
+        "width": 44
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "RightWall",
+        "corner": [
+          29,
+          -22,
+          4
+        ],
+        "length": 3,
+        "height": 19,
+        "width": 44
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "FrontWall",
+        "corner": [
+          -29,
+          -22,
+          4
+        ],
+        "length": 58,
+        "height": 19,
+        "width": 3
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "BackWall",
+        "corner": [
+          -29,
+          19,
+          4
+        ],
+        "length": 58,
+        "height": 19,
+        "width": 3
+      }
+    },
+    {
+      "command": "appearance.assign",
+      "params": {
+        "bodies": [
+          "Base",
+          "LeftWall",
+          "RightWall",
+          "FrontWall",
+          "BackWall"
+        ],
+        "color": "#82939e"
+      }
+    },
+    {
+      "command": "component.activate",
+      "params": {
+        "component": 0
+      }
+    },
+    {
+      "command": "component.create",
+      "params": {
+        "name": "Insert"
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "Insert",
+        "corner": [
+          -24,
+          -14,
+          4
+        ],
+        "length": 48,
+        "height": 10,
+        "width": 28
+      }
+    },
+    {
+      "command": "appearance.assign",
+      "params": {
+        "bodies": [
+          "Insert"
+        ],
+        "color": "#199d8e"
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad1",
+        "base": [
+          -15,
+          -7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad2",
+        "base": [
+          -15,
+          7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad3",
+        "base": [
+          0,
+          -7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad4",
+        "base": [
+          0,
+          7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad5",
+        "base": [
+          15,
+          -7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Pad6",
+        "base": [
+          15,
+          7,
+          14
+        ],
+        "radius": 4,
+        "height": 0.8
+      }
+    },
+    {
+      "command": "appearance.assign",
+      "params": {
+        "bodies": [
+          "Pad1",
+          "Pad2",
+          "Pad3",
+          "Pad4",
+          "Pad5",
+          "Pad6"
+        ],
+        "color": "#124c48"
+      }
+    },
+    {
+      "command": "component.activate",
+      "params": {
+        "component": 0
+      }
+    },
+    {
+      "command": "component.create",
+      "params": {
+        "name": "Fasteners"
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Post1",
+        "base": [
+          -27,
+          -17,
+          4
+        ],
+        "radius": 2,
+        "height": 21
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Post2",
+        "base": [
+          -27,
+          17,
+          4
+        ],
+        "radius": 2,
+        "height": 21
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Post3",
+        "base": [
+          27,
+          -17,
+          4
+        ],
+        "radius": 2,
+        "height": 21
+      }
+    },
+    {
+      "command": "solid.cylinder",
+      "params": {
+        "body_name": "Post4",
+        "base": [
+          27,
+          17,
+          4
+        ],
+        "radius": 2,
+        "height": 21
+      }
+    },
+    {
+      "command": "appearance.assign",
+      "params": {
+        "bodies": [
+          "Post1",
+          "Post2",
+          "Post3",
+          "Post4"
+        ],
+        "color": "#ced6dc"
+      }
+    },
+    {
+      "command": "component.activate",
+      "params": {
+        "component": 0
+      }
+    },
+    {
+      "command": "component.create",
+      "params": {
+        "name": "Lid"
+      }
+    },
+    {
+      "command": "solid.box",
+      "params": {
+        "body_name": "ClearLid",
+        "corner": [
+          -32,
+          -22,
+          23
+        ],
+        "length": 64,
+        "height": 2,
+        "width": 44
+      }
+    },
+    {
+      "command": "appearance.assign",
+      "params": {
+        "bodies": [
+          "ClearLid"
+        ],
+        "color": "#bad9e6",
+        "opacity": 0.25
+      }
+    },
+    {
+      "command": "component.activate",
+      "params": {
+        "component": 0
+      }
+    }
+  ]
+}

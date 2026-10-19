@@ -9,7 +9,7 @@ Where the expected values come from (the **Source** column):
 
 No expected value comes from a commercial CAD product.
 
-**81 / 81 cases pass**; sources: 60 analytic, 21 freecad. 0 known failure(s) tracked in issues; 0 case(s) without expected values yet.
+**83 / 83 cases pass**; sources: 62 analytic, 21 freecad. 0 known failure(s) tracked in issues; 0 case(s) without expected values yet.
 
 | Case | Source | Result | Surface distance mm (max / mean) | Method | Notes |
 |---|---|---|---|---|---|
@@ -54,7 +54,7 @@ No expected value comes from a commercial CAD product.
 | 39-tee-pipe | freecad 1.1.4 | pass | 0.008 / 0.0014 (worst at -9.7, 2.4, 40.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part extrude join, Part extrude cut |  |
 | 40-box-sphere-torus | analytic | pass |  | box 60x60x10 (z -10..0) + upper hemisphere r12 + spherical cap h2 below z=-10 (V = pi h^2(3R-h)/3, A = 2 pi R h) - lower half torus R22 r4 (Pappus: V = pi r^2/2 * 2 pi R, centroid -4r/3pi, A = pi r * 2 pi R); top loses disc r12 and annulus 18..26, bottom loses disc r sqrt(44) | faces: bottom, 4 sides, top split by the groove into an annulus (r 12..18) and the outer part, upper sphere, lower cap, torus |
 | 41-tube-radial-holes | freecad 1.1.4 | pass | 0.010 / 0.0012 (worst at 1.9, 19.9, 24.8) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part extrude cut, pattern (tools transformed and re-applied) |  |
-| 42-overlapping-patterns | freecad 1.1.4 | pass | 0.030 / 0.0010 (worst at -20.0, -0.0, 5.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part extrude cut, pattern (tools transformed and re-applied), Part extrude cut, pattern (tools transformed and re-applied) |  |
+| 42-overlapping-patterns | freecad 1.1.4 | pass | 0.009 / 0.0010 (worst at -1.0, -10.1, 2.2) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part extrude cut, pattern (tools transformed and re-applied), Part extrude cut, pattern (tools transformed and re-applied) |  |
 | 43-cut-splits-body | analytic | pass |  | two boxes 35x20x20 (x 0..35 and 45..80): V = 2abc, A = 2*2(ab+bc+ca) |  |
 | 44-shell-l-bracket | analytic | pass |  | L prism (area 736, perimeter 200) x 20 minus cavity = L shrunk by 2 (SolidCraft's intersection-join shell convention: inner faces offset by 2 and extended to meet, sharp inner corner at (6,6); area 352) from z=2 to 20. A rounded (arc) join would give V 8368.5487, A 8768.5487, 16 faces |  |
 | 45-shell-boss-plate | analytic | pass |  | plate 60x60x10 + boss r12 h20 minus cavity (box 56x56x8 + cylinder r10 z8..28) under SolidCraft's intersection-join shell convention (offset faces extended to meet: sharp circular inner edge at r10, z8). A rounded (arc) join would give V 13620.2567, A 14104.4455, 16 faces (torus round r2) |  |
@@ -71,13 +71,13 @@ No expected value comes from a commercial CAD product.
 | 56-holes-on-curved-face | freecad 1.1.4 | pass | 0.009 / 0.0018 (worst at -16.9, 18.5, 0.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, hole tool (cylinder/cone) cut |  |
 | 57-hole-pattern-sketch-points | analytic | pass |  | plate 80x50x10 minus 6 counterbored through holes (cb d10 x 5.5, hole d5.5) at x 15/40/65, y 15/35 |  |
 | 58-phone-stand | freecad 1.1.4 | pass | 0.007 / 0.0010 (worst at 82.5, 11.7, 6.1) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part makeFillet, Part extrude cut |  |
-| 59-enclosure-base | freecad 1.1.4 | pass | 0.008 / 0.0017 (worst at 90.9, 51.0, 6.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part makeFillet, makeThickness shell, Part extrude join, Part extrude cut |  |
+| 59-enclosure-base | freecad 1.1.4 | pass | 0.008 / 0.0017 (worst at 90.9, 53.0, 6.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part makeFillet, makeThickness shell, Part extrude join, Part extrude cut |  |
 | 60-pipe-flange | freecad 1.1.4 | pass |  | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part revolve, Part extrude cut, pattern (tools transformed and re-applied), Part makeChamfer, Part makeFillet | No reference.stl: over 409600 bytes even at 0.02 mm deflection (11380 facets). |
-| 61-shaft-keyway | freecad 1.1.4 | pass | 0.008 / 0.0019 (worst at 11.9, 3.9, 45.8) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part revolve, Part makeChamfer, Part extrude cut |  |
+| 61-shaft-keyway | freecad 1.1.4 | pass | 0.008 / 0.0019 (worst at 12.2, 2.8, 72.1) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part revolve, Part makeChamfer, Part extrude cut |  |
 | 62-heat-sink | analytic | pass |  | base 60x50x5 + 15 fins 1.5x50x25 at x = 2 + 4k: sums of boxes; fin ends coplanar with the base ends | faces: bottom, x=0, x=60, y=0 and y=50 (each merged with the fin ends), 16 base-top strips, 15x3 fin faces |
 | 63-hinge-knuckle | freecad 1.1.4 | pass | 0.008 / 0.0016 (worst at 28.0, 36.9, 4.7) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Part extrude, Part extrude join, Part extrude cut |  |
 | 64-sketch-tangent-arc-chain | analytic | pass |  | solved sketch: 80x20 rectangle whose top is 4 tangent R12 arcs on 20 mm chords alternating up/down (net area 1600); prism h3: V = A h, area = 2A + perimeter*h, Green's theorem for centroid |  |
-| 65-sketch-gear-tooth | freecad 1.1.4 | pass | 0.008 / 0.0017 (worst at 6.5, 39.5, 8.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Sketcher-solved sketch, Part extrude |  |
+| 65-sketch-gear-tooth | freecad 1.1.4 | pass | 0.008 / 0.0017 (worst at -6.5, 39.5, 0.0) | FreeCAD (OpenCASCADE) build of recipe.json by tools/freecad-oracle/build.py: Sketcher-solved sketch, Part extrude |  |
 | 66-sketch-linkage | analytic | pass |  | solved sketch: hull of circles R12 at (0,0) and R8 at (60,0) (outer tangent lines, cos a = 4/60) minus holes d12, d8 (concentric) and d4 at (30,+-4) (symmetry keeps radii equal); prism h6 |  |
 | 67-sm-base-flange | analytic | pass |  | plate 100 x 60 x t, t = 2.5 (Steel (mm) rule), thickness along +Z: V = 100*60*t, A = 2(ab+bc+ca) |  |
 | 68-sm-edge-flange | analytic | pass |  | extrusion along x (100) of the YZ section: base y 5..60 x t; 90 deg bend annulus R 2.5..5 about (y 5, z 5); flange y 0..2.5, z 5..20. Setback (R+t)tan45 = 5 (inside bend position, outer-face height datum: outer face of flange reaches z = 20); V = L*A_sec, A = 2 A_sec + L P_sec | trim/setback and height datum are SolidCraft's documented edge-flange conventions (sheet.rs add_flanges) |
@@ -94,6 +94,8 @@ No expected value comes from a commercial CAD product.
 | 79-fillet-chord-length | analytic | pass |  | box 40x30x20, top front edge rounded 4 wide across (chord c): r = c / (2 cos 45 deg) = 2 sqrt 2; V = abc - (1 - pi/4) r^2 L, A = 2(ab + bc + ca) - 2 r L + (pi/2) r L - 2 (1 - pi/4) r^2 |  |
 | 80-fillet-taper-to-fit | analytic | pass |  | plate (top 20 -> 2 wide over x 0..40, 15 high) with its top front edge filleted at 3, fit: taper. The radius is the taper law: a clamped cubic B-spline in u = x/40 on 8 equal spans, control radii min(3, 0.9 room) at the Greville abscissae, room = min(20 - 18u, 15) tan 45 deg (top face width, front face height): 3.0000, 3.0000, 3.0000, 3.0000, 3.0000, 3.0000, 3.0000, 3.0000, 3.0000, 2.4750, 1.8000. Sections are quarter rounds; V, moments and areas integrated along the edge |  |
 | 81-fillet-spline-radius | analytic | pass |  | box 40x30x20 with its top front edge (y=0, z=20) rounded at a radius that is a clamped cubic B-spline in u = x/40, knots 0,0,0,0,0.25,0.6,1,1,1,1, control radii 2, 5, 1.5, 4, 1, 3 (r(0) = 2, r(40) = 3). Sections are quarter rounds; V, moments and areas integrated along the edge, exactly per knot span |  |
+| 82-thin-extrude-frame | analytic | pass |  | square frame: the lines' 40 mm square walled 3 mm inside and 1 mm outside (mitred corners) is 42 x 42 less 34 x 34, 10 mm tall: V = (42^2 - 34^2) * 10, A = 2 (42^2 - 34^2) + 4 * 42 * 10 + 4 * 34 * 10 |  |
+| 83-boundary-loop-thicken | analytic | pass |  | region = 10 x 10 square + half disc r 5 on its top side: A = 100 + 12.5 pi, centroid by moments (half disc's at 4r / (3 pi) above its diameter); slab of thickness 2 over it (symmetric about z = 0): V = 2A, area = 2A + 2 (30 + 5 pi) |  |
 
 ## Not covered by a reference case
 

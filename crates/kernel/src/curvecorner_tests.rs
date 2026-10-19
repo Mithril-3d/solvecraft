@@ -244,10 +244,9 @@ fn a_round_ending_in_an_earlier_round_matches_both_together() {
     }
 }
 
-/// The back edge rounded first, then the arc's top edge: the arc's round leaves 0.05 mm³ more at
-/// the knife-edge tip than both together, or the other order.
+/// The back edge rounded first, then the arc's top edge: the same solid as both together, or the
+/// other order (the arc's round once left 0.05 mm³ more at the knife-edge tip).
 #[test]
-#[ignore = "not yet: the arc's round after the back edge's leaves 0.05 mm³ more at the tip"]
 fn the_arc_rounded_after_the_back_edge_matches_both_together() {
     one_then_the_other(BACK, arc_top());
 }

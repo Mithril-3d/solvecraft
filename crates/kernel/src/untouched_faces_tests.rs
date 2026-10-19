@@ -148,3 +148,66 @@ fn random_cuts_and_joins_never_split_other_faces() {
         }
     }
 }
+
+/// The edges of `b` lying along the line through `a` and `z`.
+fn edges_along(b: &Body, a: Vec3, z: Vec3) -> usize {
+    let on = |p: Vec3| p.dist_to_segment(a, z) < 1e-6;
+    let edges: std::collections::HashSet<_> = b
+        .solid
+        .edge_iter()
+        .filter(|e| on(crate::body::from_p3(e.front().point())) && on(crate::body::from_p3(e.back().point())))
+        .map(|e| e.id())
+        .collect();
+    edges.len()
+}
+
+/// Vertices of `b` where just two straight edges meet in line (a straight edge split in two).
+fn stations(b: &Body) -> usize {
+    use std::collections::HashMap;
+    let mut at: HashMap<truck_modeling::VertexID, Vec<truck_modeling::Edge>> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in b.solid.edge_iter() {
+        if seen.insert(e.id()) {
+            for v in [e.front(), e.back()] {
+                at.entry(v.id()).or_default().push(e.clone());
+            }
+        }
+    }
+    at.values()
+        .filter(|es| match es.as_slice() {
+            [a, b] => {
+                let dir = |e: &truck_modeling::Edge| (crate::body::from_p3(e.back().point()) - crate::body::from_p3(e.front().point())).normalized();
+                matches!((a.curve(), b.curve()), (truck_modeling::Curve::Line(_), truck_modeling::Curve::Line(_)))
+                    && dir(a).zip(dir(b)).is_some_and(|(u, w)| u.dot(w).abs() > 1. - 1e-9)
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// Cuts at several heights through a block's walls leave no vertices along its straight edges
+/// (#1049): the edges they never touch stay one edge each, and so does an edge a later join
+/// lies beside, instead of being drawn (and met by later features) as many pieces.
+#[test]
+fn cuts_leave_straight_edges_whole() {
+    let mut b = box_solid(Vec3::new(0., 0., 0.), Vec3::new(40., 20., 10.)).unwrap().with_box_certificate(7).unwrap();
+    // Notches through the front wall at different heights, a pocket in the top and a slot
+    // through the end: each cut is sliced at its own heights.
+    b = cut(&b, Vec3::new(5., -1., 2.), Vec3::new(10., 3., 4.));
+    b = cut(&b, Vec3::new(15., -1., 5.), Vec3::new(20., 3., 8.));
+    b = cut(&b, Vec3::new(25., 8., 6.), Vec3::new(30., 12., 11.));
+    b = cut(&b, Vec3::new(37., 5., 3.), Vec3::new(41., 15., 7.));
+    assert!(b.history().is_some(), "the cuts report their history");
+    assert_eq!(stations(&b), 0, "a straight edge is split at a vertex nothing else uses");
+    // The block's four upright edges and the top's far edges are one edge each.
+    for (x, y) in [(0., 0.), (40., 0.), (0., 20.), (40., 20.)] {
+        assert_eq!(edges_along(&b, Vec3::new(x, y, 0.), Vec3::new(x, y, 10.)), 1, "upright edge at ({x}, {y})");
+    }
+    assert_eq!(edges_along(&b, Vec3::new(0., 20., 10.), Vec3::new(40., 20., 10.)), 1, "the top's back edge");
+    assert_eq!(edges_along(&b, Vec3::new(0., 0., 0.), Vec3::new(0., 20., 0.)), 1, "the bottom's left edge");
+    // A boss joined on the top beside its back edge, then another cut: still one edge.
+    b = boolean(&b, &box_solid(Vec3::new(2., 15., 10.), Vec3::new(8., 20., 14.)).unwrap(), BoolOp::Union).unwrap().unwrap();
+    b = cut(&b, Vec3::new(12., 4., 1.), Vec3::new(14., 21., 9.));
+    assert_eq!(stations(&b), 0, "after a join and another cut");
+    assert_eq!(edges_along(&b, Vec3::new(0., 0., 0.), Vec3::new(0., 0., 10.)), 1, "upright edge after a join and a cut");
+}

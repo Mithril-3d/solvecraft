@@ -2,12 +2,18 @@
 //!
 //! Runs the same [`solidcraft_ui_egui::SolveApp`] as the desktop app through eframe's web runner
 //! (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release` from this
-//! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2, `?sample` opens the
-//! sample part.
+//! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2 (remembered until
+//! `?webgpu`), `?sample` opens the sample part.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
+mod api;
+#[cfg(target_arch = "wasm32")]
 mod files;
+#[cfg(target_arch = "wasm32")]
+mod install;
+#[cfg(any(target_arch = "wasm32", test))]
+mod space_mouse;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -18,11 +24,40 @@ mod web {
     use solidcraft_ui_egui::{Services, SolveApp};
     use wasm_bindgen::JsCast as _;
 
+    use crate::api::Api;
     use crate::files::{self, Files, Intent};
+    use crate::space_mouse::SpaceMouse;
 
     const CANVAS_ID: &str = "solidcraft_canvas";
     const LOADING_ID: &str = "solidcraft_loading";
-    const DEPTH_BITS: u8 = 24;
+    /// A 32-bit float depth buffer (no stencil): WebGPU and WebGL2 both have it, and the viewport
+    /// draws it with reversed depth, whose precision follows the distance from the eye (#1434).
+    const DEPTH_BITS: u8 = 32;
+
+    /// The loading animation (assets/styles/web/loading-logo.svg) settles into the finished mark
+    /// about 3.2 s after the page starts; this adds a short hold. The app doesn't land before it.
+    const LOADING_MIN_MS: f64 = 3600.0;
+    /// The fade from the loading screen into the app.
+    const LOADING_FADE_MS: i32 = 300;
+
+    /// Take the loading screen away once the animation has played to the finished mark: wait out
+    /// what is left of `LOADING_MIN_MS`, fade it, then remove it.
+    fn dismiss_loading(el: web_sys::Element) {
+        let Some(window) = web_sys::window() else {
+            el.remove();
+            return;
+        };
+        let now = window.performance().map_or(LOADING_MIN_MS, |p| p.now());
+        let wait = (LOADING_MIN_MS - now).max(0.0) as i32;
+        let fade = wasm_bindgen::closure::Closure::once_into_js(move || {
+            let _ = el.set_attribute("class", "done");
+            let gone = wasm_bindgen::closure::Closure::once_into_js(move || el.remove());
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(gone.unchecked_ref(), LOADING_FADE_MS);
+            }
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(fade.unchecked_ref(), wait);
+    }
 
     /// Seconds between autosaves of unsaved work.
     const AUTOSAVE_S: f64 = 30.0;
@@ -52,6 +87,7 @@ mod web {
 
     struct Shell {
         app: SolveApp,
+        api: Api,
         files: Rc<Files>,
         /// When the last autosave was (seconds), and the revision it holds (none stored: `None`).
         autosaved_at: f64,
@@ -65,6 +101,7 @@ mod web {
         /// On-demand CJK font: fetched only when a CJK language is selected.
         font: solidcraft_ui_egui::fonts::CjkFontLoader,
         font_result: FontLoadResult,
+        space_mouse: SpaceMouse,
     }
 
     impl Shell {
@@ -73,11 +110,26 @@ mod web {
             if self.files.ctx.borrow().is_none() {
                 *self.files.ctx.borrow_mut() = Some(ctx.clone());
             }
+            // A ready picker answer is consumed in app.logic later in this frame. Keep
+            // incoming files queued until then so they cannot replace its target design.
+            if self.app.file_picker_busy() {
+                ctx.request_repaint();
+                return;
+            }
             files::flush(&self.files);
             for (text, error) in self.files.messages.borrow_mut().drain(..) {
                 self.app.set_status(text, error);
             }
-            let incoming: Vec<_> = self.files.incoming.borrow_mut().drain(..).collect();
+            let mut incoming: Vec<_> = self.files.incoming.borrow_mut().drain(..).collect();
+            // A glTF file's buffers picked with it are kept next to it, not opened.
+            incoming.retain_mut(|(name, bytes, _)| {
+                let companion =
+                    std::path::Path::new(name.as_str()).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bin"));
+                if companion {
+                    vfs::insert(&format!("{}{name}", files::UPLOAD), std::mem::take(bytes));
+                }
+                !companion
+            });
             for (name, bytes, intent) in incoming {
                 let design = solidcraft_engine::io::is_design_path(&name);
                 let path = if design && intent == Intent::Open {
@@ -365,11 +417,15 @@ mod web {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.tick_font(ctx);
             self.app.logic(ctx);
+            self.api.poll();
+            self.space_mouse.logic(&mut self.app, ctx);
             self.files_tick(ctx);
             UNSAVED.with(|u| u.set(solidcraft_ui_egui::documents::any_dirty(&self.app)));
         }
-        fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
             files::take_drops(&self.files, raw);
+            // Before the app's own hook, which adds the control channel's events.
+            self.space_mouse.raw_input_hook(ctx, self.app.preferences.space_mouse_enabled, raw);
             self.app.raw_input_hook(raw);
         }
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -390,6 +446,29 @@ mod web {
 
     fn query() -> String {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+    }
+
+    /// Where `?webgl` is remembered. The installed app starts from its manifest's start URL, which
+    /// has no query, so the choice has to outlive the page it was made on.
+    const WEBGL_KEY: &str = "solidcraft.webgl";
+
+    /// Render with WebGL2: asked for now (`?webgl`, remembered) or before (until `?webgpu`).
+    fn webgl() -> bool {
+        let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+        let q = query();
+        if q.contains("webgl") {
+            if let Some(s) = &storage {
+                let _ = s.set_item(WEBGL_KEY, "1");
+            }
+            return true;
+        }
+        if q.contains("webgpu") {
+            if let Some(s) = &storage {
+                let _ = s.remove_item(WEBGL_KEY);
+            }
+            return false;
+        }
+        storage.and_then(|s| s.get_item(WEBGL_KEY).ok().flatten()).is_some()
     }
 
     /// Fetch font bytes asynchronously through the browser.
@@ -416,7 +495,7 @@ mod web {
                 return;
             };
             let mut options = eframe::WebOptions { depth_buffer: DEPTH_BITS, ..Default::default() };
-            if query().contains("webgl")
+            if webgl()
                 && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
             {
                 create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
@@ -432,18 +511,22 @@ mod web {
                         let panel = files.clone();
                         let services = Services {
                             // Open shows the browser's files (and the computer's, from there).
-                            pick_open: Some(Box::new(move || {
+                            pick_open: Some(Box::new(move |_: &[&str]| {
                                 panel.panel.set(true);
-                                None
+                                Box::pin(std::future::ready(None))
                             })),
                             // Designs are kept in the browser; everything else is downloaded.
                             pick_save: Some(Box::new(|name: &str, exts: &[&str]| {
                                 let design = exts.contains(&solidcraft_engine::io::DESIGN_EXT);
-                                Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS }))
+                                Box::pin(std::future::ready(Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS }))))
                             })),
+                            install_app: Some(crate::install::service(&cc.egui_ctx)),
                             ..Default::default()
                         };
-                        let mut app = SolveApp::new(Session::default(), services);
+                        // Thumbnails of saves and start-page cards.
+                        solidcraft_ui_egui::gpu::install_cpu_picture_renderer();
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        let mut app = SolveApp::new(Session::default(), services).with_control(receiver);
                         if let Some(p) = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k))) {
                             app.load_prefs(&p);
                         }
@@ -459,11 +542,16 @@ mod web {
                             app.session.mark_saved();
                         }
                         if !query().contains("sample") {
+                            // The empty design takes Units of new designs (#1205). The sample
+                            // part is built in millimetres and is left that way.
+                            solidcraft_ui_egui::prefs::apply_new_design(&mut app);
                             let rev = app.session.revision;
                             app.home.show(rev);
                         }
+                        let api = Api::install(sender, cc.egui_ctx.clone()).map_err(|e| format!("SolidCraft browser API: {e:?}"))?;
                         Ok(Box::new(Shell {
                             app,
+                            api,
                             files,
                             autosaved_at: f64::NEG_INFINITY,
                             autosaved: None,
@@ -472,13 +560,14 @@ mod web {
                             recents_synced: false,
                             font: Default::default(),
                             font_result: Rc::new(std::cell::RefCell::new(None)),
+                            space_mouse: SpaceMouse::default(),
                         }))
                     }),
                 )
                 .await;
             if let Some(el) = document.get_element_by_id(LOADING_ID) {
                 match result {
-                    Ok(()) => el.remove(),
+                    Ok(()) => dismiss_loading(el),
                     Err(e) => {
                         el.set_inner_html(&format!("<p>SolidCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>"))
                     }

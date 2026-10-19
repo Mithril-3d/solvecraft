@@ -353,6 +353,25 @@ impl Camera {
         self.yaw = (self.yaw + dx * 0.008) % std::f64::consts::TAU;
         self.pitch = (self.pitch + dy * 0.008).clamp(-lim, lim);
     }
+    /// Orbit by pixel deltas about `pivot`: the camera turns rigidly about it, so the pivot keeps
+    /// its place in the camera's frame and on screen, in perspective as in parallel views.
+    pub fn orbit_about(&mut self, dx: f64, dy: f64, pivot: Vec3) {
+        let keep = self.frame_coords(pivot);
+        self.orbit(dx, dy);
+        self.place(pivot, keep);
+    }
+    /// Where `p` lies from the target along the camera's right, up and back axes.
+    pub fn frame_coords(&self, p: Vec3) -> Vec3 {
+        let (r, u, b) = self.basis();
+        let d = p - self.target;
+        Vec3::new(d.dot(r), d.dot(u), d.dot(b))
+    }
+    /// Move the target so `p` lies at `coords` (from [`Camera::frame_coords`]) in the camera's
+    /// frame: with the distance unchanged, `p` is where it was on screen.
+    pub fn place(&mut self, p: Vec3, coords: Vec3) {
+        let (r, u, b) = self.basis();
+        self.target = p - (r * coords.x + u * coords.y + b * coords.z);
+    }
     /// Rotate the image about the viewing direction.
     pub fn roll_by(&mut self, radians: f64) {
         if radians.is_finite() {
@@ -431,6 +450,24 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Orbiting about a point keeps it on its pixel, with and without perspective and roll.
+    #[test]
+    fn orbit_about_keeps_the_pivot_on_screen() {
+        let pivot = Vec3::new(12.0, -7.0, 9.0);
+        for fov in [0.0, 0.6] {
+            for roll in [0.0, 0.4] {
+                let mut cam = Camera { target: Vec3::new(3.0, 4.0, -2.0), distance: 150.0, yaw: 0.3, pitch: 0.5, roll, fov, ..Camera::default() };
+                let before = cam.to_screen(pivot, 800.0, 600.0, 100.0).unwrap();
+                for _ in 0..10 {
+                    cam.orbit_about(25.0, -12.0, pivot);
+                }
+                let after = cam.to_screen(pivot, 800.0, 600.0, 100.0).unwrap();
+                assert!((after.0 - before.0).abs() < 1e-6 && (after.1 - before.1).abs() < 1e-6, "fov {fov}, roll {roll}: {before:?} -> {after:?}");
+                assert!((cam.eye() - pivot).len() > 1.0);
+            }
+        }
+    }
 
     #[test]
     fn front_view_projects_target_to_centre() {

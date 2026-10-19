@@ -89,6 +89,15 @@ pub(crate) fn pin_icon(p: &egui::Painter, r: Rect, on: bool, col: Color32) {
     p.line_segment([at(0.0, -2.0), at(0.0, 7.0)], stroke);
 }
 
+/// A breadcrumb separator ("Sketch › Create"): a thin chevron about 3 by 6 px, centred on `c`.
+/// Drawn rather than typed, because a font's "›" sits on the baseline in some languages
+/// (Japanese), where it reads as a comma.
+pub(crate) fn breadcrumb(p: &egui::Painter, c: egui::Pos2, col: Color32) {
+    let s = Stroke::new(1.0, col);
+    p.line_segment([pos2(c.x - 1.5, c.y - 3.0), pos2(c.x + 1.5, c.y)], s);
+    p.line_segment([pos2(c.x + 1.5, c.y), pos2(c.x - 1.5, c.y + 3.0)], s);
+}
+
 pub(crate) fn caret(p: &egui::Painter, c: egui::Pos2, col: Color32) {
     p.add(egui::Shape::convex_polygon(vec![pos2(c.x - 3.5, c.y - 2.0), pos2(c.x + 3.5, c.y - 2.0), pos2(c.x, c.y + 2.5)], col, Stroke::NONE));
 }
@@ -100,7 +109,7 @@ pub(crate) fn brand_mark(p: &egui::Painter, c: Pos2) {
     let face = |col: Color32, pts: &[(f32, f32)]| {
         p.add(egui::Shape::convex_polygon(m(pts), col, Stroke::NONE));
     };
-    let (light, mid, dark) = (Color32::from_rgb(96, 158, 236), Color32::from_rgb(58, 136, 238), Color32::from_rgb(55, 108, 197));
+    let [light, mid, dark, edge_col] = crate::theme::Tokens::get().logo;
     face(light, &[(3.5, 105.9), (177.0, 5.8), (263.4, 55.6), (263.8, 156.0), (177.0, 406.4)]);
     face(light, &[(177.0, 206.1), (263.8, 156.0), (350.5, 206.2), (350.5, 306.3), (177.0, 406.4)]);
     face(mid, &[(3.5, 105.9), (177.0, 206.1), (177.0, 406.4)]);
@@ -111,7 +120,7 @@ pub(crate) fn brand_mark(p: &egui::Painter, c: Pos2) {
     face(dark, &[(177.0, 206.1), (177.0, 406.4), (350.5, 306.3)]);
     face(dark, &[(263.8, 55.9), (263.8, 156.0), (177.1, 105.9)]);
     // White edge lines.
-    let edge = Stroke::new(10.0 * s, Color32::WHITE);
+    let edge = Stroke::new(10.0 * s, edge_col);
     let line = |pts: &[(f32, f32)]| {
         p.add(egui::Shape::line(m(pts), edge));
     };

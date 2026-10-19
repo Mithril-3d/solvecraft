@@ -1,15 +1,17 @@
 //! Workspace tooling: `cargo xtask <command>`.
 //!
-//! Pure Rust (std, serde_json and sha2). External tools (`cargo`) are invoked through
-//! `std::process::Command`.
+//! Rust workspace tooling. External tools (`cargo`, and Python 3.11+ for the
+//! original icon collection) are invoked through `std::process::Command`.
 
 mod app_icons;
 mod assets;
 mod book;
 mod features;
 mod i18n;
+mod icons;
 mod layers;
 mod licences;
+mod lists;
 mod test;
 mod web_offline;
 mod web_offline_test;
@@ -24,6 +26,7 @@ commands:
   layers          enforce the crate dependency layering (plan/architecture.md §3)
   assets          check that every non-code asset file is attributed in ATTRIBUTION.md
   app-icons       regenerate shared app-icon exports for Linux, FreeBSD and Windows
+  icons           validate UI icon standards, discovery and review-tool behavior (Python 3.11+)
   features        list SolidCraft's commands by area in docs/features.md (from the registry)
   i18n [--check | --add-missing]
                   report how complete the message catalogs in assets/locales are:
@@ -35,16 +38,21 @@ commands:
                   replay the reference tests (tests/oracle/*/recipe.json), compare with each
                   case's expected.json and write docs/oracle.md (--cli: a solidcraft-cli
                   already built, instead of cargo run --release)
-  action-matrix [--bless] [--results FILE]
+  action-matrix [--bless] [--results FILE] [--from DIR]
                   try every ordinary action on every face, edge, vertex and body of the design
                   corpus and compare with tests/action_matrix/baseline.json (--bless rewrites it;
-                  --results keeps every outcome with its message). See docs/action-matrix.md
+                  --results keeps every outcome with its message; --from takes the outcomes of the
+                  nightly shards' artifacts in DIR instead of running, and --bless then also
+                  rewrites tests/action_matrix/costs.json). See docs/action-matrix.md
   book [--no-build]
                   generate docs/book's command reference and screenshots, then mdbook build
                   into target/book
   licences [--check]
                   write THIRD-PARTY-LICENSES.txt (the licences of every shipped crate, embedded
-                  in the programs); --check fails when it is out of date
+                  in the programs); --check only reports when it is out of date: pull requests
+                  leave it to the Generated files workflow on main
+  lists [--fix]   check that files many changes add to are sorted one item per line (the
+                  message catalogs in assets/locales); --fix sorts them
   test [CARGO ARGS] [-- TEST ARGS]
                   build the tests with the ci profile, then run every test binary at once
                   (and the doc tests alongside)
@@ -52,10 +60,11 @@ commands:
   web-offline [DIR]
                   write the web build's service worker (sw.js: offline use, updates); run by
                   Trunk after release builds of apps/solidcraft-web, or on a built site in DIR
+  web-api-test [--site DIR]  Test the command API in a real browser build (default: dist/web)
   web-offline-test [--site DIR]
                   check in headless Chrome that the web app works offline and updates to a new
                   build (a stand-in app, or the web build in DIR such as dist/web)
-  ci              fmt --check, assets, licences --check, layers, clippy -D warnings, then the tests
+  ci              fmt --check, assets, icons, licences --check, lists, layers, clippy -D warnings, then the tests
                   with the wasm check alongside, then web-offline-test when Chrome is installed
                   (stops at the first failing step)
 ";
@@ -66,15 +75,18 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("layers") => cmd_layers(),
         Some("assets") => assets::run(&root()),
+        Some("icons") => icons::run(&root()),
         Some("app-icons") => app_icons::run(&root()),
         Some("features") => features::run(&root()),
         Some("i18n") => i18n::run(&root(), &rest),
         Some("oracle") => cmd_oracle(rest.iter().position(|a| *a == "--cli").and_then(|i| rest.get(i + 1)).copied()),
         Some("action-matrix") => {
-            cmd_action_matrix(rest.contains(&"--bless"), rest.iter().position(|a| *a == "--results").and_then(|i| rest.get(i + 1)).copied())
+            let arg = |name: &str| rest.iter().position(|a| *a == name).and_then(|i| rest.get(i + 1)).copied();
+            cmd_action_matrix(rest.contains(&"--bless"), arg("--results"), arg("--from"))
         }
         Some("book") => book::run(&root(), !rest.contains(&"--no-build")),
         Some("licences") => licences::run(&root(), rest.contains(&"--check")),
+        Some("lists") => lists::run(&root(), rest.contains(&"--fix")),
         Some("test") => {
             let (cargo_args, test_args) = rest.iter().position(|a| *a == "--").map_or((&rest[..], &[][..]), |i| (&rest[..i], &rest[i + 1..]));
             test::run(cargo_args, test_args, vec![test::doc_tests(cargo_args, test_args)])
@@ -85,6 +97,10 @@ fn main() -> ExitCode {
         Some("web-offline-test") => {
             let site = rest.iter().position(|a| *a == "--site").and_then(|i| rest.get(i + 1)).copied();
             web_offline_test::run(&root(), site, true)
+        }
+        Some("web-api-test") => {
+            let site = rest.iter().position(|a| *a == "--site").and_then(|i| rest.get(i + 1)).copied().unwrap_or("dist/web");
+            web_offline_test::run_api(site)
         }
         Some("-h" | "--help" | "help") | None => {
             print!("{USAGE}");
@@ -128,7 +144,7 @@ pub fn metadata() -> Result<serde_json::Value, String> {
 }
 
 /// The full action matrix (apps/solidcraft-cli/tests/action_matrix.rs), with the ci profile.
-fn cmd_action_matrix(bless: bool, results: Option<&str>) -> Result<(), String> {
+fn cmd_action_matrix(bless: bool, results: Option<&str>, from: Option<&str>) -> Result<(), String> {
     let mut c = cargo();
     c.args([
         "test",
@@ -150,6 +166,10 @@ fn cmd_action_matrix(bless: bool, results: Option<&str>) -> Result<(), String> {
     if let Some(r) = results {
         let p = std::path::absolute(r).map_err(|e| format!("{r}: {e}"))?;
         c.env("ACTION_MATRIX_RESULTS", p);
+    }
+    if let Some(d) = from {
+        let p = std::path::absolute(d).map_err(|e| format!("{d}: {e}"))?;
+        c.env("ACTION_MATRIX_MERGE", p);
     }
     run(c, "cargo test --profile ci -p solidcraft-cli --test action_matrix action_matrix_all")
 }
@@ -350,7 +370,9 @@ fn cmd_ci() -> Result<(), String> {
     c.args(["fmt", "--all", "--", "--check"]);
     run(c, "cargo fmt --check")?;
     assets::run(&root())?;
+    icons::run(&root())?;
     licences::run(&root(), true)?;
+    lists::run(&root(), false)?;
     cmd_layers()?;
     let mut c = cargo();
     c.args(["clippy", "--workspace", "--all-targets", "--profile", "ci", "--", "-D", "warnings"]);

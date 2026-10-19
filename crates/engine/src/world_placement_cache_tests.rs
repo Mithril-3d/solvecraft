@@ -175,3 +175,41 @@ fn adopted_scratch_keeps_its_warm_geometry_and_history_stages_invalidate_it() {
     run(&mut session, "timeline.suppress", json!({"feature":feature,"suppressed":false}));
     assert!(session.world_state().body("Draft").is_some());
 }
+
+/// A moved component's bodies keep their placed geometry and display mesh while the design
+/// changes elsewhere: each new body used to transform and mesh every body of every moved
+/// component again. A body that changes, or a placement that moves, is placed afresh.
+#[test]
+fn moved_component_bodies_are_not_placed_again_when_something_else_changes() {
+    let mut session = Session::default();
+    let created = run(&mut session, "component.create", json!({"name":"Wheel"}));
+    let occurrence = created["occurrence"].as_u64().unwrap();
+    run(&mut session, "solid.box", json!({"length":60,"width":60,"height":5,"body_name":"Rim"}));
+    run(&mut session, "component.activate", json!({"component":"root"}));
+    run(&mut session, "occurrence.move", json!({"occurrence":occurrence,"translate":[100,0,0]}));
+    let placed = session.world_state();
+    let rim = placed.bodies.iter().find(|b| b.source_name.as_deref() == Some("Rim")).unwrap().clone();
+    let mesh = rim.mesh();
+    assert!(mesh.bounds().min.dist(Vec3::new(100., 0., 0.)) < 1e-6);
+    // A body added elsewhere: the rim is the same placed body, already meshed.
+    run(&mut session, "solid.box", json!({"length":5,"width":6,"height":7,"body_name":"Frame"}));
+    let after = session.world_state();
+    let again = after.body(&rim.name).unwrap();
+    assert!(Arc::ptr_eq(&mesh, &again.mesh()), "an unchanged placed body keeps its mesh");
+    assert!(again.body.same(&rim.body));
+    // The placement moves: placed and meshed again where it now is.
+    run(&mut session, "occurrence.move", json!({"occurrence":occurrence,"translate":[0,50,0]}));
+    let moved = session.world_state();
+    let moved_rim = moved.bodies.iter().find(|b| b.source_name.as_deref() == Some("Rim")).unwrap();
+    assert!(!Arc::ptr_eq(&mesh, &moved_rim.mesh()));
+    assert!(moved_rim.mesh().bounds().min.dist(Vec3::new(100., 50., 0.)) < 1e-6);
+    // The body itself changes: placed again too, and the old snapshot is untouched.
+    run(&mut session, "body.rename", json!({"body":"Frame","name":"Frame tube"}));
+    let source = session.model.state().body("Rim").unwrap().clone();
+    let world = session.world_state();
+    let kept = world.bodies.iter().find(|b| b.source_name.as_deref() == Some("Rim")).unwrap();
+    assert!(Arc::ptr_eq(&moved_rim.mesh(), &kept.mesh()));
+    assert_eq!(kept.source_transform, moved_rim.source_transform);
+    assert!(source.mesh().bounds().min.dist(Vec3::ZERO) < 1e-6);
+    assert!(mesh.bounds().min.dist(Vec3::new(100., 0., 0.)) < 1e-6);
+}

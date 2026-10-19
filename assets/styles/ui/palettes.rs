@@ -1,6 +1,10 @@
 //! Original light and dark palette values. Compiled by the UI theme boundary.
-use crate::theme::Tokens;
+use crate::theme::{AnalysisColors, IconColors, Tokens};
 use egui::Color32;
+
+const fn icon_primary(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
 impl Tokens {
     pub const fn light() -> Tokens {
         Tokens {
@@ -13,7 +17,7 @@ impl Tokens {
             text_dim: Color32::from_rgb(110, 116, 128),
             accent: Color32::from_rgb(38, 120, 218),
             accent_soft: Color32::from_rgb(214, 230, 250),
-            sketch_accent: Color32::from_rgb(46, 150, 90),
+            sketch_accent: icon_primary(crate::icon_svg::SKETCH_PRIMARY[0]),
             error: Color32::from_rgb(214, 54, 54),
             warning: Color32::from_rgb(222, 150, 30),
             icon: Color32::from_rgb(70, 78, 92),
@@ -39,11 +43,12 @@ impl Tokens {
             axis_y: Color32::from_rgb(0, 255, 0),
             axis_z: Color32::from_rgb(2, 2, 248),
             construction_plane: Color32::from_rgba_unmultiplied_const(249, 184, 134, 70),
-            construction_geom: Color32::from_rgb(232, 140, 48),
+            construction_geom: icon_primary(crate::icon_svg::CONSTRUCTION_PRIMARY[0]),
             body: Color32::from_rgb(176, 186, 198),
             body_edge: Color32::from_rgb(40, 44, 52),
             manipulator: Color32::from_rgb(40, 110, 220),
             preview_add: Color32::from_rgb(112, 160, 226),
+            preview_new: Color32::from_rgb(240, 225, 105),
             preview_sketch: Color32::from_rgb(32, 190, 96),
             preview_cut: Color32::from_rgba_unmultiplied_const(232, 84, 44, 110),
             cube_face: Color32::from_rgb(236, 239, 244),
@@ -71,16 +76,60 @@ impl Tokens {
             profile_fill: Color32::from_rgba_unmultiplied_const(255, 196, 120, 70),
             glyph_bg: Color32::WHITE,
             glyph_edge: Color32::from_rgb(190, 110, 100),
-            glyph_text: Color32::from_rgb(150, 40, 35),
+            glyph_text: icon_primary(crate::icon_svg::CONSTRAINT_PRIMARY[0]),
             overlay: Color32::from_rgba_unmultiplied_const(255, 255, 255, 235),
             rubber_band: Color32::from_rgb(30, 120, 230),
             app_bar_text: Color32::from_rgb(230, 234, 242),
+            app_bar_hover: Color32::from_rgba_unmultiplied_const(255, 255, 255, 28),
             timeline_item: Color32::WHITE,
             timeline_item_error: Color32::from_rgb(250, 220, 220),
             timeline_marker: Color32::from_rgb(70, 76, 88),
             field: Color32::WHITE,
             box_window: Color32::from_rgb(38, 120, 218),
             box_crossing: Color32::from_rgb(40, 160, 80),
+            // Equal to `view::colors` (the engine's tags), so mapping a tag to its token
+            // changes nothing.
+            sketch_projected: Color32::from_rgb(150, 60, 190),
+            sketch_lost: Color32::from_rgb(200, 60, 90),
+            sketch_construction: Color32::from_rgb(230, 130, 40),
+            sketch_centerline: Color32::from_rgb(200, 110, 60),
+            triad: [Color32::from_rgb(220, 60, 60), Color32::from_rgb(60, 170, 60), Color32::from_rgb(60, 100, 230)],
+            gizmo: [Color32::from_rgb(225, 70, 60), Color32::from_rgb(80, 190, 80), Color32::from_rgb(70, 130, 240)],
+            bend_up: Color32::from_rgb(30, 140, 50),
+            bend_down: Color32::from_rgb(200, 90, 20),
+            interference: Color32::from_rgb(235, 45, 40),
+            continuity: [
+                Color32::from_rgb(0, 158, 115),
+                Color32::from_rgb(0, 114, 178),
+                Color32::from_rgb(240, 200, 0),
+                Color32::from_rgb(204, 0, 140),
+            ],
+            analysis: AnalysisColors::DEFAULT,
+            icons: IconColors {
+                sheet: Color32::from_rgb(170, 200, 240),
+                sheet_2: Color32::from_rgb(150, 185, 235),
+                sheet_light: Color32::from_rgb(214, 229, 248),
+                sheet_line: Color32::from_rgb(127, 166, 218),
+                highlight: Color32::WHITE,
+                glint: Color32::from_rgba_premultiplied(160, 160, 160, 160),
+                folder: Color32::from_rgb(236, 200, 110),
+                plane: Color32::from_rgb(244, 214, 150),
+                fold: Color32::from_rgb(130, 140, 160),
+                stripe: Color32::from_gray(30),
+                sky: Color32::from_rgb(190, 205, 230),
+                floor: Color32::from_rgb(60, 62, 70),
+                paint: [Color32::from_rgb(220, 70, 60), Color32::from_rgb(70, 150, 230), Color32::from_rgb(240, 200, 60)],
+                axes: [Color32::from_rgb(210, 60, 60), Color32::from_rgb(60, 160, 60), Color32::from_rgb(60, 100, 220)],
+                access: [Color32::from_rgb(70, 180, 90), Color32::from_rgb(220, 70, 60)],
+                draft: [Color32::from_rgb(70, 180, 90), Color32::from_rgb(235, 200, 50)],
+                curvature: [Color32::from_rgb(60, 110, 230), Color32::from_rgb(70, 190, 90), Color32::from_rgb(225, 60, 45)],
+                interference: Color32::from_rgb(225, 70, 60),
+                warning: Color32::from_rgb(250, 200, 60),
+                agent: Color32::from_rgb(168, 85, 247),
+                marker_halo: Color32::from_black_alpha(150),
+            },
+            app_bar_icon: [Color32::from_rgb(225, 230, 238), Color32::from_rgb(120, 140, 170), Color32::from_rgb(120, 190, 255)],
+            logo: [Color32::from_rgb(96, 158, 236), Color32::from_rgb(58, 136, 238), Color32::from_rgb(55, 108, 197), Color32::WHITE],
         }
     }
     pub const fn dark() -> Tokens {
@@ -94,7 +143,8 @@ impl Tokens {
         t.text_dim = Color32::from_rgb(148, 155, 168);
         t.accent = Color32::from_rgb(58, 136, 238);
         t.accent_soft = Color32::from_rgb(42, 70, 110);
-        t.sketch_accent = Color32::from_rgb(110, 200, 140);
+        t.sketch_accent = icon_primary(crate::icon_svg::SKETCH_PRIMARY[1]);
+        t.construction_geom = icon_primary(crate::icon_svg::CONSTRUCTION_PRIMARY[1]);
         t.error = Color32::from_rgb(240, 100, 96);
         t.warning = Color32::from_rgb(236, 170, 70);
         t.icon = Color32::from_rgb(208, 214, 226);
@@ -124,7 +174,7 @@ impl Tokens {
         t.subheading_bg = Color32::from_rgb(48, 55, 68);
         t.glyph_bg = Color32::from_rgb(44, 50, 60);
         t.glyph_edge = Color32::from_rgb(200, 130, 120);
-        t.glyph_text = Color32::from_rgb(240, 165, 155);
+        t.glyph_text = icon_primary(crate::icon_svg::CONSTRAINT_PRIMARY[1]);
         t.overlay = Color32::from_rgba_unmultiplied_const(34, 38, 46, 240);
         t.rubber_band = Color32::from_rgb(92, 160, 255);
         t.timeline_item = Color32::from_rgb(52, 58, 70);
@@ -133,6 +183,62 @@ impl Tokens {
         t.field = Color32::from_rgb(30, 34, 41);
         t.box_window = Color32::from_rgb(70, 150, 255);
         t.box_crossing = Color32::from_rgb(80, 200, 120);
+        t.bend_up = Color32::from_rgb(110, 200, 120);
+        t.bend_down = Color32::from_rgb(240, 150, 80);
+        t
+    }
+
+    /// Colour vision, red-green (Protan and Deutan share it, #778): values of the theme's colours
+    /// that a weak red or green sense still tells apart. Each was measured against normal vision,
+    /// protan and deutan, with two simulations of each loss (`colour_vision_tests`).
+    pub(super) const fn red_green(self, dark: bool) -> Tokens {
+        let mut t = self;
+        let positive = [0.20, 0.45, 0.90];
+        let negative = [0.85, 0.40, 0.05];
+        t.triad[0] = Color32::from_rgb(200, 40, 40);
+        t.triad[1] = Color32::from_rgb(120, 210, 80);
+        t.gizmo[1] = Color32::from_rgb(140, 220, 90);
+        t.preview_sketch = Color32::from_rgb(80, 185, 145);
+        t.analysis.draft = [positive, [0.95, 0.90, 0.60], negative];
+        t.analysis.access = [positive, negative];
+        t.analysis.hatch = true;
+        // The icons that show the same meanings follow; on the dark toolbar the blue is a little
+        // stronger, to stay clear of the icon fill.
+        let good = if dark { Color32::from_rgb(35, 115, 245) } else { Color32::from_rgb(51, 115, 230) };
+        t.icons.axes[0] = t.triad[0];
+        t.icons.axes[1] = t.triad[1];
+        t.icons.access = [good, Color32::from_rgb(217, 102, 13)];
+        t.construction_geom = icon_primary(crate::icon_svg::CONSTRUCTION_RED_GREEN[dark as usize]);
+        t.icons.draft = [good, Color32::from_rgb(242, 230, 153)];
+        if dark {
+            t.bend_up = Color32::from_rgb(110, 165, 255);
+            t.bend_down = Color32::from_rgb(240, 180, 70);
+            t.sketch_accent = icon_primary(crate::icon_svg::SKETCH_RED_GREEN[1]);
+        } else {
+            t.sketch_projected = Color32::from_rgb(205, 120, 215);
+            t.sketch_locked = Color32::from_rgb(60, 150, 120);
+            t.timeline_item_error = Color32::from_rgb(232, 196, 170);
+            t.bend_up = Color32::from_rgb(30, 100, 210);
+            t.bend_down = Color32::from_rgb(200, 120, 0);
+            t.sketch_accent = icon_primary(crate::icon_svg::SKETCH_RED_GREEN[0]);
+        }
+        t
+    }
+
+    /// Colour vision, blue-yellow (Tritan, #778), measured against normal vision and tritan.
+    pub(super) const fn blue_yellow(self, dark: bool) -> Tokens {
+        let mut t = self;
+        t.analysis.hatch = true;
+        t.preview_sketch = Color32::from_rgb(125, 180, 105);
+        t.glyph_text = icon_primary(crate::icon_svg::CONSTRAINT_BLUE_YELLOW[dark as usize]);
+        t.construction_geom = icon_primary(crate::icon_svg::CONSTRUCTION_BLUE_YELLOW[dark as usize]);
+        if dark {
+            t.sketch_locked = Color32::from_rgb(140, 225, 110);
+            t.box_crossing = Color32::from_rgb(240, 110, 170);
+        } else {
+            t.sketch_locked = Color32::from_rgb(20, 165, 70);
+            t.box_crossing = Color32::from_rgb(200, 60, 120);
+        }
         t
     }
 }

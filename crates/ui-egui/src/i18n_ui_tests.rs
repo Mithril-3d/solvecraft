@@ -22,13 +22,32 @@ fn japanese_dialog_keeps_english_scenario_handles() {
 }
 
 #[test]
+fn italian_dialog_keeps_english_scenario_handles() {
+    let mut h = Harness::new();
+    h.app.preferences.language = "it".into();
+    h.app.home.open = false;
+    h.call("ui.start", json!({"command":"sketch.create"}));
+    h.frames(3);
+    assert!(h.widget("Piano").is_some());
+    assert!(h.widget("Annulla").is_some());
+    assert!(!scenario::handles("dialog:Plane").is_empty());
+    assert_eq!(crate::i18n::tr("ui.preferences"), "Preferences");
+
+    h.app.preferences.language = "en".into();
+    h.frames(3);
+    assert!(h.widget("Plane").is_some());
+    assert!(h.widget("Cancel").is_some());
+}
+
+#[test]
 fn sketch_palette_profile_and_points_rows_show_their_own_translation() {
     // ui.palette_profile / ui.palette_points are reached by id, not by the usual English-text
     // lookup (see the comment on sketch_palette::TOGGLES, and
     // i18n::tests::id_labels_resolve_to_their_own_translation_not_an_english_fallback for the
     // lookup itself). A broken id falls back to English silently rather than failing loudly, so
     // check the word actually on screen in each locale, not just that something renders.
-    for (lang, profile, points) in [("de", "Profil", "Punkte"), ("ja", "プロファイル", "点"), ("ko", "프로파일", "점")] {
+    for (lang, profile, points) in [("de", "Profil", "Punkte"), ("ja", "プロファイル", "点"), ("ko", "프로파일", "점"), ("uk", "Профіль", "Точки")]
+    {
         let mut h = Harness::new();
         h.app.preferences.language = lang.into();
         h.app.home.open = false;
@@ -64,6 +83,10 @@ fn window_chrome_renders_in_the_active_language() {
         ("ja", "ブラウザ", "選択フィルター", "面"),
         ("de", "BROWSER", "Auswahlfilter", "Flächen"),
         ("ko", "브라우저", "선택 필터", "면"),
+        ("ru", "БРАУЗЕР", "Фильтр выделения", "Грани"),
+        ("fr", "NAVIGATEUR", "Filtre de sélection", "Faces"),
+        ("it", "STRUTTURA", "Filtro di selezione", "Facce"),
+        ("uk", "БРАУЗЕР", "Фільтр виділення", "Грані"),
     ] {
         let mut h = Harness::new();
         h.app.preferences.language = lang.into();
@@ -77,6 +100,115 @@ fn window_chrome_renders_in_the_active_language() {
         h.frames(2);
         assert!(h.widget(filter).is_some(), "{lang}: the selection filter must show {filter:?}");
         assert!(h.widget(faces).is_some(), "{lang}: the Faces checkbox must show {faces:?}");
+    }
+}
+
+/// The start page's two big buttons had a fixed width, so a translation longer than the English
+/// label ran past the edge ("Nouvelle conception"). Every registered language's label must stay
+/// inside its button.
+#[test]
+fn home_page_buttons_fit_their_translated_labels() {
+    fn collect(shape: &egui::Shape, rects: &mut Vec<egui::Rect>, texts: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Rect(r) => rects.push(r.rect),
+            egui::Shape::Text(t) => texts.push((t.galley.job.text.clone(), egui::Rect::from_min_size(t.pos, t.galley.size()))),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, rects, texts)),
+            _ => {}
+        }
+    }
+    for catalog in crate::i18n::LOCALES {
+        let mut h = Harness::new();
+        h.app.preferences.language = catalog.id.into();
+        let rev = h.app.session.revision;
+        h.app.home.show(rev);
+        h.frames(2);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut out = h.ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| h.app.ui(ui));
+        out.textures_delta.clear();
+        let (mut rects, mut texts) = (Vec::new(), Vec::new());
+        out.shapes.iter().for_each(|shape| collect(&shape.shape, &mut rects, &mut texts));
+        let locale = crate::i18n::Locale::for_language(catalog.id);
+        for id in ["ui.new_design", "home.open"] {
+            let label = locale.text(id);
+            let (_, text) = texts.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("{}: {label:?} is not painted", catalog.id));
+            let button = rects
+                .iter()
+                .filter(|r| (r.height() - 64.0).abs() < 1.0 && r.contains(text.left_center()))
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .unwrap_or_else(|| panic!("{}: no button around {label:?}", catalog.id));
+            assert!(text.right() <= button.right(), "{}: {label:?} ends at {} past its button's edge {}", catalog.id, text.right(), button.right());
+        }
+    }
+}
+
+/// The start page is the first thing a user sees. Its buttons, links, headings and cards were
+/// English literals, mostly painted rather than laid out as widgets, so check the text actually
+/// painted in each complete language: a broken message id falls back to English silently.
+#[test]
+fn home_page_renders_in_the_active_language() {
+    fn painted(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| painted(s, out)),
+            _ => {}
+        }
+    }
+    let cases = [
+        (
+            "it",
+            [
+                "Nuovo progetto",
+                "Apri…",
+                "Documentazione",
+                "Segnala un problema",
+                "Novità",
+                "Scorciatoie da tastiera",
+                "Preferenze",
+                "Recenti",
+                "Esempi",
+                "Piastra di esempio",
+            ],
+            "non presente\nAperto 2 h fa",
+        ),
+        (
+            "ja",
+            [
+                "新規デザイン",
+                "開く…",
+                "ドキュメント",
+                "問題を報告",
+                "新機能",
+                "キーボードショートカット",
+                "環境設定",
+                "最近使用した項目",
+                "サンプル",
+                "サンプル プレート",
+            ],
+            "見つかりません\n2 時間前に開きました",
+        ),
+        ("zh", ["新建设计", "打开…", "文档", "报告问题", "新功能", "键盘快捷键", "首选项", "最近使用", "示例", "示例板"], "文件不存在\n2 小时前打开"),
+    ];
+    for (lang, words, missing_recent) in cases {
+        let mut h = Harness::new();
+        h.app.preferences.language = lang.into();
+        let gone = h.dir.join("gone.solidcraft").to_string_lossy().into_owned();
+        h.app.home.add_recent(&gone);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        h.app.home.opened_at.insert(gone, now - 2 * 3600);
+        let rev = h.app.session.revision;
+        h.app.home.show(rev);
+        h.frames(2);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut out = h.ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| h.app.ui(ui));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        out.shapes.iter().for_each(|shape| painted(&shape.shape, &mut texts));
+        for word in words.into_iter().chain([missing_recent]) {
+            assert!(texts.iter().any(|t| t == word), "{lang}: {word:?} must be painted, got {texts:?}");
+        }
+        for english in ["New Design", "Open…", "Documentation", "Report an Issue", "What's new", "Recent", "Samples", "Sample Plate"] {
+            assert!(!texts.iter().any(|t| t == english), "{lang}: {english:?} is still painted in English");
+        }
     }
 }
 
@@ -157,4 +289,35 @@ fn long_panel_label_wraps_centred_and_its_button_is_centred() {
     let lr = out.shapes.iter().find_map(|shape| hover_rect(&shape.shape, hover, label)).expect("the hovered label is highlighted");
     assert!(rows.iter().all(|row| lr.contains_rect(*row)), "the highlight holds both lines: {lr:?} {rows:?}");
     out.textures_delta.clear();
+}
+
+/// The Interference dialog's title, input and Compute button come from the catalogs: they were
+/// English in every language.
+#[test]
+fn interference_dialog_renders_in_the_active_language() {
+    let mut h = Harness::new();
+    h.app.preferences.language = "fr".into();
+    h.app.home.open = false;
+    h.call("ui.start", json!({"command":"inspect.interference"}));
+    h.frames(3);
+    for word in ["INTERFÉRENCE", "Corps (tous si aucun)", "Calculer"] {
+        assert!(h.widget(word).is_some(), "{word:?} must be shown");
+    }
+    for english in ["INTERFERENCE", "Bodies (all if none)", "Compute"] {
+        assert!(h.widget(english).is_none(), "{english:?} is still shown in English");
+    }
+    let fr = crate::i18n::Locale::for_language("fr");
+    assert_eq!(fr.format("dialog.bodies_count", &[("count", "3")]), "3 corps");
+    assert_eq!(fr.text("dialog.compute_again"), "Recalculer");
+}
+
+/// The continuity legend's Gap (an opening between faces) and the sheet-metal hem's gap are
+/// different words in some languages, so each has its own message.
+#[test]
+fn continuity_gap_and_sheet_metal_gap_are_separate_messages() {
+    for (lang, legend, sheet) in [("fr", "Écart", "Jeu"), ("de", "Lücke", "Spalt")] {
+        let locale = crate::i18n::Locale::for_language(lang);
+        assert_eq!(locale.text("ui.continuity_gap"), legend, "{lang}");
+        assert_eq!(locale.text("ui.sheet_gap"), sheet, "{lang}");
+    }
 }

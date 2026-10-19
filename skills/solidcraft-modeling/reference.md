@@ -74,11 +74,11 @@ Distances are unsigned. Draw the geometry on the correct side first, and the dim
 | `solid.cylinder` | `radius` or `diameter`, `height` | `base` is the centre of the bottom (default origin), `axis` defaults to `Z`. Expressions work in `base`. Always pass `operation`. |
 | `sketch.slot.overall` / `sketch.slot.center_to_center` | `p0`, `p1` (overall ends / arc centres), `width` | Ids and dof are in the "Ids" section above. |
 | `solid.fillet` / `solid.chamfer` | `edges:[[x,y,z]]`, `radius` / `distance` | The pick snaps to the **nearest** edge, with no distance limit and no error, so check that the face count changed. One pick takes the whole tangent chain: a rounded rim needs 1 point, not 8. |
-| `solid.shell` | `faces:[[x,y,z]]`, `thickness` | A point on each face to remove. Fillet first, except an edge of a removed face (see Order in `SKILL.md`). |
-| `solid.hole` | `position:[x,y,z]` on a face + `diameter`, or `sketch` (+ `points`) | `clearance:"M3"`. `depth` defaults to through all. `type` is one of simple/drilled/counterbore/countersink. A `countersink` needs `cs_diameter` and `cs_angle`; a `counterbore` needs `cb_diameter` and `cb_depth`. `position` is a fixed point. |
+| `solid.shell` | `faces:[[x,y,z]]`, `thickness` | A point on each face to remove, or its name from `body_topology`. Fillet first, except an edge of a removed face (see Order in `SKILL.md`). |
+| `solid.hole` | `position:[x,y,z]` on a face (numbers or length expressions such as `["40", "width/2", "t"]`, which the hole then follows) + `diameter`, or `sketch` (+ `points`) | `clearance:"M3"`. `depth` defaults to through all. `type` is one of simple/drilled/counterbore/countersink. A `countersink` needs `cs_diameter` and `cs_angle`; a `counterbore` needs `cb_diameter` and `cb_depth`. `position` is a fixed point. |
 | `solid.pattern.rectangular` | `features`, `dir1`, `count1`, `spacing1` (+ `dir2`, `count2`, `spacing2`) | Spacing takes expressions and follows parameters. |
 | `solid.pattern.circular` | `features`, `axis` (`"Z"` or `{origin, dir}`), `count` | `angle` defaults to 360 deg. A full pattern keeps the COM on the axis, so check its radius with a top-view screenshot. |
-| `solid.mirror` | `features:[names]`, `plane` (`XY`/`XZ`/`YZ`, a construction plane, or `{origin, normal}`) | Follows parameters. Mirror and pattern features cannot be mirrored or patterned again. |
+| `solid.mirror` | `features:[names]`, `plane` (`XY`/`XZ`/`YZ`, a construction plane, or `{origin, normal}` whose origin may use length expressions) | Follows parameters. Mirror and pattern features cannot be mirrored or patterned again. |
 
 - **Names:** name every feature (`"name":"Standoff"`) and keep names unique across sketches and features. `timeline.roll_to {"feature":"Plate"}` picks the first match, which can be the sketch.
 - **Counts as parameters:** `parameters.add {"name":"n","expression":"6","unit":""}` creates a unitless parameter, and `"count":"n"` uses it in a pattern.

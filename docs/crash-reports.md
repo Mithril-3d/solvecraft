@@ -6,6 +6,14 @@ and the exact commands that trigger it. Reports are never sent anywhere. To shar
 **Report…** in Help ▸ Crash Reports…, which opens a GitHub issue draft. Nothing is shared
 until you review and submit it, and the design is not part of the draft.
 
+To send a report:
+
+1. Review the title, report text and screenshot in SolidCraft, then click **Open GitHub draft**.
+   For long reports, SolidCraft copies the text to your clipboard; paste it into the GitHub draft.
+2. Attach the screenshot if you want to share it: use **Copy screenshot** and paste it into
+   GitHub, or use **Save screenshot…** and upload the PNG. Screenshots are not attached automatically.
+3. Click **Submit new issue** on GitHub to publish the report. Opening the draft alone does not send it.
+
 ## Where they are
 
 `<data dir>/solidcraft/crashes/`, next to the recovery folder:
@@ -50,7 +58,7 @@ A folder `crashes/<YYYYMMDD-HHMMSS>-<signature>/`:
     - `command_panic`: a command hit an internal error; it was caught and the design was left unchanged
     - `kernel_panic_recovered`: the third-party geometry kernel panicked and was caught. This is harmless on the desktop, but it would crash the web build.
     - `panic`: an internal error outside any command
-    - `unclean_exit`: the app ended without a hook seeing it (an abort, a stack overflow, a segfault, or the process being killed). It is found at the next start.
+    - `unclean_exit`: the app ended without a hook seeing it (an abort, a stack overflow, a segfault, a crash inside a graphics driver, or the process being killed). It is found at the next start. When the app died while starting up, the message and `location` name the startup step (see below). On Windows, a crash in native code also says the exception, the module it happened in and the offset into it.
   - `message`, `location` (file:line), `thread`
   - `backtrace`: frames `symbol (file:line)`, without the panic machinery, std internals or the user's home folder
   - `app` (version, commit, build date), `system` (OS, architecture, renderer and GPU), `session.uptime_s`
@@ -59,8 +67,24 @@ A folder `crashes/<YYYYMMDD-HHMMSS>-<signature>/`:
   - `base`: what the replay starts from (the design before the command, an autosave, a saved file or a new design)
   - `count`, `first_seen`, `last_seen`: the same crash repeats only increase `count`
   - `notes`: what is missing and why, for example a design too large to copy
+  - `startup_phase`: `{step, ms}` when the app died before it drew its first frame: the step it
+    was in (`window`, `graphics instance`, `window surface`, `adapter request`, `adapter chosen`,
+    `device creation`, `egui renderer (shader compile)`, `surface configure`, `app setup`,
+    `viewport pipelines (shader compile)`, `first frame`, `first frame (present)`) and how many
+    milliseconds after launch it began. `system.environment` names the renderer (backend, GPU,
+    driver) as soon as the adapter is picked, so it is there even when the device never started.
+  - `native` (Windows): what the exception filter caught: `code`, `name`, `address`, `module`,
+    `offset` (into the module), `detail` (for an access violation, the address read or written)
+    and `thread`. The `backtrace` then shows the same in two lines.
 - `design.solidcraft`: the design the replay starts from
 - `replay.json`: `{"commands": [{command, params}, …]}`
+- `minidump.dmp` (Windows, native crashes): the threads' stacks and the loaded modules at the
+  crash, for WinDbg or Visual Studio. It holds stack memory only, not the design, but it stays
+  on this computer like the rest of the report; share it only on request.
+
+A crash that ends the process without any exception (a fail-fast, which is how an abort ends on
+Windows) still gets the startup step. Windows can also keep its own dumps of every crash: set
+`DumpFolder` under `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps`.
 
 ## How it stays cheap and small
 

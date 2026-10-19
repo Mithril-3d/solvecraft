@@ -88,6 +88,16 @@ geometry, as it does for a face: it does not take whichever edge is nearest now.
 without a name, by a build that kept only the point, is found by the edge nearest its point, as
 it always was, and takes that edge's name when its sketch is next edited.
 
+A command that takes a face as a point can be given a name `model.faces` lists instead
+(`face.delete`, `solid.shell`, `solid.draft`, `solid.offset_face`, `solid.split_face`, the `faces`
+of `solid.replace_face`, the `face` of `sheet.convert`). It is found with the same lookup
+(`naming::locate_one`: the face with that name, or the one face answering to it, on the given
+body or any body; a name that finds several faces is refused). The command takes a point on that
+face (`naming::named_face_point`: the incentre of the face's roomiest triangle, moved onto the
+surface of a plane, cylinder, cone, sphere or torus), which the feature stores like a picked one,
+with the name it then gets as before. Nothing new is stored in the design. `model.faces` lists
+that point for every face.
+
 A hole placed by a position on a face is the exception to "the point nearest the reference's
 point": its position is a place, not a pick. The hole follows its face along its own axis, so it
 moves with the face when the face moves, and when the face no longer reaches the position it stays

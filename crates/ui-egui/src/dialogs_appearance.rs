@@ -6,6 +6,7 @@
 use egui::{Color32, RichText, Sense, Stroke, vec2};
 use serde_json::{Value, json};
 use solidcraft_engine::Sel;
+use solidcraft_engine::doc::pbr_appearance::PbrParameters;
 
 use crate::SolveApp;
 use crate::dialogs::{Kind, combo, row_label};
@@ -20,11 +21,12 @@ pub struct Look {
     pub category: String,
     pub color: [u8; 3],
     pub opacity: f64,
+    pub pbr: Option<PbrParameters>,
 }
 
 /// Built-in looks, used until the engine offers a library (`appearance.library`).
 fn builtin() -> Vec<Look> {
-    let l = |cat: &str, name: &str, c: [u8; 3], o: f64| Look { name: name.into(), category: cat.into(), color: c, opacity: o };
+    let l = |cat: &str, name: &str, c: [u8; 3], o: f64| Look { name: name.into(), category: cat.into(), color: c, opacity: o, pbr: None };
     vec![
         l("Metal", "Aluminum - Satin", [196, 199, 204], 1.0),
         l("Metal", "Steel - Brushed", [160, 164, 170], 1.0),
@@ -64,6 +66,7 @@ pub fn library(app: &mut SolveApp) -> Vec<Look> {
                     category: x.get("category").and_then(Value::as_str).unwrap_or("Library").to_string(),
                     color: parse_color(x.get("color")?)?,
                     opacity: x.get("opacity").and_then(Value::as_f64).unwrap_or(1.0),
+                    pbr: x.get("pbr").and_then(|p| serde_json::from_value(p.clone()).ok()),
                 })
             })
             .collect();
@@ -93,10 +96,12 @@ pub fn hex(c: [u8; 3]) -> String {
 
 #[derive(Clone, Debug)]
 pub struct Ap {
+    pub local: crate::dialogs_library::LocalLibrary,
     /// Apply to faces instead of bodies.
     pub faces: bool,
     pub color: [u8; 3],
     pub opacity: f64,
+    pub pbr: Option<PbrParameters>,
     /// The look picked last (its name), if the colour came from one.
     pub look: Option<String>,
     /// Library category shown (0: all).
@@ -136,9 +141,11 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         });
         (
             Kind::Appearance(Ap {
+                local: Default::default(),
                 faces,
                 color: existing.as_ref().map_or([196, 199, 204], |l| l.color),
                 opacity: existing.as_ref().map_or(1.0, |l| l.opacity),
+                pbr: existing.as_ref().and_then(|l| l.pbr),
                 look: existing.map(|l| l.name),
                 category: 0,
                 search: String::new(),
@@ -197,12 +204,16 @@ pub fn commands(k: &Ap, inputs: &[SelInput]) -> Vec<(String, Value)> {
     p.map(|p| vec![("appearance.assign".to_string(), p)]).unwrap_or_default()
 }
 
-fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
-    if let Some(component) = &k.component {
+pub(super) fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
+    let mut p = if let Some(component) = &k.component {
         Some(json!({"components": [component], "color": hex(k.color), "opacity": k.opacity, "appearance": k.look}))
     } else {
         apply_params(items, k.color, k.opacity, k.look.as_deref())
+    }?;
+    if let Some(pbr) = k.pbr {
+        p["pbr"] = json!(pbr);
     }
+    Some(p)
 }
 
 /// Removing an override restores the inherited component or material appearance.
@@ -212,6 +223,7 @@ fn clear_params(k: &Ap, items: &[Sel]) -> Option<Value> {
         obj.remove("appearance");
         obj.remove("color");
         obj.remove("opacity");
+        obj.remove("pbr");
     }
     Some(p)
 }
@@ -242,6 +254,7 @@ fn in_design(app: &mut SolveApp) -> Vec<(Look, usize)> {
                         category: "In This Design".into(),
                         color: parse_color(x.get("color")?)?,
                         opacity: x.get("opacity").and_then(Value::as_f64).unwrap_or(1.0),
+                        pbr: x.get("pbr").and_then(|p| serde_json::from_value(p.clone()).ok()),
                     },
                     count(x, "bodies") + count(x, "faces") + count(x, "components"),
                 ))
@@ -250,7 +263,7 @@ fn in_design(app: &mut SolveApp) -> Vec<(Look, usize)> {
     }
     let mut out: Vec<(Look, usize)> = Vec::new();
     for l in app.session.doc.appearances.bodies.values() {
-        let look = Look { name: l.name.clone(), category: "In This Design".into(), color: l.color, opacity: l.opacity };
+        let look = Look { name: l.name.clone(), category: "In This Design".into(), color: l.color, opacity: l.opacity, pbr: l.pbr };
         match out.iter_mut().find(|(x, _)| *x == look) {
             Some(e) => e.1 += 1,
             None => out.push((look, 1)),
@@ -345,10 +358,49 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
     row_label(ui, "Opacity");
     ui.spacing_mut().slider_width = 110.0;
     // Decimal formatting must not round a saved look merely by drawing its editor.
-    if ui.add(egui::Slider::new(&mut k.opacity, 0.0..=1.0).max_decimals_opt(None).custom_formatter(|value, _| format!("{value:.2}"))).changed() {
+    if ui
+        .add_enabled(
+            k.pbr.is_none(),
+            egui::Slider::new(&mut k.opacity, 0.0..=1.0).max_decimals_opt(None).custom_formatter(|value, _| format!("{value:.2}")),
+        )
+        .changed()
+    {
         k.remove_override = false;
     }
     ui.end_row();
+    row_label(ui, app.tr("appearance.surface_response"));
+    let mut enabled = k.pbr.is_some();
+    let toggle = ui.checkbox(&mut enabled, app.tr("appearance.pbr_opaque")).on_hover_text(app.tr("appearance.pbr_help"));
+    crate::scenario::publish_handle("appearance:pbr", toggle.rect.center());
+    if toggle.changed() {
+        k.pbr = enabled.then(PbrParameters::default);
+        if enabled {
+            k.opacity = 1.0;
+        }
+        k.remove_override = false;
+    }
+    ui.end_row();
+    if let Some(parameters) = k.pbr {
+        let mut metallic = parameters.metallic();
+        let mut roughness = parameters.roughness();
+        let mut ior = parameters.dielectric_ior();
+        for (label, handle, value, range) in [
+            ("appearance.metallic", "appearance:metallic", &mut metallic, 0.0..=1.0),
+            ("appearance.roughness", "appearance:roughness", &mut roughness, 0.045..=1.0),
+            ("appearance.dielectric_ior", "appearance:ior", &mut ior, 1.0..=3.0),
+        ] {
+            row_label(ui, app.tr(label));
+            let response = ui.add(egui::DragValue::new(value).range(range).speed(0.01).custom_parser(crate::prefs::parse_number));
+            crate::scenario::publish_handle(handle, response.rect.center());
+            if response.changed() {
+                k.remove_override = false;
+            }
+            ui.end_row();
+        }
+        if let Ok(parameters) = PbrParameters::new(metallic, roughness, ior) {
+            k.pbr = Some(parameters);
+        }
+    }
     row_label(ui, "");
     let picked: Vec<Sel> = inputs.first().map(|i| i.items.clone()).unwrap_or_default();
     ui.horizontal(|ui| {
@@ -382,6 +434,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         }
     });
     ui.end_row();
+    crate::dialogs_library::rows(app, ui, k, inputs);
     // In this design.
     let used = in_design(app);
     if !used.is_empty() {
@@ -393,7 +446,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
                 egui::Id::new(("ap_used", *i)),
                 look.color,
                 look.opacity,
-                k.color == look.color && k.opacity == look.opacity,
+                k.color == look.color && k.opacity == look.opacity && k.pbr == look.pbr,
                 &format!("{} · {n} item(s)", look.name),
                 look.clone(),
             )
@@ -401,6 +454,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
             {
                 k.color = look.color;
                 k.opacity = look.opacity;
+                k.pbr = look.pbr;
                 k.look = Some(look.name.clone());
                 k.remove_override = false;
             }
@@ -432,12 +486,13 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         ui.label(RichText::new(crate::i18n::tr_label("No matching appearances")).color(t.text_dim));
     }
     swatch_rows(ui, &shown, |ui, (i, l)| {
-        let picked_look = k.look.as_deref() == Some(l.name.as_str());
+        let picked_look = k.look.as_deref() == Some(l.name.as_str()) && k.pbr == l.pbr;
         if swatch(ui, egui::Id::new(("ap_lib", *i)), l.color, l.opacity, picked_look, &format!("{} (drag onto a body or face)", l.name), (*l).clone())
             .clicked()
         {
             k.color = l.color;
             k.opacity = l.opacity;
+            k.pbr = l.pbr;
             k.look = Some(l.name.clone());
             k.remove_override = false;
         }
@@ -449,9 +504,13 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         let targets = drop_target(app, k.faces);
         k.color = look.color;
         k.opacity = look.opacity;
+        k.pbr = look.pbr;
         k.look = Some(look.name.clone());
         k.remove_override = false;
-        if let Some(p) = apply_params(&targets, look.color, look.opacity, k.look.as_deref()) {
+        if let Some(mut p) = apply_params(&targets, look.color, look.opacity, k.look.as_deref()) {
+            if let Some(pbr) = look.pbr {
+                p["pbr"] = json!(pbr);
+            }
             k.note = Some(match app.run("appearance.assign", p.clone()) {
                 Ok(_) => {
                     k.applied = Some(p);
@@ -495,6 +554,32 @@ mod tests {
         s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
         s.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5, "corner": [20, 0, 0]})).unwrap();
         SolveApp::new(s, Services::default())
+    }
+
+    #[test]
+    fn clicked_pbr_editor_commits_once_and_reopens_without_changing_mass() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.resize", json!({"width":1600,"height":1400}));
+        h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        let mass = h.app.session.execute("component.properties", &json!({})).unwrap();
+        let before = h.app.session.undo.len();
+        h.app.start("appearance.assign");
+        h.frames(3);
+        h.step(&json!({"click":{"handle":"appearance:pbr"}})).unwrap();
+        h.step(&json!({"widget":"Apply to selection"})).unwrap();
+        assert!(h.app.session.doc.appearances.bodies["Body1"].pbr.is_some());
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        h.step(&json!({"widget":"OK"})).unwrap();
+        assert_eq!(h.app.session.undo.len(), before + 1);
+        assert_eq!(h.app.session.execute("component.properties", &json!({})).unwrap(), mass);
+        h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+        h.app.start("appearance.assign");
+        let Kind::Appearance(k) = &h.app.dialog.as_ref().unwrap().kind else { panic!("appearance editor") };
+        assert_eq!(k.pbr, Some(PbrParameters::default()));
+        assert_eq!(k.opacity, 1.0);
+        let params = selected_params(k, &h.app.dialog.as_ref().unwrap().inputs[0].items).unwrap();
+        assert_eq!(params["pbr"]["roughness"], 0.5);
     }
 
     #[test]

@@ -223,7 +223,8 @@ fn text_in_a_font_closes_into_profiles_with_counters() {
     let folder = Folder::new("profiles");
     let (at, height) = (v(10.0, 20.0), 7.0);
     let font = folder.font();
-    let source = LinkSource::Text { text: "O".into(), at, height, angle: 0.0, font: Some(font.clone()), style: Default::default() };
+    let source =
+        LinkSource::Text { text: "O".into(), at, height, angle: 0.0, font: Some(font.clone()), style: Default::default(), exprs: Default::default() };
     let mut sk = Sketch::new();
     sk.add_link(LinkKind::Text, source, &text_geometry_in(Some(&font), "O", at, height, 0.0).unwrap()).unwrap();
     // The block with the counter in it is 8 x 7 mm minus 4 x 3 mm; the counter is a region of its own.
@@ -303,6 +304,7 @@ fn a_font_is_kept_in_the_design_and_old_designs_read_without_one() {
         angle: 0.0,
         font: font.map(str::to_string),
         style: Default::default(),
+        exprs: Default::default(),
     };
     // No font: nothing is written, so the text of a design reads and writes as it did before fonts, and a design saved
     // before them reads as text in the built-in font.

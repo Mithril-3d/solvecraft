@@ -12,11 +12,34 @@ use crate::Document;
 
 /// A look: a name (a library entry's, or "Custom"), sRGB colour and opacity (1 = opaque).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "LookWire")]
 pub struct Look {
     pub name: String,
     pub color: [u8; 3],
     #[serde(default = "opaque")]
     pub opacity: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pbr: Option<crate::pbr_appearance::PbrParameters>,
+}
+
+#[derive(Deserialize)]
+struct LookWire {
+    name: String,
+    color: [u8; 3],
+    #[serde(default = "opaque")]
+    opacity: f64,
+    #[serde(default)]
+    pbr: Option<crate::pbr_appearance::PbrParameters>,
+}
+
+impl TryFrom<LookWire> for Look {
+    type Error = String;
+    fn try_from(value: LookWire) -> std::result::Result<Self, Self::Error> {
+        if value.pbr.is_some() && value.opacity != 1.0 {
+            return Err("opaque PBR requires opacity 1; refraction/transmission is not supported".into());
+        }
+        Ok(Self { name: value.name, color: value.color, opacity: value.opacity, pbr: value.pbr })
+    }
 }
 
 fn opaque() -> f64 {
@@ -25,7 +48,13 @@ fn opaque() -> f64 {
 
 impl Look {
     pub fn custom(color: [u8; 3], opacity: f64) -> Look {
-        Look { name: "Custom".into(), color, opacity: opacity.clamp(0.0, 1.0) }
+        Look { name: "Custom".into(), color, opacity: opacity.clamp(0.0, 1.0), pbr: None }
+    }
+    pub fn opaque_surface(&self) -> crate::Result<Option<solidcraft_render::surface::OpaqueSurface>> {
+        if self.pbr.is_some() && self.opacity != 1.0 {
+            return Err(crate::DocError::Invalid("opaque PBR requires opacity 1".into()));
+        }
+        self.pbr.map(|p| p.surface(self.color).map_err(|e| crate::DocError::Invalid(e.to_string()))).transpose()
     }
     /// Colour as 0–1 fractions.
     pub fn rgb(&self) -> [f32; 3] {
@@ -109,14 +138,19 @@ pub use defaults::LIBRARY;
 
 /// A library appearance by name (case-insensitive).
 pub fn library(name: &str) -> Option<Look> {
-    LIBRARY.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim())).map(|(n, c, o)| Look { name: n.to_string(), color: *c, opacity: *o })
+    LIBRARY.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim())).map(|(n, c, o)| Look {
+        name: n.to_string(),
+        color: *c,
+        opacity: *o,
+        pbr: None,
+    })
 }
 
 /// The look a physical material gives a body that has no appearance of its own.
 pub fn material_look(material: &str) -> Option<Look> {
     let color = crate::material_color(material)?;
     let opacity = if material == "Glass" { 0.25 } else { 1.0 };
-    Some(Look { name: material.to_string(), color, opacity })
+    Some(Look { name: material.to_string(), color, opacity, pbr: None })
 }
 
 impl Document {
@@ -162,12 +196,12 @@ impl Document {
     pub fn face_colors(&self, b: &crate::ModelBody) -> Vec<(usize, Look)> {
         // Face colours the body was imported with, under the design's own.
         let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let names = crate::naming::face_names(b);
         let mut out: Vec<(usize, Look)> = match b.body.paint() {
             Some(p) => p.faces.iter().map(|f| (f.face, Look::custom(f.color.map(to8), f.opacity as f64))).collect(),
-            // Carried from an earlier version of the body: by face name.
+            // Carried from an earlier version of the body: by face name (worked out only here:
+            // the viewport asks every body for its face colours on every change).
             None => match &b.imported {
-                Some(imp) => names
+                Some(imp) => crate::naming::face_names(b)
                     .iter()
                     .enumerate()
                     .filter_map(|(i, n)| imp.faces.get(crate::naming::strip_piece(n)).map(|(c, o)| (i, Look::custom(c.map(to8), *o as f64))))

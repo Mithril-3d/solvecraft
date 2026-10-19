@@ -738,7 +738,7 @@ def main():
     mcp.send("notifications/initialized", notify=True)
     d = Demo(a.port, mcp, open(a.log, "w") if a.log else None, a.speed, a.minimum_caption)
     # The pi story's camera moves orbit about the point under the pointer (Preferences > Navigation).
-    d.ui("ui.prefs", {"language": "en", "theme": "dark", "ui_scale": 1, "nav": "fusion", "orbit_cursor": a.story.startswith("pi"), "button": "apply"})
+    d.ui("ui.prefs", {"language": "en", "theme": "dark", "ui_scale": 1, "nav": "fusion", "orbit_around": "cursor" if a.story.startswith("pi") else "view_centre", "button": "apply"})
     d.ui("ui.resize", {"width": 1920, "height": 1080})
     d.ui("ui.home", {"open": False})
     d.ui("ui.documents", {"action": "new"})

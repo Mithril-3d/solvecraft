@@ -92,7 +92,7 @@ fn extent(f: &Value, p: &mut Value) {
         "symmetric" => {
             let full = e.get("is_full_length").and_then(Value::as_bool).unwrap_or(false);
             p["direction"] = json!("symmetric");
-            p["distance"] = if full { json!(format!("({}) / 2", expr_text(&dist))) } else { dist };
+            p["distance"] = if full { dist } else { json!(format!("({}) * 2", expr_text(&dist))) };
         }
         "two_sides" => {
             p["distance"] = e.get("side1").cloned().unwrap_or(Value::Null);
@@ -296,6 +296,17 @@ pub fn to_script(recipe: &Value) -> Result<Value, String> {
             Some("sketch") => sketch_cmds(f, &mut out)?,
             Some("extrude") => {
                 let mut p = json!({"sketch": profile_sketch(f), "profiles": profiles_of(f), "operation": op(f), "name": name, "body_names": bodies});
+                // Thin: {sketch, curves, thickness, side?, thickness2?} instead of profiles.
+                if let (Some(thin), Some(params)) = (f.get("thin"), p.as_object_mut()) {
+                    params.remove("profiles");
+                    params.insert("thin".into(), json!(true));
+                    params.insert("sketch".into(), thin.get("sketch").cloned().unwrap_or(Value::Null));
+                    for key in ["curves", "thickness", "side", "thickness2"] {
+                        if let Some(v) = thin.get(key) {
+                            params.insert(key.into(), v.clone());
+                        }
+                    }
+                }
                 extent(f, &mut p);
                 out.push(json!({"command": "solid.extrude", "params": p}));
             }
@@ -412,6 +423,24 @@ pub fn to_script(recipe: &Value) -> Result<Value, String> {
                     "sketch": profile_sketch(f), "profiles": profiles_of(f), "path_sketch": path.get("sketch"), "path": path.get("curves"),
                     "operation": op(f), "name": name, "body_names": bodies}}));
             }
+            // A boundary surface: a loop of one sketch's curves (`sketch`, `curves`), or a network
+            // (`u`, `v`), as `surface.boundary` takes them.
+            Some("boundary_surface") => {
+                let mut p = json!({"name": name});
+                for k in ["sketch", "curves", "continuity", "u", "v", "operation"] {
+                    if let Some(v) = f.get(k) {
+                        p[k] = v.clone();
+                    }
+                }
+                if let Some(b) = bodies.as_array().and_then(|a| a.first()) {
+                    p["body_name"] = b.clone();
+                }
+                out.push(json!({"command": "surface.boundary", "params": p}));
+            }
+            Some("thicken") => out.push(json!({"command": "surface.thicken", "params": {
+                "bodies": f.get("bodies"), "thickness": f.get("thickness"), "symmetric": f.get("symmetric").cloned().unwrap_or(json!(false)),
+                "operation": op(f), "name": name}})),
+            Some("remove") => out.push(json!({"command": "solid.remove", "params": {"bodies": f.get("bodies"), "name": name}})),
             Some("shell") => {
                 let faces: Vec<Value> = f.get("faces_removed").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.get("point").cloned()).collect();
                 out.push(json!({"command": "solid.shell", "params": {"faces": faces, "thickness": f.get("inside_thickness"), "name": name}}));

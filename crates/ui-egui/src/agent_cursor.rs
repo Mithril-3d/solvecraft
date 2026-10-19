@@ -334,7 +334,7 @@ fn finish(app: &mut SolveApp, ctx: &egui::Context) {
 }
 
 /// The pointer's colour: a violet no part of the UI uses.
-use crate::icons::pointer::AGENT;
+use crate::icons::pointer::agent;
 
 /// Draw the pointer, its "Agent" tag and the click ripples over everything.
 pub fn paint(app: &SolveApp, ctx: &egui::Context) {
@@ -345,7 +345,7 @@ pub fn paint(app: &SolveApp, ctx: &egui::Context) {
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::new("sc_agent_cursor")));
     for (at, t0) in &app.agent.ripples {
         let k = ((app.now - t0) / 0.6).clamp(0.0, 1.0) as f32;
-        painter.circle_stroke(*at, 6.0 + 22.0 * k, Stroke::new(3.0 * (1.0 - k) + 0.5, AGENT.gamma_multiply(1.0 - k)));
+        painter.circle_stroke(*at, 6.0 + 22.0 * k, Stroke::new(3.0 * (1.0 - k) + 0.5, agent().gamma_multiply(1.0 - k)));
     }
     crate::icons::pointer::paint(&painter, p);
 }

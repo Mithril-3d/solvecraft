@@ -224,7 +224,7 @@ fn bare_numbers_beside_a_unitless_expression_stay_bare() {
     assert_eq!(inputs(&s, 0)[2], "(16) / (2 * 4)", "the revolutions");
     assert!(s.model.result(s.doc.features[0].id).is_some_and(|r| r.error.is_none()));
     run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 10, "center": ["2 * 5", 0, 0], "body_name": "B"}));
-    assert_eq!(s.doc.features[1].kind.point_expr().map(|p| p[0].clone()), Some("(2 * 5) - (20) / 2".to_string()));
+    assert_eq!(s.doc.features[1].kind.point_expr().map(|p| p[0].to_string()), Some("(2 * 5) - (20) / 2".to_string()));
     let b = shape(&mut s, "B");
     assert!(b.bbox[0].abs() < 1e-6 && (b.bbox[3] - 20.0).abs() < 1e-6, "{b:?}");
 }

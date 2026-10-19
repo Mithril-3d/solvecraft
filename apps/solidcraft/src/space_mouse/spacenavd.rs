@@ -1,0 +1,144 @@
+//! Reading a 3D mouse through `spacenavd` on Linux. The daemon owns the device and applies what
+//! `spnavcfg` sets (swapped and inverted axes, sensitivity, dead zones) before it hands the motion
+//! to its clients, so a program that reads the HID device itself bypasses that setup. Over its
+//! socket the daemon sends fixed 32-byte records: eight native-endian `i32`, the first the kind of
+//! record (0 for motion, then x y z rx ry rz and the milliseconds since the last record).
+//! Other records (button presses, from newer daemons also configuration changes) are ignored.
+//!
+//! The socket is plain file I/O, so no library is needed, and it needs no udev rule: the daemon
+//! is what has access to the device.
+
+use std::io::Read;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+
+use solidcraft_ui_egui::space_mouse::{Axes, FULL_SCALE};
+
+/// Where the daemon listens. `/var/run` is a link to `/run` on current systems.
+const SOCKETS: [&str; 2] = ["/var/run/spnav.sock", "/run/spnav.sock"];
+
+const RECORD_BYTES: usize = 32;
+
+/// What the daemon reports at full deflection (seen with a SpaceMouse Compact and a default
+/// sensitivity). Our axes are in the raw HID units of [`FULL_SCALE`].
+const DAEMON_FULL_SCALE: i64 = 500;
+
+pub fn connect() -> Option<UnixStream> {
+    SOCKETS.iter().find_map(|path| connect_to(Path::new(path)))
+}
+
+fn connect_to(path: &Path) -> Option<UnixStream> {
+    UnixStream::connect(path).ok()
+}
+
+/// The axes of one record, or `None` for a record that is not motion.
+///
+/// The daemon's frame is right-handed with x to the right, y away from the user and z up; ours is
+/// the device's raw one, x right, y towards the user and z down, so y and z (and the rotations
+/// about them) change sign. With nothing set in `spnavcfg` the two give the same motion; what
+/// the user swaps or inverts there then carries over.
+fn decode(record: &[u8; RECORD_BYTES]) -> Option<Axes> {
+    let mut data = [0_i32; 8];
+    for (slot, bytes) in data.iter_mut().zip(record.as_chunks::<4>().0) {
+        *slot = i32::from_ne_bytes(*bytes);
+    }
+    let [kind, x, y, z, rx, ry, rz, _period] = data;
+    (kind == 0).then(|| Axes {
+        translation: [unit(x), unit(-i64::from(y)), unit(-i64::from(z))],
+        rotation: [unit(rx), unit(-i64::from(ry)), unit(-i64::from(rz))],
+    })
+}
+
+/// A daemon value in our raw units. Out-of-range values stay in `i16`: they are input from another
+/// process.
+fn unit(value: impl Into<i64>) -> i16 {
+    let scaled = value.into() * i64::from(FULL_SCALE) / DAEMON_FULL_SCALE;
+    i16::try_from(scaled.clamp(i64::from(i16::MIN), i64::from(i16::MAX))).unwrap_or_default()
+}
+
+/// Hands every motion record to `publish` until the daemon closes the connection or fails. A
+/// partial record at the end is dropped.
+pub fn read(mut stream: impl Read, mut publish: impl FnMut(Axes)) {
+    let mut record = [0_u8; RECORD_BYTES];
+    loop {
+        match stream.read_exact(&mut record) {
+            Ok(()) => {
+                if let Some(axes) = decode(&record) {
+                    publish(axes);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                log::info!("3D mouse: spacenavd connection ended: {error}");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn record(data: [i32; 8]) -> [u8; RECORD_BYTES] {
+        let mut bytes = [0_u8; RECORD_BYTES];
+        for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(data) {
+            *chunk = value.to_ne_bytes();
+        }
+        bytes
+    }
+
+    #[test]
+    fn motion_records_become_axes_in_the_devices_raw_frame() {
+        // Full deflection of the daemon's x, y and z is the device's full scale, and y and z flip.
+        assert_eq!(decode(&record([0, 500, 500, 500, 0, 0, 0, 8])), Some(Axes { translation: [350, -350, -350], rotation: [0; 3] }));
+        // Rotations follow translations: right-handed in both frames, so ry and rz flip as y and z do.
+        assert_eq!(decode(&record([0, 0, 0, 0, 250, 250, 250, 8])), Some(Axes { translation: [0; 3], rotation: [175, -175, -175] }));
+        // Rest is a motion record of zeros.
+        assert_eq!(decode(&record([0, 0, 0, 0, 0, 0, 0, 1200])), Some(Axes::default()));
+    }
+
+    #[test]
+    fn what_spnavcfg_swaps_reaches_the_view() {
+        // The daemon sends a push away as y. With Y and Z swapped in spnavcfg it sends the same push
+        // as z, and the view gets a lift (raw z) instead of the zoom (raw y).
+        let before = decode(&record([0, 0, 500, 0, 0, 0, 0, 8])).map(|axes| axes.translation);
+        let after = decode(&record([0, 0, 0, 500, 0, 0, 0, 8])).map(|axes| axes.translation);
+        assert_eq!(before, Some([0, -350, 0]));
+        assert_eq!(after, Some([0, 0, -350]));
+    }
+
+    #[test]
+    fn other_records_and_hostile_values_are_harmless() {
+        // A button record (kind 1, press) and one of an unknown kind are not motion.
+        assert_eq!(decode(&record([1, 0, 1, 0, 0, 0, 0, 0])), None);
+        assert_eq!(decode(&record([7, 500, 500, 500, 500, 500, 500, 0])), None);
+        // Nothing overflows on the extremes of `i32`.
+        let extreme = decode(&record([0, i32::MIN, i32::MIN, i32::MAX, i32::MAX, i32::MIN, i32::MIN, -1]));
+        assert_eq!(extreme.map(|axes| axes.translation[0]), Some(i16::MIN));
+        assert_eq!(extreme.map(|axes| axes.translation[1]), Some(i16::MAX));
+        assert_eq!(extreme.map(|axes| axes.rotation[0]), Some(i16::MAX));
+    }
+
+    #[test]
+    fn a_stream_is_read_record_by_record_until_it_ends() {
+        let (mut daemon, client) = UnixStream::pair().expect("a socket pair");
+        let mut bytes = Vec::new();
+        bytes.extend(record([0, 100, 0, 0, 0, 0, 0, 8]));
+        bytes.extend(record([2, 1, 0, 0, 0, 0, 0, 0])); // a button release: skipped
+        bytes.extend(record([0, 0, 0, 0, 0, 0, 0, 900]));
+        bytes.extend([1, 2, 3]); // the daemon went away mid-record
+        daemon.write_all(&bytes).expect("written");
+        drop(daemon);
+        let mut seen = Vec::new();
+        read(client, |axes| seen.push(axes.translation));
+        assert_eq!(seen, [[70, 0, 0], [0, 0, 0]]);
+    }
+
+    #[test]
+    fn no_daemon_means_no_connection() {
+        let missing = std::env::temp_dir().join(format!("sc-no-spnav-{}.sock", std::process::id()));
+        assert!(connect_to(&missing).is_none());
+    }
+}

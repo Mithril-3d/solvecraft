@@ -283,3 +283,23 @@ fn an_angle_between_lines_takes_the_reading_nearest_its_value_and_reports_degree
     let d = run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "driven": true}));
     assert_eq!(d["unit"], "mm", "{d}");
 }
+
+#[test]
+fn symmetry_moves_a_free_line_between_two_fixed_lines() {
+    // #1796: with both mirrored lines fixed, the symmetry line between them (a free construction
+    // line) is the one to move; it was refused as "neither entity can move".
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [0, 20]], "ids": ["left"]}));
+    run(&mut s, "sketch.line", json!({"points": [[10, 0], [10, 20]], "ids": ["right"]}));
+    run(&mut s, "sketch.line", json!({"points": [[3, 0], [3, 20]], "construction": true, "ids": ["mid"]}));
+    run(&mut s, "sketch.constraint.fix", json!({"entities": ["left", "right"]}));
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": "left", "b": "right", "line": "mid"}));
+    let sk = sketch(&s);
+    let at = |r: &str| sk.point(sk.resolve_point(r).unwrap()).unwrap();
+    for end in ["mid.start", "mid.end"] {
+        assert!((at(end).x - 5.0).abs() < 1e-7, "{end} at {:?}", at(end));
+    }
+    for (end, x) in [("left.start", 0.0), ("left.end", 0.0), ("right.start", 10.0), ("right.end", 10.0)] {
+        assert!((at(end).x - x).abs() < 1e-9, "{end} moved to {:?}", at(end));
+    }
+}

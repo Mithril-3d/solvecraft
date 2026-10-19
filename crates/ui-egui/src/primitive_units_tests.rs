@@ -156,10 +156,10 @@ fn a_centimetre_design_shows_centimetres() {
 fn stored(h: &Harness, id: u64) -> Vec<String> {
     use solidcraft_engine::doc::FeatureKind;
     match h.app.session.doc.feature(id).map(|f| &f.kind) {
-        Some(FeatureKind::Box { length, width, height, .. }) => vec![length.clone(), width.clone(), height.clone()],
-        Some(FeatureKind::Cylinder { radius, height, .. }) => vec![radius.clone(), height.clone()],
-        Some(FeatureKind::Sphere { radius, .. }) => vec![radius.clone()],
-        Some(FeatureKind::Torus { major, minor, .. }) => vec![major.clone(), minor.clone()],
+        Some(FeatureKind::Box { length, width, height, .. }) => vec![length.to_string(), width.to_string(), height.to_string()],
+        Some(FeatureKind::Cylinder { radius, height, .. }) => vec![radius.to_string(), height.to_string()],
+        Some(FeatureKind::Sphere { radius, .. }) => vec![radius.to_string()],
+        Some(FeatureKind::Torus { major, minor, .. }) => vec![major.to_string(), minor.to_string()],
         other => panic!("not a primitive: {other:?}"),
     }
 }

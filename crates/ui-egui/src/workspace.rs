@@ -11,11 +11,17 @@ const ASSEMBLE: &[&str] = &[
     "component.create",
     "joint.create",
     "joint.as_built",
+    "component.insert_design",
     "joint.origin",
     "joint.rigid_group",
     "joint.drive",
     "joint.motion_link",
+    "joint.gear",
+    "joint.rack_pinion",
+    "joint.screw",
+    "joint.cam",
     "motion.study",
+    "motion.trace",
     "explode.create",
     "contact.enable_sets",
     "contact.enable_all",
@@ -115,6 +121,7 @@ pub fn layout<'a>(tab: &str, panel: &str, specs: &[&'a CommandSpec]) -> Option<(
             tab,
         ),
         ("SOLID", "CONFIGURE") => (&["parameters.change", "config.table"], 2, tab),
+        ("SKETCH", "PATTERN") => (&["sketch.mirror", "sketch.pattern.rectangular", "sketch.pattern.circular"], 3, tab),
         ("SOLID" | "SHEET METAL" | "PLASTIC", "ASSEMBLE") => (ASSEMBLE, 3, tab),
         ("SHEET METAL", "CREATE") => (SHEET_CREATE, 3, tab),
         ("SHEET METAL", "MODIFY") => (SHEET_MODIFY, 2, tab),
@@ -145,8 +152,9 @@ pub fn feature_icon(k: &FeatureKind) -> Option<&'static str> {
         FeatureKind::SheetConvert { .. } => "convert_sheet",
         FeatureKind::Boss { .. } => "boss",
         FeatureKind::Lip { .. } => "lip",
-        FeatureKind::SnapFit { .. } => "snap",
+        FeatureKind::SnapFit { .. } => "snap_fit",
         FeatureKind::Rest { .. } => "rest",
+        FeatureKind::Rib { web: true, .. } => "web",
         FeatureKind::Rib { .. } => "rib",
         _ => return None,
     })
@@ -193,7 +201,7 @@ mod tests {
         assert!(h.widget("Add Row").is_some());
     }
 
-    /// Fusion's layout: joints on every tab's ASSEMBLE panel, sheet metal and plastic tabs
+    /// Layout: joints on every tab's ASSEMBLE panel, sheet metal and plastic tabs
     /// reach the shared solid commands, the plastic rules sit on SETUP.
     #[test]
     fn tabs_share_commands_in_fusion_order() {
@@ -211,5 +219,37 @@ mod tests {
         assert!(p.contains(&"plastic.boss") && p.contains(&"solid.rib") && p.contains(&"plastic.lip"));
         assert!(ids("PLASTIC", "MODIFY").contains(&"solid.shell"));
         assert!(panels("PLASTIC").is_some_and(|p| p.first() == Some(&"SETUP")));
+    }
+
+    /// #1240: a saved part reaches an assembly from the ASSEMBLE panel (and the File menu) as a
+    /// linked component, and a STEP file picked there is inserted as Insert STEP would.
+    #[test]
+    fn insert_design_is_on_the_assemble_panel_and_inserts_a_saved_part() {
+        use serde_json::json;
+        for tab in ["SOLID", "SHEET METAL", "PLASTIC"] {
+            assert!(ids(tab, "ASSEMBLE").contains(&"component.insert_design"), "{tab}");
+        }
+        assert!(!ids("SOLID", "ASSEMBLE")[..3].contains(&"component.insert_design"), "Component, Joint and As-built Joint keep the big buttons");
+        let mut h = crate::scenario::Harness::new();
+        let part = h.dir.join("part1.solidcraft");
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30})).unwrap();
+        s.execute("file.save", &json!({"path": part})).unwrap();
+        s.execute("file.export", &json!({"path": h.dir.join("part2.step")})).unwrap();
+        h.step(&json!({"choose_file": "part1.solidcraft"})).unwrap();
+        h.step(&json!({"start": "component.insert_design"})).unwrap();
+        h.frames(3);
+        let links = h.app.session.execute("component.links", &json!({})).unwrap();
+        assert_eq!(links["links"][0]["name"], "part1", "{links}");
+        assert_eq!(h.app.session.world_state().bodies.len(), 1);
+        h.step(&json!({"choose_file": "part2.step"})).unwrap();
+        h.step(&json!({"start": "component.insert_design"})).unwrap();
+        for _ in 0..600 {
+            if h.app.session.world_state().bodies.len() == 2 {
+                break;
+            }
+            h.frames(1);
+        }
+        assert_eq!(h.app.session.world_state().bodies.len(), 2, "the STEP file's body is inserted");
     }
 }

@@ -25,7 +25,15 @@ fn sampler_keeps_style_precedence_hidden_references_text_and_disjoint_parts() {
     let text = sk
         .add_link(
             LinkKind::Text,
-            LinkSource::Text { text: "A".into(), at: Vec2::ZERO, height: 2., angle: 0., font: None, style: Default::default() },
+            LinkSource::Text {
+                text: "A".into(),
+                at: Vec2::ZERO,
+                height: 2.,
+                angle: 0.,
+                font: None,
+                style: Default::default(),
+                exprs: Default::default(),
+            },
             &[LinkGeom::Line(Vec2::new(0., 7.), Vec2::new(2., 7.))],
         )
         .unwrap();

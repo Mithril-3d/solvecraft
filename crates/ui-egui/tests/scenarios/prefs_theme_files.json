@@ -1,0 +1,13 @@
+[
+  {"note": "#2255: the Theme list offers the built-in theme files (Gruvbox) after Dark, Light and System; picking one applies at once, Cancel puts the theme back."},
+  {"click": {"handle": "titlebar:preferences"}},
+  {"expect": {"prefs": {"dialog": "General", "theme": "dark", "dark": true}}},
+  {"click": {"handle": "prefs:theme"}},
+  {"click": {"handle": "prefs:theme:gruvbox-light-soft"}},
+  {"expect": {"prefs": {"theme": "gruvbox-light-soft", "dark": false}, "shown_handles": ["prefs:theme"], "hidden_handles": ["prefs:theme:dark"]}},
+  {"click": {"handle": "prefs:theme"}},
+  {"click": {"handle": "prefs:theme:gruvbox-dark"}},
+  {"expect": {"prefs": {"theme": "gruvbox-dark", "dark": true}}},
+  {"widget": "Cancel"},
+  {"expect": {"prefs": {"dialog": null, "theme": "dark", "dark": true}}}
+]

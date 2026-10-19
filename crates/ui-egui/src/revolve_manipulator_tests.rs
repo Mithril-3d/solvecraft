@@ -33,7 +33,7 @@ fn volume(h: &Harness) -> f64 {
 }
 fn angle(h: &Harness) -> String {
     let FeatureKind::Revolve { angle, .. } = &h.app.session.doc.find_feature("Turn").unwrap().kind else { panic!("revolve") };
-    angle.clone()
+    angle.to_string()
 }
 fn expected_volume(degrees: f64) -> f64 {
     0.5 * (225.0 - 100.0) * 5.0 * degrees.to_radians()

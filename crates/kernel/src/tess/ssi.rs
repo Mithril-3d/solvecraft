@@ -5,8 +5,13 @@
 //! each surface in turn from no starting guess: a nearest-point search per surface per point.
 //! Here the intersection is solved exactly at a set of leader parameters, and a cubic B-spline
 //! is fitted through those points together with both surfaces' parameters there (a smooth
-//! leader with its curves on both surfaces). Each point is then refined from the B-spline by
-//! Newton's method on the four unknowns (u1, v1, u2, v2): S1(u1, v1) = S2(u2, v2), held on the
+//! leader with its curves on both surfaces). The B-spline runs over the chord length of the
+//! solved points, never over the curve's own parameter: truck's parameter can change speed
+//! abruptly (a polyline leader with short and long spans), and a cubic interpolated over it
+//! rings there, stepping back along the curve (Lee, "Choosing nodes in parametric curve
+//! interpolation", CAD 21, 1989). The curve's parameter reaches the chord length through the
+//! piecewise-linear map between the seeds, which is monotone. Each point is then refined from
+//! the B-spline by Newton's method on the four unknowns (u1, v1, u2, v2): S1(u1, v1) = S2(u2, v2), held on the
 //! plane through the B-spline point normal to the B-spline (Barnhill & Kersey, "A marching
 //! method for parametric surface/surface intersection", CAGD 7, 1990; Patrikalakis & Maekawa,
 //! "Shape Interrogation for CAD/CAM", 2002, ch. 5). Every point is independent once seeded. Where the surfaces are close to
@@ -34,9 +39,11 @@ const MIN_SIN: f64 = 0.05;
 pub(crate) struct Intersection {
     surfaces: [EvalSurface; 2],
     domains: [Domain; 2],
-    /// The smooth leader over the curve's parameter: the intersection point (x, y, z) and both
-    /// surfaces' parameters (u1, v1, u2, v2), periodic directions unwrapped along it.
+    /// The smooth leader over the chord length of the seeds: the intersection point (x, y, z)
+    /// and both surfaces' parameters (u1, v1, u2, v2), periodic directions unwrapped along it.
     leader: CurveN<7>,
+    /// The curve's parameter at each seed and the chord length there, both increasing.
+    seeds: Vec<(f64, f64)>,
     /// Convergence tolerance (mm).
     eps: f64,
 }
@@ -59,8 +66,14 @@ impl Intersection {
         // The leader lies within the curve's tolerance of both surfaces.
         let accept = (ic.tolerance() * 100.0).max(1e-6);
         let scale = (0..=SEEDS).map(|k| leader(t0 + (t1 - t0) * k as f64 / SEEDS as f64).0.len()).fold(1.0, f64::max);
-        let mut it = Intersection { surfaces, domains, leader: CurveN { degree: 1, knots: Vec::new(), ctrl: Vec::new() }, eps: scale * 1e-10 };
-        let (mut params, mut points) = (Vec::with_capacity(SEEDS + 1), Vec::with_capacity(SEEDS + 1));
+        let mut it = Intersection {
+            surfaces,
+            domains,
+            leader: CurveN { degree: 1, knots: Vec::new(), ctrl: Vec::new() },
+            seeds: Vec::new(),
+            eps: scale * 1e-10,
+        };
+        let (mut params, mut points): (Vec<f64>, Vec<[f64; 7]>) = (Vec::with_capacity(SEEDS + 1), Vec::with_capacity(SEEDS + 1));
         let mut prev: Option<[f64; 4]> = None;
         for k in 0..=SEEDS {
             let t = t0 + (t1 - t0) * k as f64 / SEEDS as f64;
@@ -77,23 +90,58 @@ impl Intersection {
                 q[2 * i] = uv[0];
                 q[2 * i + 1] = uv[1];
             }
-            // Exactly on the intersection where Newton converges (near-tangent seeds keep the
-            // leader point and its projections).
-            let (p, q) = d.normalized().and_then(|dir| it.newton(p, dir, q)).unwrap_or((p, q));
-            params.push(t);
+            // The fit takes only points exactly on the intersection: a leader point Newton
+            // cannot place (near-tangent, or the solution leaves a surface's domain where a
+            // polyline leader overshoots a vertex) is off the curve and would bend the fit back
+            // along it. The ends stay either way, so the fit spans the whole curve.
+            let solved = d.normalized().and_then(|dir| it.newton(p, dir, q));
+            prev = Some(solved.map_or(q, |(_, q)| q));
+            let (p, q) = match solved {
+                Some(x) => x,
+                None if k == 0 || k == SEEDS => (p, q),
+                None => continue,
+            };
+            // A seed that lands on the previous one adds no chord and stays out of the fit
+            // (whose parameters must increase).
+            let s = match it.seeds.last().zip(points.last()) {
+                Some((&(_, s), &[x, y, z, ..])) => {
+                    let chord = p.dist(Vec3::new(x, y, z));
+                    if !(chord > it.eps) {
+                        continue;
+                    }
+                    s + chord
+                }
+                None => 0.0,
+            };
+            it.seeds.push((t, s));
+            params.push(s);
             points.push([p.x, p.y, p.z, q[0], q[1], q[2], q[3]]);
-            prev = Some(q);
         }
-        it.leader = CurveN::interpolate(&params, &points, 3).ok()?;
+        let degree = points.len().checked_sub(1)?.min(3);
+        it.leader = CurveN::interpolate(&params, &points, degree).ok()?;
         Some(it)
     }
 
     /// The point at curve parameter `t` and both surfaces' parameters there, or `None`
     /// (near-tangent, or Newton failed).
     pub(crate) fn eval(&self, t: f64) -> Option<(Vec3, [f64; 4])> {
-        let (x, dx) = self.leader.eval(t)?;
+        let (x, dx) = self.leader.eval(self.chord_at(t)?)?;
         let dir = Vec3::new(dx[0], dx[1], dx[2]).normalized()?;
         self.newton(Vec3::new(x[0], x[1], x[2]), dir, [x[3], x[4], x[5], x[6]])
+    }
+
+    /// The chord length at curve parameter `t`: linear between the seeds, clamped to the ends.
+    fn chord_at(&self, t: f64) -> Option<f64> {
+        let (&(ta, sa), &(tb, sb)) = (self.seeds.first()?, self.seeds.last()?);
+        if !(t > ta) {
+            return Some(sa);
+        }
+        if !(t < tb) {
+            return Some(sb);
+        }
+        let k = self.seeds.partition_point(|&(tk, _)| tk <= t);
+        let (Some(&(t0, s0)), Some(&(t1, s1))) = (<[_]>::get(&self.seeds, k.checked_sub(1)?), <[_]>::get(&self.seeds, k)) else { return None };
+        Some(s0 + (s1 - s0) * (t - t0) / (t1 - t0))
     }
 
     /// The two surfaces, in the order of the parameters [`Intersection::eval`] gives.
@@ -186,7 +234,7 @@ mod tests {
 
     /// Points on the intersection edges of a boolean (a cross hole: two cylinders) lie on both
     /// surfaces, on truck's curve (the parameterisation follows our smooth leader, so the same
-    /// parameter may sit at a slightly different place along it), and advance along the curve.
+    /// parameter may sit at a slightly different place along it), and advance along it.
     #[test]
     fn intersection_points_lie_on_both_surfaces_and_on_truck_s_curve() {
         let Ok(pin) = crate::cylinder(Vec3::new(5.0, 5.0, -1.0), Vec3::Z, 2.0, 6.0) else { panic!("pin") };
@@ -199,6 +247,21 @@ mod tests {
             let (t0, t1) = curve.range_tuple();
             let dense: Vec<Vec3> = (0..=1000).map(|k| from_p3(curve.subs(t0 + (t1 - t0) * f64::from(k) / 1000.0))).collect();
             let near = |p: Vec3| dense.windows(2).map(|w| p.dist_to_segment(w[0], w[1])).fold(f64::MAX, f64::min);
+            // Arc length along truck's curve to the point nearest `p`.
+            let along = |p: Vec3| {
+                let (mut run, mut best) = (0.0, (f64::MAX, 0.0));
+                for w in dense.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let len = a.dist(b);
+                    let f = if len > 0.0 { ((p - a).dot(b - a) / (len * len)).clamp(0.0, 1.0) } else { 0.0 };
+                    let d = p.dist(a + (b - a) * f);
+                    if d < best.0 {
+                        best = (d, run + f * len);
+                    }
+                    run += len;
+                }
+                best.1
+            };
             let mut last: Option<Vec3> = None;
             for k in 0..=50 {
                 let t = t0 + (t1 - t0) * f64::from(k) / 50.0;
@@ -208,7 +271,7 @@ mod tests {
                 }
                 assert!(near(p) < 1e-4, "t {t}: {p:?} is {} from truck's curve", near(p));
                 if let Some(q) = last {
-                    assert!(p.dist(q) > 0.0, "t {t}: the points advance");
+                    assert!(along(p) > along(q), "t {t}: the points advance along the curve");
                 }
                 last = Some(p);
                 checked += 1;

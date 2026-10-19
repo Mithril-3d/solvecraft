@@ -25,6 +25,7 @@ use super::{
 };
 use crate::blend::{too_large, vtx};
 use crate::body::{Solid, from_p3, p3, v3};
+use crate::bridge::Frame;
 use crate::record::Rebuild;
 use crate::{KernelError, Result};
 
@@ -683,9 +684,65 @@ fn connect(from: &mt::Vertex, to: &mt::Vertex, pool: &[(mt::Edge, Vec<Owner>)], 
     Err(fail("a boundary does not close"))
 }
 
+/// The strip's own station nearest the corner ball `c`: the section where the strip stops against
+/// that ball, where its direction of leave and its curvature are read.
+fn corner_station(strip: &Strip, c: Vec3) -> Option<f64> {
+    strip.sections.iter().min_by(|a, b| a.1.c.dist(c).total_cmp(&b.1.c.dist(c))).map(|x| x.0)
+}
+
+/// One side of a G2 corner: the corner ball's own section arc of radius `r` about `c`, from its
+/// contact `q_from` to its contact `q_to`, each station carrying the direction the corner patch
+/// leaves the blend in (towards the corner's apex) and the blend's own curvature across it, read
+/// from `strip` where the ball stops against it. A rolling ball's section is a circular arc about
+/// its own centre wherever the edge runs, so this arc is the blend's section curve itself, and its
+/// ends are the ball's contacts exactly — the sides close the loop whatever the fit's station
+/// spacing is.
+fn g2_side(strip: &Strip, c: Vec3, r: f64, q_from: Vec3, q_to: Vec3, apex: Vec3) -> Result<Vec<Frame>> {
+    use mt::ParametricSurface;
+    /// Stations across one section: enough for the patch's cubic cross-sections, few enough to
+    /// keep the corner's own patch small.
+    const STATIONS: usize = 9;
+    let vec_of = |d: mt::Vector3| Vec3::new(d.x, d.y, d.z);
+    let v = corner_station(strip, c).ok_or_else(|| fail("corner section"))?;
+    let a = (q_from - c).normalized().ok_or_else(|| fail("corner contact"))?;
+    let b = (q_to - c).normalized().ok_or_else(|| fail("corner contact"))?;
+    let dot = a.dot(b).clamp(-1.0, 1.0);
+    let w = (b - a * dot).normalized().ok_or_else(|| fail("corner contact"))?;
+    let theta = dot.acos();
+    // The blend's own direction of leave and curvature across the seam, at its corner station.
+    let speed = vec_of(strip.surface.vder(0.5, v)).len();
+    if !(speed > 1e-30) {
+        return Err(unsupported("a corner section of no width"));
+    }
+    let leave = vec_of(strip.surface.vder(0.5, v)) * (1.0 / speed);
+    let bend = vec_of(strip.surface.vvder(0.5, v)) * (1.0 / (speed * speed));
+    if !(leave.is_finite() && bend.is_finite() && theta.is_finite() && r.is_finite()) {
+        return Err(unsupported("a corner section that is not finite"));
+    }
+    let mut out = Vec::with_capacity(STATIONS);
+    for k in 0..STATIONS {
+        let t = theta * k as f64 / (STATIONS - 1) as f64;
+        let p = c + (a * t.cos() + w * t.sin()) * r;
+        // The patch leaves the blend towards the material the corner caps, so the sign is the one
+        // towards the corner's apex (the blends' own v direction runs away from the vertex).
+        let leave = if leave.dot(apex - p) < 0.0 { -leave } else { leave };
+        if !(p.is_finite() && leave.is_finite() && bend.is_finite()) {
+            return Err(unsupported("a corner section that is not finite"));
+        }
+        out.push(Frame { p, leave, bend, bend_change: Vec3::ZERO });
+    }
+    Ok(out)
+}
+
 /// Blend the edges `ids` of `solid` with radius `r` (a chamfer's distance), rebuilding the
 /// corners at their ends; with what it built from `solid`.
 pub(crate) fn corner_blend(solid: &Solid, ids: &[mt::EdgeID], size: f64, r: f64, round: bool) -> Result<(Solid, Rebuild)> {
+    corner_blend_style(solid, ids, size, r, round, false)
+}
+
+/// [`corner_blend`]; with `g2`, the corners where three blends meet are G2 patches
+/// ([`crate::corner_g2`]) instead of pieces of the rolling ball's sphere.
+pub(crate) fn corner_blend_style(solid: &Solid, ids: &[mt::EdgeID], size: f64, r: f64, round: bool, g2: bool) -> Result<(Solid, Rebuild)> {
     if !(size.is_finite() && size > 0.0 && r.is_finite() && r > 0.0) {
         return Err(KernelError::Invalid("blend size and radius must be finite and positive".into()));
     }
@@ -1006,6 +1063,33 @@ pub(crate) fn corner_blend(solid: &Solid, ids: &[mt::EdgeID], size: f64, r: f64,
                     let out = (n(f12, q12) + n(f23, q23) + n(f31, q31)).normalized().unwrap_or(Vec3::Z);
                     let side = out.any_perp();
                     let (np, sp, back) = (c + side * r, c - side * r, c - out * r);
+                    if g2 {
+                        // A G2 patch on the blends' own end sections, gathered at the ball's pole
+                        // (the point the sphere's meridians are built through above). Each side is
+                        // the strip's section through the ball's contact with the face it shares
+                        // with the previous strip; the strips run on past their edges, so that
+                        // station is found by projecting the contact point, not taken from the
+                        // edge's own end.
+                        let s2 = strip_of(e2)?;
+                        let s3 = strip_of(e3)?;
+                        // The cap's own pole: the ball's point nearest the corner (the sphere
+                        // patch's `back` above is its opposite pole, where the meridian starts).
+                        let apex = c + out * r;
+                        // Side 1 runs from the ball's contact with the face it shares with e3
+                        // round to the one it shares with e2, and so on round the loop: each
+                        // side's last station is the next side's first, at that contact.
+                        let sides = [g2_side(s1, c, r, q31, q12, apex)?, g2_side(s2, c, r, q12, q23, apex)?, g2_side(s3, c, r, q23, q31, apex)?];
+                        let _patch = crate::corner_g2::corner_g2_patch(&sides, apex)?;
+                        // Sewing the patch into the shell is not done yet: it brings its own
+                        // boundary vertices where the strips' contacts end at the ball's contacts
+                        // (`v12`/`v23`/`v31`), and a truck vertex is its allocation, not its point,
+                        // so the rebuilt shell does not close there (rewrapping the section curves
+                        // onto the contacts is the missing step). Refused rather than left open:
+                        // the rolling ball fills the corner instead.
+                        return Err(unsupported(
+                            "a G2 corner sewn between these blends (the patch's section curves do not join the blends' contacts yet)",
+                        ));
+                    }
                     let meridian = builder::circle_arc(&builder::vertex(p3(np)), &builder::vertex(p3(sp)), p3(back));
                     let surf = mt::Surface::RevolutedCurve(mt::Processor::new(mt::RevolutedCurve::by_revolution(
                         meridian.oriented_curve(),

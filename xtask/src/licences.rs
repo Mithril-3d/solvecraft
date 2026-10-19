@@ -2,8 +2,10 @@
 //! into the shipped programs (solidcraft, solidcraft-cli, solidcraft-web), read from
 //! `cargo metadata` and the crates' own licence files. The programs embed it (Help ▸ About ▸
 //! Licences, `solidcraft-cli licences`), so a release download needs no licence files beside it.
-//! `--check` (part of `cargo xtask ci`) fails when the committed file is out of date, e.g. after a
-//! dependency changed.
+//! `--check` (part of `cargo xtask ci`) generates it without writing it: it fails when the
+//! dependency graph can't be read, and only reports a file that is out of date, since pull
+//! requests leave it to the Generated files workflow (`.github/workflows/generated.yml`), which
+//! rewrites it on main after each merge.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -21,7 +23,10 @@ pub fn run(root: &Path, check: bool) -> Result<(), String> {
     if check {
         let old = std::fs::read_to_string(&path).unwrap_or_default();
         if old.replace("\r\n", "\n") != text {
-            return Err(format!("{FILE} is out of date (dependencies changed): run `cargo xtask licences` and commit it"));
+            // Not an error: pull requests don't edit the file (two that did would always conflict);
+            // the Generated files workflow rewrites it on main after the merge.
+            println!("licences: {FILE} will change when this lands (the Generated files workflow rewrites it on main)");
+            return Ok(());
         }
         println!("licences: {FILE} is up to date");
         return Ok(());

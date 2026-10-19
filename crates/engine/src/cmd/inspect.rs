@@ -13,12 +13,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("measure")
         .key("I")
         .noundo()
-        .params("bodies?: [names] (default all); or items: [1-2 selections] → length/area/volume, minimum distance (from, to) and angle"),
-    CommandSpec::new("document.inspect", "Inspect Design", inspect).noundo().params("measure?: bool (include body measurements)"),
-    CommandSpec::new("sketch.inspect", "Inspect Sketch", sketch_inspect).noundo().params("sketch?: id|name (default active)"),
-    CommandSpec::new("model.edges", "List Edges", model_edges).noundo().params("body: name"),
-    CommandSpec::new("model.faces", "List Faces", model_faces).noundo().params("body: name"),
-    CommandSpec::new("model.threads", "List Threads", model_threads).noundo(),
+        .params("bodies?: [names] (default all); or items: [1-2 selections] → length/area/volume; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
+    CommandSpec::new("document.inspect", "Inspect Design", inspect).icon("inspect").noundo().params("measure?: bool (include body measurements)"),
+    CommandSpec::new("sketch.inspect", "Inspect Sketch", sketch_inspect).icon("inspect").noundo().params("sketch?: id|name (default active)"),
+    CommandSpec::new("model.edges", "List Edges", model_edges).icon("inspect").noundo().params("body: name"),
+    CommandSpec::new("model.faces", "List Faces", model_faces).icon("inspect").noundo().params(
+        "body: name → per face: index, name (what face.delete, sheet.convert `face`, solid.shell … take in place of a point), exact, area, centroid (not always on the face), \
+         plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face)",
+    ),
+    CommandSpec::new("model.threads", "List Threads", model_threads).icon("inspect").noundo(),
     CommandSpec::new("material.assign", "Physical Material", physical_material)
         .at("SOLID", "MODIFY")
         .icon("material")
@@ -26,19 +29,19 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("appearance.assign", "Appearance", appearance).at("SOLID", "MODIFY").icon("appearance").key("A").params(
         "bodies?: [names]; faces?: [[x,y,z] on faces] (body?: which body, default the nearest); components?: [names or ids, or occurrence names]; \
              appearance?: library name (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1, default 1); \
-             neither (or color: null): clear, so the face follows its body, the body its component, the component its material",
+             pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); omitted/null uses legacy scalar shading. Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
     ),
-    CommandSpec::new("appearance.library", "Appearance Library", appearance_library)
+    CommandSpec::new("appearance.library", "Appearance Library", appearance_library).icon("library")
         .noundo()
         .params("→ the built-in appearances (name, colour, opacity)"),
-    CommandSpec::new("appearance.list", "List Appearances", appearance_list)
+    CommandSpec::new("appearance.list", "List Appearances", appearance_list).icon("list")
         .noundo()
         .params("body?: name → assigned appearances; with body, its resolved look and its faces' (face index, look)"),
-    CommandSpec::new("material.list", "List Materials", material_list)
+    CommandSpec::new("material.list", "List Materials", material_list).icon("list")
         .noundo()
         .doc_only()
         .params("→ the built-in materials, then the design's own (user: true, with their look)"),
-    CommandSpec::new("engine.commands", "List Commands", commands).noundo(),
+    CommandSpec::new("engine.commands", "List Commands", commands).icon("list").noundo(),
 ];
 
 pub fn measure_json(b: &solidcraft_doc::ModelBody) -> Value {
@@ -85,7 +88,7 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
     if !want.is_empty() && bodies.len() != want.len() {
         return Err(bad("inspect.measure", "unknown body name"));
     }
-    // Sheet metal keeps the edges where bends meet flat faces (as Fusion does): count its
+    // Sheet metal keeps the edges where bends meet flat faces (so bends stay visible): count its
     // B-rep faces as they are, without merging coplanar neighbours.
     let sheets = s.model.state().sheets.clone();
     for b in &mut bodies {
@@ -95,6 +98,23 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
                 b[k] = json!(b["kernel"][k].as_i64().unwrap_or(0) + d);
             }
             b["sheet_metal"] = json!(true);
+            // A perforation field (#732) is not cut into the B-rep: take its open area out of the volume, the mass
+            // and the area (both faces minus the holes, plus the bores).
+            let open = sh.perforated_area();
+            if open > 0.0 {
+                let v = b["volume_mm3"].as_f64().unwrap_or(0.0);
+                let nv = v - open * sh.t;
+                if let Some(m) = b["mass_g"].as_f64().filter(|_| v > 0.0) {
+                    b["mass_g"] = json!(m * nv / v);
+                }
+                b["volume_mm3"] = json!(nv);
+                let bores: f64 = sh
+                    .perforations
+                    .iter()
+                    .map(|p| sh.perforation_holes(p).map_or(0.0, |h| h.len() as f64) * std::f64::consts::PI * p.diameter * sh.t)
+                    .sum();
+                b["area_mm2"] = json!(b["area_mm2"].as_f64().unwrap_or(0.0) - 2.0 * open + bores);
+            }
         }
     }
     let tv: f64 = bodies.iter().filter_map(|b| b["volume_mm3"].as_f64()).sum();
@@ -225,6 +245,10 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
             let mut v = if with_measure { measure_json(b) } else { json!({"name": b.name, "feature": b.feature}) };
             if let Some(o) = v.as_object_mut() {
                 o.insert("visible".into(), json!(s.body_visible(&b.name)));
+                if s.body_removed_later(&b.name) {
+                    // Editing a sketch rolls the timeline back; this body is deleted further on.
+                    o.insert("removed_later".into(), json!(true));
+                }
             }
             v
         })
@@ -235,7 +259,7 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|ss| json!({"id": ss.feature, "name": ss.name, "dof": ss.report.dof, "status": ss.report.status, "curves": ss.sketch.curves.len(), "profiles": ss.profiles.len(), "visible": crate::view::sketch_shown(s, ss.feature)}))
         .collect();
     Ok(json!({
-        "name": s.doc.name, "units": s.doc.units, "path": s.path, "dirty": s.is_dirty(), "revision": s.revision,
+        "name": s.doc.name, "units": s.doc.units, "metadata": s.doc.metadata, "path": s.path, "dirty": s.is_dirty(), "revision": s.revision,
         "active_sketch": s.active_sketch, "marker": marker,
         "params": params, "timeline": timeline, "bodies": bodies, "sketches": sketches,
         "selection": s.selection, "undo": s.undo.len(), "redo": s.redo.len(), "hidden_origin": s.visibility.hidden_origin,
@@ -266,13 +290,21 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     let b = body_of(&st, p, "model.faces")?;
     let names = solidcraft_doc::naming::face_names(b);
     let tol = (b.body.size() * 2e-3).max(1e-3);
+    let spots = solidcraft_doc::naming::face_spots(b);
     let faces: Vec<Value> = b
         .body
         .faces(tol)?
         .iter()
         .map(|f| {
-            json!({"index": f.index, "name": names.get(f.index), "exact": solidcraft_doc::naming::face_name_exact(b, f.index),
-                   "area": f.area, "centroid": f.centroid, "plane_normal": f.plane_normal})
+            let spot = spots.get(f.index).copied().flatten();
+            let mut v = json!({"index": f.index, "name": names.get(f.index), "exact": solidcraft_doc::naming::face_name_exact(b, f.index),
+                   "area": f.area, "centroid": f.centroid, "plane_normal": f.plane_normal, "point": spot.map(|x| x.point)});
+            if let (Some(solidcraft_kernel::FaceSurface::Cylinder { origin, axis, radius }), Some(o)) =
+                (spot.and_then(|x| x.surface), v.as_object_mut())
+            {
+                o.insert("cylinder".into(), json!({"origin": origin, "axis": axis, "radius": radius}));
+            }
+            v
         })
         .collect();
     Ok(json!({"body": b.name, "faces": faces}))
@@ -324,7 +356,7 @@ pub(super) fn color_param(v: &Value) -> Option<[u8; 3]> {
 fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
     use solidcraft_doc::appearance::{FaceLook, Look, library};
     let cmd = "appearance.assign";
-    let look: Option<Look> = match (str_(p, "appearance"), p.get("color")) {
+    let mut look: Option<Look> = match (str_(p, "appearance"), p.get("color")) {
         // A colour with a name: that colour, called that (a name not in the library is fine).
         (Some(n), Some(v)) if !v.is_null() => {
             let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
@@ -350,6 +382,11 @@ fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
             Some(Look::custom(c, o))
         }
     };
+    if let Some(l) = &mut look {
+        attach_pbr(cmd, p, l)?;
+    } else if p.get("pbr").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "`pbr` requires a color or appearance"));
+    }
     let bodies = string_list(p, "bodies");
     let st = s.model.state();
     if bodies.iter().any(|b| st.body(b).is_none()) {
@@ -449,7 +486,7 @@ fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
         "bodies": bodies,
         "faces": faces.iter().map(|(b, p)| json!({"body": b, "point": p})).collect::<Vec<_>>(),
         "components": comps,
-        "appearance": look.as_ref().map(|l| json!({"name": l.name, "color": l.hex(), "opacity": l.opacity})),
+        "appearance": look.as_ref().map(look_json),
     }))
 }
 
@@ -460,7 +497,40 @@ fn dist_to(b: &solidcraft_doc::ModelBody, p: solidcraft_geom::Vec3) -> f64 {
 }
 
 pub(super) fn look_json(l: &solidcraft_doc::appearance::Look) -> Value {
-    json!({"name": l.name, "color": l.hex(), "opacity": l.opacity})
+    let mut value = json!({"name": l.name, "color": l.hex(), "opacity": l.opacity});
+    if let Some(pbr) = l.pbr {
+        value["pbr"] = json!(pbr);
+    }
+    value
+}
+
+#[cfg(test)]
+#[path = "pbr_appearance_tests.rs"]
+mod pbr_tests;
+
+pub(super) fn attach_pbr(cmd: &str, params: &Value, look: &mut solidcraft_doc::appearance::Look) -> Result<()> {
+    let Some(value) = params.get("pbr") else { return Ok(()) };
+    if value.is_null() {
+        look.pbr = None;
+        return Ok(());
+    }
+    if let Some(opacity) = params.get("opacity")
+        && opacity.as_f64().filter(|v| v.is_finite() && *v == 1.0).is_none()
+    {
+        return Err(bad(cmd, "opaque PBR requires numeric opacity 1"));
+    }
+    let object = value
+        .as_object()
+        .filter(|o| o.len() == 3 && o.keys().all(|k| matches!(k.as_str(), "metallic" | "roughness" | "dielectric_ior")))
+        .ok_or_else(|| bad(cmd, "`pbr` requires exactly metallic, roughness and dielectric_ior"))?;
+    let number = |key: &str| object.get(key).and_then(Value::as_f64).ok_or_else(|| bad(cmd, format!("`pbr.{key}` must be a finite number")));
+    let response = solidcraft_doc::pbr_appearance::PbrParameters::new(number("metallic")?, number("roughness")?, number("dielectric_ior")?)
+        .map_err(|e| bad(cmd, e.to_string()))?;
+    if look.opacity != 1.0 {
+        return Err(bad(cmd, "opaque PBR requires opacity 1; refraction/transmission is not supported"));
+    }
+    look.pbr = Some(response);
+    Ok(())
 }
 
 fn appearance_library(_s: &mut Session, _p: &Value) -> Result<Value> {
@@ -507,7 +577,13 @@ fn appearance_list(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let in_design: Vec<Value> = used
         .iter()
-        .map(|(l, b, f, c)| json!({"name": l.name, "color": l.hex(), "opacity": l.opacity, "bodies": b, "faces": f, "components": c}))
+        .map(|(l, b, f, c)| {
+            let mut value = look_json(l);
+            value["bodies"] = json!(b);
+            value["faces"] = json!(f);
+            value["components"] = json!(c);
+            value
+        })
         .collect();
     let mut out = json!({
         "in_design": in_design,

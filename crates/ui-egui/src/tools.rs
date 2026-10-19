@@ -16,6 +16,10 @@ mod display_preview_tests;
 #[path = "sketch_neutral_click_tests.rs"]
 mod neutral_click_tests;
 
+#[cfg(test)]
+#[path = "symmetry_pick_tests.rs"]
+mod symmetry_pick_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Click points; `n` points complete the shape (0 = chain until finished).
@@ -150,11 +154,9 @@ pub fn on_click(app: &mut SolveApp, proj: &Proj, pos: Pos2) {
     }
     match tool.kind {
         Kind::Draw(n) => {
-            if let Some(mut p) = sketch_point_at(app, proj, pos) {
+            if let Some(p) = sketch_point_at(app, proj, pos) {
                 // Typed values win over the cursor; lines snap to horizontal/vertical.
-                if tool.dims.iter().any(|b| b.locked) || (tool.cmd == "sketch.line" && p.1.is_none()) {
-                    p = (crate::sketch_dims::effective(app, &tool, p.0), None);
-                }
+                let p = crate::sketch_dims::placed(app, &tool, &p);
                 // A repeated initial point supplies no extent. Keep waiting rather than
                 // attempting a degenerate shape; explicit typed values still validate.
                 if n != 1 && tool.pts.len() == 1 && tool.pts.first().is_some_and(|first| first.0 == p.0) && !tool.dims.iter().any(|b| b.locked) {
@@ -191,8 +193,12 @@ pub fn on_click(app: &mut SolveApp, proj: &Proj, pos: Pos2) {
         }
         Kind::Pick(n) => {
             let hits = pick(app, proj, pos);
+            // Symmetry's third pick may be an origin axis lying along the sketch's own x or y
+            // (#1075); the command names those `x` / `y`.
+            let axis_ok = tool.cmd == "sketch.constraint.symmetry" && tool.picks.len() == 2;
             if let Some(id) = hits.iter().find_map(|h| match h {
                 Hit::SketchPoint { id, .. } | Hit::SketchCurve { id, .. } => Some(id.clone()),
+                Hit::Axis { name } if axis_ok => sketch_axis_of(app, name).map(str::to_string),
                 _ => None,
             }) {
                 tool.picks.push(id);
@@ -457,6 +463,31 @@ pub(crate) fn projection_preselection(selection: &[solidcraft_engine::Sel]) -> O
         .collect()
 }
 
+/// `x` or `y` when the origin axis `name` is the active sketch's own x or y axis: along it, and
+/// through the sketch's origin.
+fn sketch_axis_of(app: &SolveApp, name: &str) -> Option<&'static str> {
+    use solidcraft_engine::geom::Vec3;
+    let dir = match name {
+        "X" => Vec3::X,
+        "Y" => Vec3::Y,
+        "Z" => Vec3::Z,
+        _ => return None,
+    };
+    let st = app.session.world_state();
+    let plane = st.sketch(app.session.active_sketch?)?.plane;
+    let o = plane.origin;
+    if (o - dir * o.dot(dir)).len() > 1e-6 {
+        return None;
+    }
+    if plane.x.dot(dir).abs() > 1.0 - 1e-9 {
+        Some("x")
+    } else if plane.y.dot(dir).abs() > 1.0 - 1e-9 {
+        Some("y")
+    } else {
+        None
+    }
+}
+
 fn run_pick(app: &mut SolveApp, t: &Tool) {
     let k = &t.picks;
     let params = match t.cmd {
@@ -502,7 +533,9 @@ pub(crate) fn paint_preview_curve(
     mode: u8,
 ) {
     for curve in &mut sketch.curves {
-        curve.centerline = mode == 2 && matches!(curve.kind, solidcraft_engine::sketch::CurveKind::Line { .. });
+        let line = matches!(curve.kind, solidcraft_engine::sketch::CurveKind::Line { .. });
+        curve.centerline = mode == 2 && line;
+        curve.infinite = mode == 3 && line;
         curve.construction = mode != 0 && !curve.centerline;
     }
     paint_curve(&sketch, 0, plane, painter, proj, stroke, &mut solidcraft_engine::render::SamplingBudget::new(4096, 65_536));
@@ -554,6 +587,14 @@ pub(crate) fn preview_curve(t: &Tool, hover: Vec2, sweep: Option<f64>, rho: Opti
         }
         ("sketch.circle.two_point", [a]) => {
             sk.add_circle((*a + hover) * 0.5, a.dist(hover) * 0.5, None, None).ok()?;
+        }
+        // The first click is the middle: the line runs from the cursor's mirror image through
+        // it to the cursor (#1358), not from the middle to the cursor.
+        ("sketch.line.midpoint", [m]) => {
+            if m.dist(hover) <= 1e-9 {
+                return None;
+            }
+            sk.add_line(*m * 2.0 - hover, hover, None, None, None).ok()?;
         }
         ("sketch.circle.three_point" | "sketch.arc.three_point", [a, b]) => {
             let ab = *b - *a;
@@ -691,8 +732,8 @@ pub fn preview(app: &SolveApp, t: &Tool, painter: &egui::Painter, proj: &Proj) {
             tk.text_dim,
         );
     }
-    let Some((h, _)) = t.hover.clone() else { return };
-    let h = crate::sketch_dims::effective(app, t, h);
+    let Some(hover) = t.hover.as_ref() else { return };
+    let h = crate::sketch_dims::shown(app, t, hover);
     if let Some(corners) = polygon_outline(t, h, crate::sketch_dims::locked_value(app, t, "Sides").unwrap_or(6.0)) {
         let outline: Vec<_> = corners.iter().map(|c| ss.plane.to_world(*c)).collect();
         paint_sketch_path(&outline, crate::sketch_palette::mode(app), painter, proj, stroke);

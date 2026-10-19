@@ -73,7 +73,7 @@ fn imported(session: &mut Session, step: String, name: &str) -> u64 {
     let owner = session.active_component;
     let id = session
         .doc_mut()
-        .add_feature(FeatureKind::Import { file: "fixture.step".into(), step: step.into(), components: vec![] }, Some(name))
+        .add_feature(FeatureKind::Import { file: "fixture.step".into(), step: step.into(), components: vec![], skip: Vec::new() }, Some(name))
         .unwrap();
     let feature = session.doc_mut().feature_mut(id).unwrap();
     feature.body_names = vec![name.into()];

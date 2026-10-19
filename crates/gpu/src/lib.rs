@@ -1,7 +1,9 @@
-//! GPU evaluation of display tessellation plans: the surface point and normal at every
-//! vertex's parameters, in a compute shader (`tess.wgsl`), the GPU twin of
-//! [`TessPlan::evaluate`]. Shared edge nodes keep their exact positions, so faces still meet
-//! exactly; evaluation runs in f32.
+//! SolidCraft's GPU work: the viewport's render pipelines ([`view`]), pictures drawn with them
+//! offscreen ([`capture`]), and display tessellation plans evaluated in a compute shader.
+//!
+//! Plan evaluation: the surface point and normal at every vertex's parameters, in a compute
+//! shader (`tess.wgsl`), the GPU twin of [`TessPlan::evaluate`]. Shared edge nodes keep their
+//! exact positions, so faces still meet exactly; evaluation runs in f32.
 //!
 //! Use [`TessGpu::new`] with the application's device, or [`TessGpu::headless`] (native only)
 //! to open one without a window, as the CLI and tests do. A viewport draws a plan straight from
@@ -17,18 +19,81 @@ use solidcraft_geom::Vec3;
 use solidcraft_geom::tess::{EvalCurve, EvalSurface, TessPlan};
 use wgpu::util::DeviceExt;
 
+pub mod capture;
+mod pbr;
+pub mod pick;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod select;
+pub mod view;
+
+/// The tessellation compute shader (WGSL).
+pub const SHADER: &str = include_str!("tess.wgsl");
+
+/// The device feature for a 32-bit float depth buffer with a stencil, which the viewport draws
+/// with reversed depth ([`view::reversed_depth`]) where the device has it. A device is opened
+/// with it whenever its adapter offers it ([`depth_features`]).
+pub const FLOAT_DEPTH_STENCIL: wgpu::Features = wgpu::Features::DEPTH32FLOAT_STENCIL8;
+
+/// The depth features to open a device on `adapter` with: [`FLOAT_DEPTH_STENCIL`] if it has it.
+pub fn depth_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & FLOAT_DEPTH_STENCIL
+}
+
+/// The depth format to draw with on `device`: 32-bit float (reversed depth) where it can, with a
+/// stencil when `stencil` (the section cap needs one), else 24 bits with a stencil.
+pub fn depth_format(device: &wgpu::Device, stencil: bool) -> wgpu::TextureFormat {
+    match (stencil, device.features().contains(FLOAT_DEPTH_STENCIL)) {
+        (false, _) => wgpu::TextureFormat::Depth32Float,
+        (true, true) => wgpu::TextureFormat::Depth32FloatStencil8,
+        (true, false) => wgpu::TextureFormat::Depth24PlusStencil8,
+    }
+}
+
+/// The error a popped error scope caught. Native devices answer at once; a browser's answer
+/// comes later, and is not waited for (no error is assumed).
+fn popped(f: impl std::future::Future<Output = Option<wgpu::Error>>) -> Option<wgpu::Error> {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(e) => e,
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// An adapter and device without a window (native only): the adapter [`select::pick`] chooses
+/// under the `SOLIDCRAFT_GPU` policy. The environment may narrow the backends and pick the D3D12
+/// shader compiler (`WGPU_BACKEND`, `WGPU_DX12_COMPILER`).
+#[cfg(not(target_arch = "wasm32"))]
+fn open_headless() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let policy = select::Policy::from_env().map_err(GpuError::Policy)?;
+    let (adapter, _) = select::pick(policy).ok_or(GpuError::NoAdapter(policy.name()))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("solidcraft headless"),
+        required_features: depth_features(&adapter),
+        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        ..Default::default()
+    }))
+    .map_err(|e| GpuError::Device(e.to_string()))?;
+    Ok((adapter, device, queue))
+}
+
 /// Most vertices evaluated in one dispatch (bounds the buffers; larger plans go in batches).
 pub const MAX_BATCH: usize = 1 << 20;
 const WORKGROUP: u32 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
-    #[error("no GPU adapter is available")]
-    NoAdapter,
+    #[error("no GPU adapter qualifies under the `{0}` policy (SOLIDCRAFT_GPU); `solidcraft-cli gpu` lists the adapters this machine offers")]
+    NoAdapter(&'static str),
+    #[error("{0}")]
+    Policy(String),
     #[error("the GPU device could not be opened: {0}")]
     Device(String),
     #[error("the GPU evaluation failed: {0}")]
     Failed(String),
+    #[error("the GPU render failed: {0}")]
+    Render(String),
+    #[error("the GPU tessellation pipeline could not be created: {0}")]
+    Pipeline(String),
     #[error("not supported yet: {0}")]
     Unsupported(String),
 }
@@ -78,11 +143,47 @@ pub struct TessGpu {
 }
 
 impl TessGpu {
-    /// The pipeline on an existing device (`adapter`: its name, for reports).
-    pub fn new(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+    /// The pipeline on an existing device (`adapter`: its name, for reports). An error (never
+    /// a panic) when the device cannot build it, for example where the D3D12 driver's older shader
+    /// compiler (FXC) rejects the shader: the caller then builds bodies on the CPU.
+    pub fn new(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue) -> Result<Self> {
+        Self::with_shader(adapter, device, queue, SHADER)
+    }
+
+    /// [`TessGpu::new`] with another shader source: tests use it to make pipeline creation fail
+    /// as it does on a device whose compiler rejects the real shader.
+    #[doc(hidden)]
+    pub fn with_shader(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue, shader: &str) -> Result<Self> {
+        // Errors here would go to the device's uncaptured-error handler, which panics by default:
+        // capture them, so a device that cannot run the shader only loses GPU tessellation.
+        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f));
+        let (pipeline, layout) = Self::build(&device, shader);
+        let mut failed = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(e) = popped(scope.pop()) {
+                failed.get_or_insert(e.to_string());
+            }
+        }
+        if let Some(e) = failed {
+            return Err(GpuError::Pipeline(e));
+        }
+        // A viewport records the evaluation into its own frame (see `TessGpu::record`).
+        #[cfg(target_arch = "wasm32")]
+        let _ = queue;
+        Ok(TessGpu {
+            adapter: adapter.into(),
+            device,
+            #[cfg(not(target_arch = "wasm32"))]
+            queue,
+            pipeline,
+            layout,
+        })
+    }
+
+    fn build(device: &wgpu::Device, shader: &str) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("solidcraft tessellation"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("tess.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
         });
         let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -114,34 +215,14 @@ impl TessGpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        // A viewport records the evaluation into its own frame (see `TessGpu::record`).
-        #[cfg(target_arch = "wasm32")]
-        let _ = queue;
-        TessGpu {
-            adapter: adapter.into(),
-            device,
-            #[cfg(not(target_arch = "wasm32"))]
-            queue,
-            pipeline,
-            layout,
-        }
+        (pipeline, layout)
     }
 
     /// A device of its own, without a window (native only).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
-        )
-        .map_err(|_| GpuError::NoAdapter)?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("solidcraft compute"),
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-            ..Default::default()
-        }))
-        .map_err(|e| GpuError::Device(e.to_string()))?;
-        Ok(Self::new(adapter.get_info().name, device, queue))
+        let (adapter, device, queue) = open_headless()?;
+        Self::new(adapter.get_info().name, device, queue)
     }
 
     /// The adapter's name, for reports.

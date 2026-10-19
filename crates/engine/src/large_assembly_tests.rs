@@ -7,6 +7,7 @@
 //! `SOLIDCRAFT_BENCH_PARTS=400 cargo test --release -p solidcraft-engine bench_generated_assembly -- --ignored --nocapture`
 
 use serde_json::json;
+use solidcraft_doc::BodyName;
 use solidcraft_doc::{Document, FeatureKind, Operation, mat_inverse, point_expr, rigid};
 use solidcraft_geom::Vec3;
 
@@ -24,7 +25,7 @@ fn generated_assembly(parts: usize) -> Document {
             (id, m)
         })
         .collect();
-    let mm = |v: f64| format!("{v} mm");
+    let mm = |v: f64| solidcraft_doc::Expr::new(format!("{v} mm"));
     let mut made = Vec::new();
     for i in 0..parts {
         let o = Vec3::new(30.0 * (i % 20) as f64, 30.0 * (i / 20) as f64, 0.0);
@@ -33,7 +34,7 @@ fn generated_assembly(parts: usize) -> Document {
         for (k, x) in [2.0, 9.0, 16.0].into_iter().enumerate() {
             let pin = FeatureKind::Cylinder {
                 base: point_expr(o + Vec3::new(x, 20.0, 0.0)),
-                axis: Vec3::Z,
+                axis: solidcraft_doc::Dir(Vec3::Z),
                 radius: mm(1.5),
                 height: mm(4.0 + k as f64),
                 operation: Operation::NewBody,
@@ -47,7 +48,7 @@ fn generated_assembly(parts: usize) -> Document {
     for (part, feature) in made {
         let (to, m) = comps[part / 4 % groups];
         for b in state.bodies.iter().filter(|b| b.feature == feature) {
-            let kind = FeatureKind::BodyTransfer { bodies: vec![b.name.clone()], from: 0, to, transform: mat_inverse(&m).unwrap() };
+            let kind = FeatureKind::BodyTransfer { bodies: vec![BodyName::from(&b.name)], from: 0, to, transform: mat_inverse(&m).unwrap() };
             doc.add_feature(kind, None).unwrap();
         }
     }

@@ -4,16 +4,95 @@ use solidcraft_kernel::{Body, BoolOp};
 use super::*;
 
 /// The GPU, or `None` with a note when the machine has no adapter (CI runners without a GPU).
+/// A device that cannot build the pipeline fails the test: that is a shader the device rejects
+/// (as D3D12's FXC once did), not a missing GPU. `SOLIDCRAFT_REQUIRE_GPU=1` (the Windows CI job,
+/// on the WARP software adapter) fails without an adapter too.
 fn gpu() -> Option<TessGpu> {
     match TessGpu::headless() {
         Ok(g) => {
             eprintln!("GPU: {}", g.adapter_name());
             Some(g)
         }
+        Err(e @ GpuError::Pipeline(_)) => panic!("{e}"),
+        Err(e) if std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_some() => panic!("a GPU is required here: {e}"),
         Err(e) => {
             eprintln!("skipping the GPU comparison: {e}");
             None
         }
+    }
+}
+
+/// A shader the device rejects when the pipeline is created (its binding 1 is writable, the
+/// layout's read-only), standing in for one a device's compiler cannot build.
+const REJECTED: &str = "
+@group(0) @binding(1) var<storage, read_write> surfaces: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    surfaces[gid.x] = 1u;
+    out[gid.x] = vec4<f32>(0.0);
+}
+";
+
+/// A pipeline the device cannot build is an error the caller can fall back from (to the CPU
+/// mesh), not a panic in the device's uncaptured-error handler; and the device stays usable.
+#[test]
+fn a_pipeline_the_device_rejects_is_an_error_not_a_crash() {
+    let (adapter, device, queue) = match open_headless() {
+        Ok(d) => d,
+        Err(e) => {
+            assert!(std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none(), "a GPU is required here: {e}");
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let name = adapter.get_info().name;
+    match TessGpu::with_shader(name.clone(), device.clone(), queue.clone(), REJECTED) {
+        Err(GpuError::Pipeline(e)) => eprintln!("rejected as expected: {e}"),
+        Err(e) => panic!("unexpected error: {e}"),
+        Ok(_) => panic!("the rejected shader built a pipeline"),
+    }
+    // Not wgsl at all: also an error, not a panic.
+    assert!(matches!(TessGpu::with_shader(name.clone(), device.clone(), queue.clone(), "fn main( {"), Err(GpuError::Pipeline(_))));
+    // The same device then builds the real pipeline and evaluates on it.
+    let gpu = ok(TessGpu::new(name, device, queue));
+    let body = ok(solidcraft_kernel::torus(Vec3::ZERO, 6.0, 1.5));
+    let plan = ok(body.display_plan(0.01));
+    assert_eq!(ok(gpu.evaluate(&plan)).positions.len(), plan.evaluate().positions.len());
+}
+
+/// The shader as the D3D12 backend translates it (naga's HLSL for shader model 5.1, the FXC
+/// target, with wgpu's options) avoids what FXC cannot compile without unrolling a loop:
+/// arrays inside structs and two-dimensional arrays written by a loop counter. Runs everywhere;
+/// the Windows CI job compiles the real thing with FXC.
+#[test]
+fn the_hlsl_for_fxc_has_no_arrays_fxc_must_unroll_loops_for() {
+    use naga::back::hlsl;
+    let module = ok(naga::front::wgsl::parse_str(SHADER));
+    let info = ok(naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default()).validate(&module));
+    let options = hlsl::Options {
+        shader_model: hlsl::ShaderModel::V5_1,
+        force_loop_bounding: true,
+        restrict_indexing: true,
+        fake_missing_bindings: true,
+        ..Default::default()
+    };
+    let pipeline = hlsl::PipelineOptions::default();
+    let mut out = String::new();
+    ok(hlsl::Writer::new(&mut out, &options, &pipeline).write(&module, &info, None));
+    assert!(out.contains("void main("), "{out}");
+    // Struct members that are arrays: `float n0_[8];` inside a `struct ... { };`.
+    let mut in_struct = false;
+    for line in out.lines() {
+        let l = line.trim();
+        if l.starts_with("struct ") && !l.ends_with(';') {
+            in_struct = true;
+        } else if l.starts_with("};") {
+            in_struct = false;
+        } else if in_struct {
+            assert!(!l.contains('['), "an array inside a struct: {l}");
+        }
+        assert!(!l.contains("]["), "a two-dimensional array: {l}");
     }
 }
 

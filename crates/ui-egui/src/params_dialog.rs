@@ -18,6 +18,8 @@ use crate::SolveApp;
 use crate::theme::Tokens;
 
 const UNITS: [&str; 9] = ["mm", "cm", "m", "in", "ft", "deg", "rad", "", "um"];
+/// The expression a new parameter row starts with.
+const NEW_EXPR: &str = "10 mm";
 
 /// Dialog state (what is being typed; the parameters themselves live in the document).
 #[derive(Default)]
@@ -37,11 +39,19 @@ pub struct ParamsDialog {
     pub error: Option<String>,
     /// The expression edit to preview: (name, expression).
     pub preview: Option<(String, String)>,
+    /// The rows as the engine listed them at one revision of the design (#2723): listing
+    /// evaluates every parameter, so it happens when the design changes, not every frame.
+    listed: Option<(u64, Arc<Vec<Row>>)>,
+    /// The add row's live check, by (revision, unit, expression).
+    new_check: Option<((u64, String, String), Result<String, String>)>,
+    /// How many times the rows were listed and the add row checked (for the tests).
+    pub lists: u32,
+    pub checks: u32,
 }
 
 impl ParamsDialog {
     pub fn new() -> Self {
-        ParamsDialog { new_expr: "10 mm".into(), ..Default::default() }
+        ParamsDialog { new_expr: NEW_EXPR.into(), ..Default::default() }
     }
     /// The command the live preview should run (a valid expression being edited).
     pub fn preview_commands(&self) -> Option<Vec<(String, Value)>> {
@@ -120,11 +130,24 @@ pub fn open(app: &mut SolveApp) {
 
 /// Draw the dialog when it is open. Called once per frame.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
-    publish(app, ctx);
+    // Completions are offered only under a focused text box; gathering them evaluates every
+    // parameter, so a design changing command after command (an agent building over MCP)
+    // does not pay for it on every change while nobody is typing.
+    if app.params.is_some() || ctx.memory(|m| m.focused().is_some()) {
+        publish(app, ctx);
+    }
     let Some(mut d) = app.params.take() else { return };
     let t = Tokens::get();
     let mut open = true;
-    let all = rows(app);
+    let all = if let Some((rev, r)) = d.listed.as_ref().filter(|(rev, _)| *rev == app.session.revision) {
+        let _ = rev;
+        r.clone()
+    } else {
+        let r = Arc::new(rows(app));
+        d.listed = Some((app.session.revision, r.clone()));
+        d.lists += 1;
+        r
+    };
     crate::frame::window(ctx, RichText::new(crate::i18n::tr_label("PARAMETERS")).strong().size(13.0), crate::frame::Width::Wide)
         .id(egui::Id::new("sc_params_dialog"))
         .open(&mut open)
@@ -136,16 +159,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut d.filter).hint_text(crate::i18n::tr_label("Filter")).desired_width(180.0));
                 ui.separator();
-                if ui.button("Import…").on_hover_text(crate::i18n::tr_label("CSV or JSON: updates existing parameters, adds new ones")).clicked()
-                    && let Some(p) = app.services.pick_open.as_ref().and_then(|f| f())
-                {
-                    d.error = app.run("parameters.import", json!({ "path": p })).err();
+                if ui.button("Import…").on_hover_text(crate::i18n::tr_label("CSV or JSON: updates existing parameters, adds new ones")).clicked() {
+                    app.pick_open_command("parameters.import", json!({}), &[]);
                 }
                 for (label, ext) in [("Export CSV…", "csv"), ("Export JSON…", "json")] {
-                    if ui.button(label).clicked()
-                        && let Some(p) = app.services.pick_save.as_ref().and_then(|f| f(&format!("parameters.{ext}"), &[ext]))
-                    {
-                        d.error = app.run("parameters.export", json!({ "path": p, "format": ext })).err();
+                    if ui.button(label).clicked() {
+                        app.pick_save_command(&format!("parameters.{ext}"), &[ext], "parameters.export", json!({"format": ext}));
                     }
                 }
             });
@@ -216,6 +235,25 @@ fn check(app: &mut SolveApp, e: &str, unit: &str) -> Result<String, String> {
     }
 }
 
+/// The add row's check of its expression, kept until the design, unit or text changes.
+fn new_check(app: &mut SolveApp, d: &mut ParamsDialog, unit: &str) -> Result<String, String> {
+    let key = (app.session.revision, unit.to_string(), d.new_expr.clone());
+    if let Some((k, r)) = &d.new_check
+        && *k == key
+    {
+        return r.clone();
+    }
+    let r = check(app, &d.new_expr, unit);
+    d.checks += 1;
+    d.new_check = Some((key, r.clone()));
+    r
+}
+
+/// Height of a row in the tables: tall enough for the text boxes and the combo box.
+fn row_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y.max(20.0)
+}
+
 fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&Row], salt: &str) {
     let t = Tokens::get();
     egui::Grid::new(("ptable", salt)).num_columns(7).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -223,12 +261,43 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             ui.label(RichText::new(h).color(t.text_dim).small());
         }
         ui.end_row();
-        for r in rows {
-            // Favourite star.
-            let star = if r.favorite { RichText::new("★").color(t.accent) } else { RichText::new("☆").color(t.text_dim) };
-            if ui.add(egui::Button::new(star).frame(false)).on_hover_text(crate::i18n::tr_label("Favourite")).clicked() {
-                d.error = app.run("parameters.favorite", json!({"name": r.name, "favorite": !r.favorite})).err();
+        // Only the rows in view are laid out (#2723); the others take their height, so the
+        // scroll bar and the columns stay as they are. A row being edited stays drawn.
+        let row_h = row_height(ui);
+        let clip = ui.clip_rect();
+        for (i, r) in rows.iter().enumerate() {
+            let top = ui.cursor().min.y;
+            let in_view = top + row_h >= clip.min.y && top <= clip.max.y;
+            let busy = d.editing.contains_key(&r.name) || d.comments.contains_key(&r.name) || d.renaming.as_ref().is_some_and(|(o, _)| *o == r.name);
+            if !in_view && !busy {
+                ui.allocate_space(egui::vec2(0.0, row_h));
+                ui.end_row();
+                continue;
             }
+            ui.horizontal(|ui| {
+                ui.set_min_height(row_h);
+                // Favourite star.
+                let star = if r.favorite { RichText::new("★").color(t.accent) } else { RichText::new("☆").color(t.text_dim) };
+                if ui.add(egui::Button::new(star).frame(false)).on_hover_text(crate::i18n::tr_label("Favourite")).clicked() {
+                    d.error = app.run("parameters.favorite", json!({"name": r.name, "favorite": !r.favorite})).err();
+                }
+                // Up and down past the neighbouring user parameter (#1187), in the user table only:
+                // the favourites table lists favourites first whatever their order.
+                if salt == "user" {
+                    for (glyph, tip, neighbour, side) in
+                        [("▲", "Move up", i.checked_sub(1).and_then(|j| rows.get(j)), "before"), ("▼", "Move down", rows.get(i + 1), "after")]
+                    {
+                        let button = egui::Button::new(RichText::new(glyph).small().color(t.text_dim)).frame_when_inactive(false);
+                        let resp = ui.add_enabled(neighbour.is_some(), button).on_hover_text(crate::i18n::tr_label(tip));
+                        crate::scenario::publish_handle(&format!("param:{}:{}", side, r.name), resp.rect.center());
+                        if resp.clicked()
+                            && let Some(n) = neighbour
+                        {
+                            d.error = app.run("parameters.move", json!({"name": r.name, side: n.name})).err();
+                        }
+                    }
+                }
+            });
             // Name: double-click to rename.
             match &mut d.renaming {
                 Some((old, new)) if *old == r.name => {
@@ -239,17 +308,18 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
                             d.error = app.run("parameters.rename", json!({"name": old, "new_name": new})).err();
                         }
                         d.renaming = None;
-                    } else {
+                    } else if !resp.has_focus() {
+                        // Only take focus once: requesting it every frame resets the text box's
+                        // focus lock, so arrow keys would move focus away and end the rename.
                         resp.request_focus();
                     }
                 }
                 _ => {
                     let name = if r.source == "user" { RichText::new(&r.name) } else { RichText::new(&r.name).color(t.text_dim) };
-                    if ui
-                        .add(egui::Label::new(name).sense(egui::Sense::click()))
-                        .on_hover_text(crate::i18n::tr_label("Double-click to rename"))
-                        .double_clicked()
-                    {
+                    let resp =
+                        ui.add(egui::Label::new(name).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr_label("Double-click to rename"));
+                    crate::scenario::publish_handle(&format!("param:name:{}", r.name), resp.rect.center());
+                    if resp.double_clicked() {
                         d.renaming = Some((r.name.clone(), r.name.clone()));
                     }
                 }
@@ -258,7 +328,7 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             if r.source == "user" {
                 let mut sel = UNITS.iter().position(|u| *u == r.unit).unwrap_or(0);
                 let before = sel;
-                egui::ComboBox::from_id_salt(("punit", &r.name)).width(56.0).selected_text(unit_label(&r.unit)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("punit", salt, &r.name)).width(56.0).selected_text(unit_label(&r.unit)).show_ui(ui, |ui| {
                     for (i, u) in UNITS.iter().enumerate() {
                         ui.selectable_value(&mut sel, i, unit_label(u));
                     }
@@ -279,10 +349,15 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             if bad {
                 te = te.text_color(t.error);
             }
-            let id = ui.make_persistent_id(("pexpr", &r.name));
+            // Per table: a favourite is listed twice, and one id would give both boxes the focus and
+            // each key to both (#1767).
+            let id = ui.make_persistent_id(("pexpr", salt, &r.name));
             let focused = ui.memory(|m| m.has_focus(id));
             let resp = ui.add_sized([170.0, 20.0], te.id(id));
             crate::scenario::publish_handle(&format!("param:{}", r.name), resp.rect.center());
+            if salt == "fav" {
+                crate::scenario::publish_handle(&format!("param:favorite:{}", r.name), resp.rect.center());
+            }
             let completed = complete(ui, &resp, &mut e);
             if resp.changed() || completed {
                 d.editing.insert(r.name.clone(), e.clone());
@@ -323,11 +398,8 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             }
             // Delete (user parameters; refused while used, the message says by what).
             if r.source == "user" {
-                if ui
-                    .add(egui::Button::new(RichText::new("Delete").small().color(t.text_dim)).frame(false))
-                    .on_hover_text(crate::i18n::tr_label("Delete this parameter"))
-                    .clicked()
-                {
+                // Outlined on hover like the expression and comment fields; the label says what it does.
+                if ui.add(egui::Button::new(RichText::new("Delete").small().color(t.text_dim)).frame_when_inactive(false)).clicked() {
                     d.error = app.run("parameters.delete", json!({"name": r.name})).err();
                 }
             } else {
@@ -377,7 +449,7 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog) {
             });
         crate::scenario::publish_handle("param:new:unit", unit_response.response.rect.center());
         let unit = UNITS.get(d.new_unit).copied().unwrap_or("mm");
-        let bad = check(app, &d.new_expr, unit).is_err();
+        let bad = new_check(app, d, unit).is_err();
         let mut te = egui::TextEdit::singleline(&mut d.new_expr).id(expr_id).desired_width(170.0);
         if bad {
             te = te.text_color(t.error);
@@ -385,7 +457,7 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog) {
         let resp = ui.add(te);
         crate::scenario::publish_handle("param:new:expression", resp.rect.center());
         let completed = complete(ui, &resp, &mut d.new_expr);
-        let live = check(app, &d.new_expr, unit);
+        let live = new_check(app, d, unit);
         match &live {
             Ok(v) => ui.label(RichText::new(v).color(t.text_dim)),
             Err(m) => ui.label(RichText::new(m).color(t.error)),
@@ -406,6 +478,7 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog) {
             match app.run("parameters.add", p) {
                 Ok(_) => {
                     d.new_name.clear();
+                    d.new_expr = NEW_EXPR.into();
                     d.new_comment.clear();
                     d.error = None;
                     name.request_focus();
@@ -478,16 +551,24 @@ pub(crate) fn word_before(text: &str, cursor: usize) -> (usize, String) {
 
 /// Suggestions for the word being typed.
 pub fn suggestions(ctx: &egui::Context, word: &str) -> Vec<Suggestion> {
-    if word.is_empty() || word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    suggestions_for(ctx, word, false)
+}
+
+pub(crate) fn suggestions_for(ctx: &egui::Context, word: &str, explicit: bool) -> Vec<Suggestion> {
+    if (!explicit && word.is_empty()) || word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Vec::new();
     }
     let all = ctx.data(|d| d.get_temp::<Cache>(cache_id())).map(|c| c.all).unwrap_or_default();
     // A complete token is ready to submit, even when longer names share its prefix.
-    if all.iter().any(|s| s.text == word) {
+    if !explicit && all.iter().any(|s| s.text == word) {
         return Vec::new();
     }
     let w = word.to_ascii_lowercase();
-    all.iter().filter(|s| s.text.to_ascii_lowercase().starts_with(&w) && s.text.trim_end_matches('(') != word).take(8).cloned().collect()
+    all.iter()
+        .filter(|s| s.text.to_ascii_lowercase().starts_with(&w) && (explicit || s.text.trim_end_matches('(') != word))
+        .take(8)
+        .cloned()
+        .collect()
 }
 
 /// Offer keyboard and pointer completions under a focused expression box.
@@ -519,5 +600,83 @@ mod tests {
         assert!(r.iter().any(|x| x.name == "width" && x.source == "user"));
         assert!(check(&mut app, "width / 2", "mm").is_ok());
         assert!(check(&mut app, "width + 1 deg", "mm").is_err());
+    }
+
+    /// A favourite is listed twice, under Favorites and in its own table; typing into either of its
+    /// expression boxes enters each key once (#1767: `1.1` came out `1.11.1`).
+    #[test]
+    fn a_favourite_parameter_takes_each_key_once() {
+        for (favourite, row) in [(false, 0), (true, 0), (true, 1)] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.home.open = false;
+            h.app.run("parameters.add", json!({"name": "width", "expression": "10 mm"})).unwrap();
+            if favourite {
+                h.app.run("parameters.favorite", json!({"name": "width", "favorite": true})).unwrap();
+            }
+            h.step(&json!({"start": "parameters.change"})).unwrap();
+            h.frames(4);
+            // `param:width` is the box in the parameter's own table, `param:favorite:width` the one
+            // under Favorites.
+            h.step(&json!({"click": {"handle": if row == 0 { "param:width" } else { "param:favorite:width" }}})).unwrap();
+            h.frames(2);
+            h.step(&json!({"key": "A", "cmd": true})).unwrap();
+            h.step(&json!({"text": "1.1"})).unwrap();
+            h.frames(2);
+            let editing = h.app.params.as_ref().unwrap().editing.get("width").cloned();
+            assert_eq!(editing.as_deref(), Some("1.1"), "favourite {favourite}, row {row}");
+        }
+    }
+
+    /// A design with hundreds of chained parameters.
+    fn big_design() -> crate::scenario::Harness {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("parameters.add", json!({"name": "p0", "expression": "10 mm"})).unwrap();
+        for i in 1..400 {
+            h.app.run("parameters.add", json!({"name": format!("p{i}"), "expression": format!("p{} + 1 mm", i - 1)})).unwrap();
+        }
+        h
+    }
+
+    /// Mean milliseconds per frame over `n` frames.
+    fn frame_ms(h: &mut crate::scenario::Harness, n: usize) -> f64 {
+        let start = std::time::Instant::now();
+        h.frames(n);
+        start.elapsed().as_secs_f64() * 1000.0 / n as f64
+    }
+
+    /// Frame times with the window closed and open (`cargo test -p solidcraft-ui-egui params_frame_time -- --nocapture`).
+    #[test]
+    fn params_frame_time() {
+        let mut h = big_design();
+        h.frames(5);
+        let closed = frame_ms(&mut h, 20);
+        h.step(&json!({"start": "parameters.change"})).unwrap();
+        h.frames(5);
+        let open = frame_ms(&mut h, 20);
+        assert!(h.app.params.is_some());
+        eprintln!("params frame time: closed {closed:.2} ms, open {open:.2} ms");
+    }
+
+    /// An open window lists and checks once per revision of the design, not once per frame
+    /// (#2723), and shows a change at once.
+    #[test]
+    fn the_window_does_not_re_evaluate_every_frame() {
+        let mut h = big_design();
+        h.step(&json!({"start": "parameters.change"})).unwrap();
+        h.frames(30);
+        let d = h.app.params.as_ref().unwrap();
+        assert_eq!((d.lists, d.checks), (1, 1), "30 frames of an unchanged design");
+        h.app.run("parameters.change", json!({"name": "p0", "expression": "20 mm"})).unwrap();
+        h.frames(30);
+        let d = h.app.params.as_ref().unwrap();
+        assert_eq!((d.lists, d.checks), (2, 2), "one more for the change");
+        let shown = d.listed.as_ref().unwrap().1.iter().find(|r| r.name == "p399").and_then(|r| r.value);
+        assert_eq!(shown, Some(20.0 + 399.0));
+        // A comment is a change too.
+        h.app.run("parameters.comment", json!({"name": "p1", "comment": "hello"})).unwrap();
+        h.frames(2);
+        let d = h.app.params.as_ref().unwrap();
+        assert!(d.listed.as_ref().unwrap().1.iter().any(|r| r.name == "p1" && r.comment == "hello"));
     }
 }

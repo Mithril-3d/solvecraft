@@ -375,7 +375,7 @@ impl Sketch {
     /// The outline geometry of a text source of this sketch: its path, when it has one, is a
     /// curve of this sketch as it is now.
     pub fn text_source_geometry(&self, src: &LinkSource) -> Result<Vec<LinkGeom>> {
-        let LinkSource::Text { text, at, height, angle, font, style } = src else {
+        let LinkSource::Text { text, at, height, angle, font, style, .. } = src else {
             return Err(SketchError::Invalid("not a text".into()));
         };
         let path = match &style.path {

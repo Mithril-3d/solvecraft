@@ -151,13 +151,12 @@ pub(crate) fn curved_arrow(painter: &egui::Painter, at: Pos2, clockwise: bool, h
 pub(crate) const AXIS_RADIUS: f32 = 11.0;
 pub(crate) fn axis_tip(painter: &egui::Painter, c: Pos2, name: &str, d: &Vec3, at: Pos2, depth: f64, hovered: bool, t: Tokens) {
     let col = if d.x != 0.0 {
-        solidcraft_engine::view::colors::AXIS_X
+        t.triad[0]
     } else if d.y != 0.0 {
-        solidcraft_engine::view::colors::AXIS_Y
+        t.triad[1]
     } else {
-        solidcraft_engine::view::colors::AXIS_Z
+        t.triad[2]
     };
-    let col = Color32::from_rgb(col.0, col.1, col.2);
     let positive = !name.starts_with('-');
     let ink = if depth < -0.01 { col.gamma_multiply(0.55) } else { col };
     painter.line_segment([c, at], Stroke::new(if positive { 2.0 } else { 1.0 }, ink));

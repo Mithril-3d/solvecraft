@@ -1,10 +1,12 @@
 //! SolidCraft headless command line.
 //!
 //! ```text
-//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--allow-errors]
-//! solidcraft-cli eval <script.json|design.solidcraft|part.step> (alias: inspect) measurements as JSON
-//! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] loading timings as JSON lines
-//! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…]
+//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings] [--profile] [--json-out FILE] [--allow-errors]
+//! solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE] (alias: inspect) measurements as JSON
+//! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
+//! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]] loading timings as JSON lines
+//! solidcraft-cli bench-agent [--scale F] [--save F] [--script-out F] a ~1,300-body design built command by command, timed
+//! solidcraft-cli snapshot <script|design> [--in design|part.step] --out shot.png [--width W] [--height H] [--view iso|front|top|…|NAME | --camera JSON] [--no-grid] [--no-axes]
 //! solidcraft-cli exec <command> [json-params]                 run one command on an empty design
 //! solidcraft-cli commands                                     the command registry as JSON
 //! solidcraft-cli recipe <recipe.json>                         translate an oracle recipe to a script
@@ -17,10 +19,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod bench_agent;
 mod crashes;
 mod fuzz;
 mod oracle;
 mod recipe;
+mod render;
 mod spatial;
 
 use std::process::ExitCode;
@@ -30,15 +34,28 @@ use serde_json::{Value, json};
 mod app_icon;
 
 use solidcraft_engine::Session;
-use solidcraft_engine::render::{StandardView, render_png};
+use solidcraft_engine::view::Guides;
 
 const USAGE: &str = "usage:
-  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--allow-errors]
+  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--timings] [--profile] [--json-out FILE] [--allow-errors]
   solidcraft-cli run --in <design.solidcraft|part.step> [--out FILE]...
       (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway)
-  solidcraft-cli eval <script.json|design.solidcraft|part.step>     (alias: inspect; or --in FILE)
-  solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]
-  solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|back|top|bottom|left|right]
+      (--timings prints {timings: [{index, command, ms}], total_ms} for a script, with --results its results too;
+       --profile adds each command's profile: {boolean_ms, tessellate_ms, other_ms}, the kernel's share)
+  solidcraft-cli eval <script.json|design.solidcraft|part.step> [--json-out FILE]     (alias: inspect; or --in FILE)
+      (--json-out FILE writes the JSON that run (with --results, else the measurement) and eval print to FILE instead of stdout,
+       as plain UTF-8: a shell's > can re-encode it, e.g. Windows PowerShell adds a byte-order mark)
+  solidcraft-cli script <design.solidcraft|script.json> [--out script.json]
+      (the design's history as a command script that eval and run replay)
+  solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]]
+  solidcraft-cli bench-agent [--scale F] [--save design.solidcraft] [--script-out script.json]
+  solidcraft-cli snapshot <script|design> [--in design.solidcraft|part.step] --out shot.png [--width W] [--height H] [--view NAME | --camera JSON] [--no-grid] [--no-axes]
+  solidcraft-cli snapshot --in <design.solidcraft|part.step> --out shot.png ...
+      (as with run, --in starts from a design and the script runs on top of it; an option snapshot doesn't take is an error;
+       --view: iso, front, back, top, bottom, left, right, or the name of a view saved in the design with view.save;
+       --camera: {target: [x,y,z], yaw, pitch, distance, fov?} in mm and radians, as the MCP screenshot takes it (docs/mcp.md);
+       --no-grid and --no-axes leave the ground grid (on Z 0) and the origin's axes out of the picture)
+  solidcraft-cli render <script|design> --out image.png [--setup NAME] [--width W] [--height H] [--transparent] [--overwrite] [--timeout SECONDS]
   solidcraft-cli exec <command> [json-params]
   solidcraft-cli commands
   solidcraft-cli recipe <recipe.json>
@@ -47,6 +64,10 @@ const USAGE: &str = "usage:
   solidcraft-cli mcp [--in design.solidcraft|script.json] [--connect 127.0.0.1:PORT [--token T]] [--allow-path DIR]... [--allow-any-path]
   solidcraft-cli crashes [list [--json] | show <id> | replay <id> | dir | clear [<id>]]
   solidcraft-cli licences
+  solidcraft-cli gpu [--policy auto|hardware|software|cpu]
+      (the GPU adapters a headless render can open, best first, the one the policy picks and the tier it
+       lands on: gpu, gpu-software, or the CPU rasterizer (auto with no adapter, or cpu); the policy defaults
+       to SOLIDCRAFT_GPU, else auto; exits with an error when hardware or software finds no such adapter)
   solidcraft-cli icon --out icon.png [--size 256] | --out icon.ico
 ";
 
@@ -55,8 +76,11 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("eval" | "inspect") => cmd_eval(&args[1..]),
+        Some("script") => cmd_script(&args[1..]),
         Some("snapshot") => cmd_snapshot(&args[1..]),
+        Some("render") => render::run(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
+        Some("gpu") => cmd_gpu(&args[1..]),
         Some("commands") => {
             use std::io::Write as _;
             let mut s = Session::default();
@@ -91,6 +115,8 @@ fn main() -> ExitCode {
         // Hidden: time recomputes after parameter edits (docs/perf.md).
         Some("bench-edit") => cmd_bench_edit(&args[1..]),
         Some("bench-open") => cmd_bench_open(&args[1..]),
+        // A ~1,300-body design built command by command, as an agent builds one over MCP.
+        Some("bench-agent") => bench_agent::run(&args[1..]),
         Some("--version" | "-V") => {
             println!("solidcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -156,7 +182,11 @@ fn positional(args: &[String]) -> Option<&String> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         if a.starts_with("--") {
-            i += if matches!(a.as_str(), "--quiet" | "--results" | "--allow-errors") { 1 } else { 2 };
+            i += if matches!(a.as_str(), "--quiet" | "--results" | "--timings" | "--profile" | "--allow-errors" | "--no-grid" | "--no-axes") {
+                1
+            } else {
+                2
+            };
             continue;
         }
         return Some(a);
@@ -164,32 +194,66 @@ fn positional(args: &[String]) -> Option<&String> {
     None
 }
 
+/// `--json-out FILE`: where the JSON a command prints goes instead of stdout.
+fn json_out(args: &[String]) -> Result<Option<&str>, String> {
+    if !args.iter().any(|a| a == "--json-out") {
+        return Ok(None);
+    }
+    match flag(args, "--json-out") {
+        Some(file) if !file.starts_with("--") => Ok(Some(file)),
+        _ => Err("--json-out needs a FILE".to_string()),
+    }
+}
+
+/// `v` as indented JSON with a final newline: on stdout, or in `file`. The file is plain UTF-8
+/// with no byte-order mark, whatever the platform's shell does to redirected output (Windows
+/// PowerShell's `>` writes UTF-16, or UTF-8 with a BOM), so strict JSON readers take it.
+fn print_json(v: &Value, file: Option<&str>) -> Result<(), String> {
+    match file {
+        Some(file) => {
+            let mut text = pretty(v);
+            text.push('\n');
+            std::fs::write(file, text).map_err(|e| format!("{file}: {e}"))
+        }
+        None => {
+            println!("{}", pretty(v));
+            Ok(())
+        }
+    }
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
+    install_renderer();
+    let json_out = json_out(args)?;
     let base = flag(args, "--in");
     let path = positional(args);
     if path.is_none() && base.is_none() {
         return Err(USAGE.to_string());
     }
-    // `--in` starts from a design or STEP file; the positional script then runs on top of it.
-    let mut s = match base {
-        Some(b) => load(b)?,
-        None => Session::default(),
-    };
-    let results = if args.iter().any(|a| a == "--results") {
-        // Collect every command's result (scripts only), then process requested files too.
-        let v = read_json(path.ok_or("--results needs a script")?)?;
-        let r = s.run_script(&v).map_err(|e| e.to_string())?;
-        Some(Value::Array(r))
-    } else {
-        match (base, path) {
-            (Some(_), Some(p)) => {
-                let v = read_json(p)?;
-                s.run_script(&v).map_err(|e| e.to_string())?;
+    let want_results = args.iter().any(|a| a == "--results");
+    // `--profile` times each command and splits out its kernel time; it implies `--timings`.
+    let profile = args.iter().any(|a| a == "--profile");
+    let timings = profile || args.iter().any(|a| a == "--timings");
+    let (mut s, results) = if want_results || timings {
+        // Collect every command's result or time (scripts only), then process requested files too.
+        let mut s = match base {
+            Some(b) => load(b)?,
+            None => Session::default(),
+        };
+        let needs = if want_results { "--results needs a script" } else { "--timings needs a script" };
+        let v = read_json(path.ok_or(needs)?)?;
+        let out = if timings {
+            let (r, mut t) = s.run_script_timed(&v, profile).map_err(|e| e.to_string())?;
+            if want_results && let Some(o) = t.as_object_mut() {
+                o.insert("results".into(), Value::Array(r));
             }
-            (None, Some(p)) => s = load(p)?,
-            _ => {}
-        }
-        None
+            t
+        } else {
+            Value::Array(s.run_script(&v).map_err(|e| e.to_string())?)
+        };
+        (s, Some(out))
+    } else {
+        (open(base, path)?, None)
     };
     // A feature that fails leaves the bodies as they were before it (a parameter change can
     // break a feature without failing the command that made it): writing them would hand out
@@ -204,10 +268,45 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         s.execute("file.save_as", &json!({"path": p})).map_err(|e| e.to_string())?;
     }
     if let Some(results) = results {
-        println!("{}", pretty(&results));
-    } else if !args.iter().any(|a| a == "--quiet") {
+        print_json(&results, json_out)?;
+    } else if json_out.is_some() || !args.iter().any(|a| a == "--quiet") {
+        // `--quiet` silences stdout; a file that was asked for is still written.
         let m = s.execute("inspect.measure", &json!({})).map_err(|e| e.to_string())?;
-        println!("{}", pretty(&m));
+        print_json(&m, json_out)?;
+    }
+    Ok(())
+}
+
+/// The session `run` and `snapshot` start from: `--in` (a design or STEP file) with the
+/// positional script run on top of it, or either one alone.
+fn open(base: Option<&str>, path: Option<&String>) -> Result<Session, String> {
+    match (base, path) {
+        (Some(b), Some(p)) => {
+            let mut s = load(b)?;
+            s.run_script(&read_json(p)?).map_err(|e| e.to_string())?;
+            Ok(s)
+        }
+        (Some(b), None) => load(b),
+        (None, Some(p)) => load(p),
+        (None, None) => Err(USAGE.to_string()),
+    }
+}
+
+/// Refuses an option `cmd` doesn't take, and one missing its value: a typo, or another
+/// command's option, would otherwise be ignored without a word.
+fn known_flags(cmd: &str, args: &[String], valued: &[&str], switches: &[&str]) -> Result<(), String> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if valued.contains(&a.as_str()) {
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => i += 2,
+                _ => return Err(format!("{cmd}: {a} needs a value")),
+            }
+        } else if a.starts_with("--") && !switches.contains(&a.as_str()) {
+            return Err(format!("{cmd} doesn't take {a} (it takes {})", [valued, switches].concat().join(", ")));
+        } else {
+            i += 1;
+        }
     }
     Ok(())
 }
@@ -226,6 +325,7 @@ fn timeline_ok(s: &Session) -> Result<(), String> {
 }
 
 fn cmd_eval(args: &[String]) -> Result<(), String> {
+    let json_out = json_out(args)?;
     let path = flag(args, "--in").or_else(|| positional(args).map(String::as_str)).ok_or_else(|| USAGE.to_string())?;
     let mut s = load(path)?;
     let m = s.execute("inspect.measure", &json!({})).map_err(|e| e.to_string())?;
@@ -238,24 +338,110 @@ fn cmd_eval(args: &[String]) -> Result<(), String> {
         "params": d["params"],
         "sketches": d["sketches"],
     });
-    println!("{}", pretty(&out));
+    print_json(&out, json_out)
+}
+
+/// A design's history as a command script (`timeline.export_script`): printed, or written to
+/// `--out`; what the script leaves out goes to stderr.
+fn cmd_script(args: &[String]) -> Result<(), String> {
+    let path = positional(args).ok_or_else(|| USAGE.to_string())?;
+    let s = &mut load(path)?;
+    let out = flag(args, "--out");
+    let r = s.execute("timeline.export_script", &json!({"path": out})).map_err(|e| e.to_string())?;
+    for what in r["omitted"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        eprintln!("note: the script leaves out {what}");
+    }
+    match out {
+        Some(out) => eprintln!("{out}: {} steps", r["steps"]),
+        None => println!("{}", pretty(&r["script"])),
+    }
     Ok(())
 }
 
-fn cmd_snapshot(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or_else(|| USAGE.to_string())?;
-    let out = flag(args, "--out").ok_or("snapshot needs --out FILE.png")?;
-    let w = flag(args, "--width").and_then(|x| x.parse().ok()).unwrap_or(1280usize);
-    let h = flag(args, "--height").and_then(|x| x.parse().ok()).unwrap_or(800usize);
-    let s = load(path)?;
-    let mut cam = solidcraft_engine::view::home_camera(&s);
-    if let Some(v) = flag(args, "--view") {
-        cam.set_view(StandardView::parse(v).ok_or_else(|| format!("unknown view `{v}`"))?);
+/// `gpu`: the headless adapter survey and the policy's pick.
+fn cmd_gpu(args: &[String]) -> Result<(), String> {
+    use solidcraft_gpu::select::{Policy, survey};
+    let policy = match args {
+        [] => Policy::from_env()?,
+        [flag, v] if flag == "--policy" => Policy::parse(v).ok_or_else(|| format!("--policy must be auto, hardware, software or cpu, not `{v}`"))?,
+        _ => return Err("usage: solidcraft-cli gpu [--policy auto|hardware|software|cpu]".into()),
+    };
+    let s = survey(policy);
+    let chosen = s.chosen.and_then(|i| s.adapters.get(i)).cloned();
+    // The tier pictures land on: a hardware GPU, a software adapter, or the CPU rasterizer.
+    let renderer = s.lands_on.map(|l| l.renderer());
+    println!(
+        "{}",
+        pretty(&json!({
+            "policy": policy.name(),
+            "backends": s.backends,
+            "adapters": s.adapters,
+            "chosen": chosen,
+            "lands_on": s.lands_on,
+            "renderer": renderer,
+        }))
+    );
+    match s.lands_on {
+        Some(solidcraft_gpu::select::Landing::Cpu) => {
+            eprintln!("warning: {}", solidcraft_engine::capture::CPU_WARNING);
+            Ok(())
+        }
+        Some(_) => Ok(()),
+        None => Err(format!("no adapter qualifies under the {} policy", policy.name())),
     }
-    let scene = solidcraft_engine::view::scene(&s, &cam);
-    let png = render_png(&scene, &cam, w, h).ok_or("render failed")?;
-    std::fs::write(out, &png).map_err(|e| format!("{out}: {e}"))?;
-    println!("{}", pretty(&json!({"path": out, "width": w, "height": h, "bytes": png.len()})));
+}
+
+/// Draw this process's pictures (snapshots, MCP screenshots, saved thumbnails) on the GPU with the
+/// viewport's pipelines: the headless device the `SOLIDCRAFT_GPU` policy picks, opened on the first
+/// picture; under `auto` with no qualifying adapter (or `cpu`), the CPU rasterizer, and the
+/// picture says so. Under `hardware` or `software` with no such adapter a picture fails with an
+/// error that names the policy.
+fn install_renderer() {
+    solidcraft_engine::capture::install(std::sync::Arc::new(|scene, cam, w, h| {
+        let (rgba, renderer) = solidcraft_gpu::capture::headless_rgba(scene, cam, w, h)?;
+        Ok(solidcraft_engine::capture::Picture { rgba, renderer })
+    }));
+}
+
+fn cmd_snapshot(args: &[String]) -> Result<(), String> {
+    install_renderer();
+    known_flags("snapshot", args, &["--in", "--out", "--width", "--height", "--view", "--camera"], &["--no-grid", "--no-axes"])?;
+    if positional(args).is_none() && flag(args, "--in").is_none() {
+        return Err(USAGE.to_string());
+    }
+    let out = flag(args, "--out").ok_or("snapshot needs --out FILE.png")?;
+    let size = |name: &str, default: u32| match flag(args, name) {
+        None => Ok(default),
+        Some(x) => x.parse().ok().filter(|n| (16..=8192).contains(n)).ok_or_else(|| format!("{name} must be 16 to 8192 pixels, not `{x}`")),
+    };
+    let (w, h) = (size("--width", 1280)?, size("--height", 800)?);
+    let mut s = open(flag(args, "--in"), positional(args))?;
+    // The camera choices of the MCP `screenshot`, through the same command (`view.apply`): a
+    // standard view, a view saved in the design, or an explicit camera. A script that applies a
+    // view itself sets the camera too; without any, the iso view framing the model.
+    match (flag(args, "--view"), flag(args, "--camera")) {
+        (Some(_), Some(_)) => return Err("snapshot: give --view or --camera, not both".into()),
+        (Some(v), None) => {
+            let hint = "standard views: iso, front, back, top, bottom, left, right";
+            s.execute("view.apply", &json!({"view": v})).map_err(|e| format!("--view {v}: {e} ({hint}; or a view saved with view.save)"))?;
+        }
+        (None, Some(c)) => {
+            let camera: Value = serde_json::from_str(c).map_err(|e| format!("--camera: not JSON: {e}"))?;
+            s.execute("view.apply", &json!({"camera": camera})).map_err(|e| format!("--camera: {e}"))?;
+        }
+        (None, None) => {}
+    }
+    let cam = s.camera.unwrap_or_else(|| solidcraft_engine::view::home_camera(&s));
+    let guides = Guides { grid: !args.iter().any(|a| a == "--no-grid"), axes: !args.iter().any(|a| a == "--no-axes") };
+    let scene = solidcraft_engine::view::scene_with_guides(&s, &cam, s.section, guides);
+    let png = solidcraft_engine::capture::png(&scene, &cam, w, h)?;
+    std::fs::write(out, &png.bytes).map_err(|e| format!("{out}: {e}"))?;
+    let mut reply = json!({"path": out, "width": w, "height": h, "bytes": png.bytes.len(), "renderer": png.renderer});
+    if let Some(w) = solidcraft_engine::capture::warning(png.renderer) {
+        eprintln!("warning: {w}");
+        reply["warning"] = json!(w);
+    }
+    println!("{}", pretty(&reply));
     Ok(())
 }
 
@@ -301,6 +487,7 @@ fn ico(images: &[(usize, Vec<u8>)]) -> Result<Vec<u8>, String> {
 }
 
 fn cmd_exec(args: &[String]) -> Result<(), String> {
+    install_renderer();
     let id = args.first().ok_or_else(|| USAGE.to_string())?;
     let p: Value = match args.get(1) {
         Some(t) => serde_json::from_str(t).map_err(|e| format!("params: {e}"))?,
@@ -316,6 +503,7 @@ fn cmd_exec(args: &[String]) -> Result<(), String> {
 /// a running app's control port. stdout carries only protocol messages. Files the agent's tool
 /// calls reach are confined to `solidcraft_mcp::agent_scope` unless `--allow-any-path` is given.
 fn cmd_mcp(args: &[String]) -> Result<(), String> {
+    install_renderer();
     let scope = (!args.iter().any(|a| a == "--allow-any-path"))
         .then(|| solidcraft_mcp::agent_scope(flags(args, "--allow-path").into_iter().map(std::path::PathBuf::from)));
     if let Some(s) = &scope {
@@ -333,13 +521,20 @@ fn cmd_mcp(args: &[String]) -> Result<(), String> {
     }
     let backend: Box<dyn solidcraft_mcp::Backend> = match (flag(args, "--connect"), flag(args, "--in")) {
         (Some(_), Some(_)) => return Err("mcp: use either --connect or --in, not both".into()),
-        (Some(addr), None) => Box::new(solidcraft_mcp::Remote::connect_with_token(addr, flag(args, "--token")).map_err(|e| {
-            let port = addr.rsplit(':').next().filter(|p| p.parse::<u16>().is_ok()).unwrap_or("PORT");
-            format!(
-                "cannot connect to {addr}: {e}\nno SolidCraft app is listening there; start it with \
-                 `solidcraft --control {port}` (or SOLIDCRAFT_CONTROL_PORT={port}) and retry"
-            )
-        })?),
+        (Some(addr), None) => {
+            let Some(port) = addr.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).filter(|p| *p != 0) else {
+                return Err(format!("mcp: --connect wants HOST:PORT, such as 127.0.0.1:7878, not `{addr}`"));
+            };
+            // Serve without the app too: the tools connect once it runs, and say it isn't until then.
+            let mut remote = solidcraft_mcp::Remote::new(addr, flag(args, "--token"));
+            if let Err(e) = remote.try_connect() {
+                eprintln!(
+                    "solidcraft mcp: no SolidCraft app at {addr} yet ({e}); start it with `solidcraft --control {port}` \
+                     (or SOLIDCRAFT_CONTROL_PORT={port}), tool calls connect once it runs"
+                );
+            }
+            Box::new(remote)
+        }
         (None, Some(path)) => Box::new(solidcraft_mcp::Headless::new(load(path)?)),
         (None, None) => Box::new(solidcraft_mcp::Headless::default()),
     };
@@ -401,7 +596,7 @@ fn cmd_bench_edit(args: &[String]) -> Result<(), String> {
 }
 
 /// Separate file reading, JSON decoding/repair, timeline evaluation and display meshing.
-fn cmd_bench_open(args: &[String]) -> Result<(), String> {
+pub(crate) fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("usage: solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]")?;
     let t = std::time::Instant::now();
     let step = solidcraft_engine::io::is_step_path(path);
@@ -439,5 +634,37 @@ fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     st.warm_meshes(|| true);
     let triangles: usize = st.bodies.iter().map(|b| b.mesh().triangles.len()).sum();
     println!("{}", json!({"step": "mesh", "ms": t.elapsed().as_secs_f64() * 1000.0, "bodies": st.bodies.len(), "triangles": triangles}));
+    // `--display LEVEL`: the display plans the viewport draws at that display quality, made as
+    // the GPU viewport makes them; `--edit NAME EXPR` then changes a parameter and times the
+    // evaluation and the plans of the bodies it changed.
+    let flag = |name: &str| args.iter().position(|a| a == name);
+    let Some(level) = flag("--display").and_then(|i| args.get(i + 1)) else { return Ok(()) };
+    let q = solidcraft_engine::doc::display_quality::DisplayQuality::parse(level).ok_or("--display: coarse, normal, fine or ultra")?;
+    let plans = |st: &solidcraft_engine::doc::ModelState| {
+        let t = std::time::Instant::now();
+        solidcraft_engine::kernel::for_each_on_threads(&st.bodies, 16, |b| {
+            let _ = b.plan_mesh_at(q);
+        });
+        let triangles: usize = st.bodies.iter().filter_map(|b| b.plan_mesh_at(q)).map(|m| m.triangles.len()).sum();
+        (t.elapsed().as_secs_f64() * 1000.0, triangles)
+    };
+    let (ms, triangles) = plans(&st);
+    println!("{}", json!({"step": "display", "quality": q.id(), "ms": ms, "triangles": triangles}));
+    if let Some(i) = flag("--edit") {
+        let (Some(name), Some(expr)) = (args.get(i + 1), args.get(i + 2)) else { return Err("--edit NAME EXPR".into()) };
+        let mut s = s;
+        let t = std::time::Instant::now();
+        s.execute("parameters.change", &json!({"name": name, "expression": expr})).map_err(|e| e.to_string())?;
+        let eval_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let st = s.world_state();
+        let t = std::time::Instant::now();
+        st.warm_meshes(|| true);
+        let mesh_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let (ms, triangles) = plans(&st);
+        println!(
+            "{}",
+            json!({"step": "edit", "quality": q.id(), "evaluate_ms": eval_ms, "mesh_ms": mesh_ms, "display_ms": ms, "triangles": triangles})
+        );
+    }
     Ok(())
 }

@@ -1468,3 +1468,59 @@ fn a_live_drag_shares_one_decomposition_budget() {
     assert!(d.count > 6, "{d:?}");
     assert!(d.work <= budget + one.work, "{d:?} over a budget of {budget}");
 }
+
+/// #1365: lines drawn by eye and a construction line through the origin, as in the report.
+fn drawn_by_eye() -> Session {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[-56.7, 0], [56.7, 0]], "construction": true, "ids": ["hc"]}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "origin", "b": "hc"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, -54], [0, 55.2]], "construction": true, "ids": ["vc"]}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "origin", "b": "vc"}));
+    run(
+        &mut s,
+        "sketch.line",
+        json!({"points": [[0, 26], [29.6, 26], [29.6, 41.2], [44, 41.2], [44, 0]], "infer": true, "ids": ["a", "b", "c", "d"]}),
+    );
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "a.start", "b": "vc"}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "d.end", "b": "hc"}));
+    s
+}
+
+#[test]
+fn the_first_dimension_scales_a_sketch_drawn_by_eye() {
+    let mut s = drawn_by_eye();
+    let before = sketch(&s);
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["vc", "b"], "value": "50 mm", "text_at": [15, 47], "scale_sketch": true}));
+    let f = 50.0 / 29.6;
+    assert!((out["scaled"].as_f64().unwrap() - f).abs() < 1e-6, "{out}");
+    assert!((out["measured"].as_f64().unwrap() - 50.0).abs() < 1e-6, "{out}");
+    // Every point scaled about the origin: the shape and the construction lines keep their
+    // directions (the vertical construction line stays vertical), only the size changes.
+    let after = sketch(&s);
+    for (p, q) in before.points.iter().zip(&after.points) {
+        assert!(q.pos.dist(p.pos * f) < 1e-6, "{} {:?} -> {:?}", p.id, p.pos, q.pos);
+    }
+    // The second dimension sizes the sketch as usual: nothing scales again.
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["c"], "value": "30 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_none(), "{out}");
+    assert!((pt(&s, "c.end").x - pt(&s, "c.start").x - 30.0).abs() < 1e-6);
+    assert!((pt(&s, "b.start").x - pt(&s, "vc.start").x - 50.0).abs() < 1e-6);
+    // The construction line can still be made vertical (it already is: redundant, not a conflict).
+    run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "vc"}));
+}
+
+#[test]
+fn the_first_dimension_does_not_scale_a_sketch_that_has_a_size() {
+    // A sketch with projected or fixed geometry, or another length dimension, already has a
+    // size: its first new dimension sizes what it measures as before.
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.constraint.fix", json!({"entity": "l1.end"}));
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l2"], "value": "50 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_none(), "{out}");
+    // An angle never scales.
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [30, 0], [50, 20]]}));
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l1", "l2"], "value": "60 deg", "scale_sketch": true}));
+    assert!(out.get("scaled").is_none(), "{out}");
+}

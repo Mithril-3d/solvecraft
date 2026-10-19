@@ -3,13 +3,19 @@ use serde_json::{Value, json};
 use solidcraft_render::{Camera, StandardView};
 
 use super::CommandSpec;
-use crate::params::{bad, vec3};
+use crate::params::{bad, num, req_vec2, req_vec3, vec3};
 use crate::{Result, Session};
 
-pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("view.navigate", "Navigate View", navigate)
+pub static COMMANDS: &[CommandSpec] = &[
+CommandSpec::new("view.graphics_preset", "Graphics Preset", graphics_preset)
+    .icon("settings").noundo().doc_only().params("preset: performance|quality → preset, enabled, display_quality, supersampling, supersampling_adaptive; Quality: AO, Fine, adaptive 2x SSAA; Performance: no AO, Normal, no SSAA"),
+CommandSpec::new("view.ambient_occlusion", "Ambient Occlusion", ambient_occlusion)
+    .icon("settings").noundo().doc_only().params("enabled: bool → enabled; apply soft contact shading in the GPU viewport"),
+CommandSpec::new("view.navigate", "Navigate View", navigate)
     .icon("orbit")
     .noundo()
-    .params("camera: Camera; direction?: [x,y,z] in the camera's up-axis frame; or action: left|right|up|down|clockwise|counterclockwise|home|fit → camera, fit")];
+    .doc_only()
+    .params("camera: Camera; direction?: [x,y,z] in the camera's up-axis frame; or action: left|right|up|down|clockwise|counterclockwise|home|fit, degrees?: 0..180 (how far left|right|up|down turn; default 90); or motion: pan|orbit|zoom, delta?: [dx,dy] (pixels, each ±10000), viewport?: [width,height] (1..1000000, required for pan or pivot), pivot?: [x,y,z], factor?: 0.05..20 (required for zoom), anchor?: [x,y,z] → camera, fit, continuous?")];
 
 fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "view.navigate";
@@ -24,6 +30,9 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad(cmd, "invalid camera"));
     }
+    if p.get("motion").is_some() {
+        return continuous(cam, p);
+    }
     let mut fit = false;
     if let Some(value) = p.get("direction") {
         let dir = vec3(value)
@@ -37,12 +46,23 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
         }
     } else {
         use std::f64::consts::FRAC_PI_2;
-        let (r, u, _) = cam.basis();
+        let (r, u, b) = cam.basis();
+        // Left, right, up and down turn the view a quarter turn (the navigation cube's arrows),
+        // or `degrees` (the arrow keys' 15° steps, #1541).
+        let (sin, cos) = match p.get("degrees") {
+            None => (1.0, 0.0),
+            Some(d) => d
+                .as_f64()
+                .filter(|d| d.is_finite() && *d > 0.0 && *d <= 180.0)
+                .map(|d| if d == 90.0 { (1.0, 0.0) } else { d.to_radians().sin_cos() })
+                .ok_or_else(|| bad(cmd, "degrees must be a number above 0 and at most 180"))?,
+        };
+        let turn = |toward: solidcraft_geom::Vec3| cam.looking_from(b * cos + toward * sin);
         match p.get("action").and_then(Value::as_str) {
-            Some("left") => cam = cam.looking_from(-r),
-            Some("right") => cam = cam.looking_from(r),
-            Some("up") => cam = cam.looking_from(u),
-            Some("down") => cam = cam.looking_from(-u),
+            Some("left") => cam = turn(-r),
+            Some("right") => cam = turn(r),
+            Some("up") => cam = turn(u),
+            Some("down") => cam = turn(-u),
             Some("clockwise") => cam.roll = (cam.roll + FRAC_PI_2).rem_euclid(std::f64::consts::TAU),
             Some("counterclockwise") => cam.roll = (cam.roll - FRAC_PI_2).rem_euclid(std::f64::consts::TAU),
             Some("home") => {
@@ -54,6 +74,45 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     Ok(json!({"camera": cam, "fit": fit}))
+}
+
+/// Direct manipulation is stateless, bounded and independent of document evaluation.
+fn continuous(mut cam: Camera, p: &Value) -> Result<Value> {
+    let cmd = "view.navigate";
+    let viewport = || {
+        let size = req_vec2(cmd, p, "viewport")?;
+        if !(1.0..=1e6).contains(&size.x) || !(1.0..=1e6).contains(&size.y) {
+            return Err(bad(cmd, "viewport dimensions must be in 1..1000000"));
+        }
+        Ok(size)
+    };
+    match p.get("motion").and_then(Value::as_str) {
+        Some(motion @ ("pan" | "orbit")) => {
+            let delta = req_vec2(cmd, p, "delta")?;
+            if delta.x.abs() > 1e4 || delta.y.abs() > 1e4 {
+                return Err(bad(cmd, "motion deltas must be within ±10000 pixels"));
+            }
+            if motion == "pan" {
+                cam.pan(delta.x, delta.y, viewport()?.y);
+            } else if p.get("pivot").is_some() {
+                let pivot = req_vec3(cmd, p, "pivot")?;
+                viewport()?;
+                cam.orbit_about(delta.x, delta.y, pivot);
+            } else {
+                cam.orbit(delta.x, delta.y);
+            }
+        }
+        Some("zoom") => {
+            let factor = num(p, "factor").filter(|f| (0.05..=20.0).contains(f)).ok_or_else(|| bad(cmd, "factor must be in 0.05..20"))?;
+            let anchor = p.get("anchor").map(|_| req_vec3(cmd, p, "anchor")).transpose()?;
+            cam.zoom_at(factor, anchor);
+        }
+        _ => return Err(bad(cmd, "unknown navigation motion")),
+    }
+    if !cam.is_valid() {
+        return Err(bad(cmd, "motion produced an invalid camera"));
+    }
+    Ok(json!({"camera":cam, "fit":false, "continuous":true}))
 }
 
 /// At a halfway tie prefer the heading nearer the front plan view.
@@ -79,6 +138,109 @@ mod tests {
     use super::*;
     use solidcraft_geom::Vec3;
     use solidcraft_render::UpAxis;
+
+    /// #1541: left, right, up and down turn a quarter turn, or `degrees` (the arrow keys' 15°).
+    #[test]
+    fn turns_take_degrees_and_default_to_a_quarter_turn() {
+        let mut s = Session::default();
+        let cam = Camera { yaw: 0.0, pitch: 0.0, distance: 100.0, ..Default::default() };
+        let mut turn = |action: &str, degrees: Option<Value>| -> Result<Camera> {
+            let mut params = json!({"camera": cam, "action": action});
+            if let Some(d) = degrees {
+                params["degrees"] = d;
+            }
+            let result = s.execute("view.navigate", &params)?;
+            Ok(serde_json::from_value(result["camera"].clone()).unwrap())
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // A quarter turn as before, given or not.
+        let quarter = turn("left", None).unwrap();
+        assert_eq!(turn("left", Some(json!(90))).unwrap(), quarter);
+        assert!(close((quarter.yaw - cam.yaw).abs(), std::f64::consts::FRAC_PI_2));
+        // 15° each way, about the up axis or over the top.
+        for (action, yaw, pitch) in [("left", -15.0, 0.0), ("right", 15.0, 0.0), ("up", 0.0, 15.0), ("down", 0.0, -15.0)] {
+            let to = turn(action, Some(json!(15))).unwrap();
+            assert!(close(to.yaw.abs(), f64::to_radians(yaw).abs()), "{action}: yaw {}", to.yaw);
+            assert!(close(to.pitch, f64::to_radians(pitch)), "{action}: pitch {}", to.pitch);
+            assert_eq!((to.target, to.distance), (cam.target, cam.distance));
+        }
+        // Left and right turn opposite ways.
+        assert!(close(turn("left", Some(json!(15))).unwrap().yaw, -turn("right", Some(json!(15))).unwrap().yaw));
+        for bad in [json!(0), json!(-15), json!(181), json!(f64::NAN.to_string()), json!("15"), json!(null)] {
+            assert!(turn("left", Some(bad.clone())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn continuous_navigation_moves_the_camera_without_editing_the_design() {
+        let mut s = Session::default();
+        let before = s.doc.to_json();
+        let cam = Camera { distance: 100.0, ..Default::default() };
+        for (motion, extra) in
+            [("pan", json!({"delta":[30,20],"viewport":[800,600]})), ("orbit", json!({"delta":[30,20]})), ("zoom", json!({"factor":0.5}))]
+        {
+            let mut params = extra;
+            params["camera"] = json!(cam);
+            params["motion"] = json!(motion);
+            let result = s.execute("view.navigate", &params).unwrap();
+            let to: Camera = serde_json::from_value(result["camera"].clone()).unwrap();
+            assert_eq!(result["continuous"], true);
+            match motion {
+                "pan" => {
+                    assert_ne!(to.target, cam.target);
+                    assert_eq!((to.yaw, to.pitch, to.distance), (cam.yaw, cam.pitch, cam.distance));
+                }
+                "orbit" => {
+                    assert!((to.yaw - cam.yaw - 0.24).abs() < 1e-9);
+                    assert!((to.pitch - cam.pitch - 0.16).abs() < 1e-9);
+                    assert_eq!((to.target, to.distance), (cam.target, cam.distance));
+                }
+                _ => assert_eq!(to.distance, 50.0),
+            }
+        }
+        assert_eq!(s.doc.to_json(), before);
+        assert!(s.undo.is_empty());
+    }
+
+    #[test]
+    fn continuous_perspective_orbit_keeps_near_and_far_pivots_on_screen() {
+        let mut s = Session::default();
+        let cam = Camera { yaw: 0.0, pitch: 0.0, distance: 100.0, fov: 0.6, ..Default::default() };
+        for pivot in [Vec3::new(15.0, -50.0, 0.0), Vec3::new(15.0, 50.0, 0.0)] {
+            let result =
+                s.execute("view.navigate", &json!({"camera":cam,"motion":"orbit","delta":[20,10],"viewport":[800,600],"pivot":pivot})).unwrap();
+            let to: Camera = serde_json::from_value(result["camera"].clone()).unwrap();
+            let (ax, ay, _) = cam.to_screen(pivot, 800.0, 600.0, 200.0).unwrap();
+            let (bx, by, _) = to.to_screen(pivot, 800.0, 600.0, 200.0).unwrap();
+            assert!((ax - bx).abs() < 1e-6 && (ay - by).abs() < 1e-6, "pivot {pivot:?} drifted from ({ax},{ay}) to ({bx},{by})");
+        }
+    }
+
+    #[test]
+    fn continuous_orbit_keeps_its_pivot_on_screen_and_rejects_hostile_motion() {
+        let mut s = Session::default();
+        let cam = Camera { distance: 100.0, ..Default::default() };
+        let pivot = Vec3::new(12.0, 5.0, 0.0);
+        let result = s.execute("view.navigate", &json!({"camera":cam,"motion":"orbit","delta":[20,10],"viewport":[800,600],"pivot":pivot})).unwrap();
+        let to: Camera = serde_json::from_value(result["camera"].clone()).unwrap();
+        let (ax, ay, _) = cam.to_screen(pivot, 800.0, 600.0, 1.0).unwrap();
+        let (bx, by, _) = to.to_screen(pivot, 800.0, 600.0, 1.0).unwrap();
+        assert!((ax - bx).abs() < 1e-6 && (ay - by).abs() < 1e-6);
+        for extra in [
+            json!({"motion":"pan","delta":[1,2],"viewport":[800,0]}),
+            json!({"motion":"pan","delta":[1e100,2],"viewport":[800,600]}),
+            json!({"motion":"orbit","delta":[1]}),
+            json!({"motion":"orbit","delta":[1,2],"pivot":[0,0,0]}),
+            json!({"motion":"zoom","factor":0}),
+            json!({"motion":"zoom","factor":1e100}),
+            json!({"motion":"zoom","factor":1,"anchor":[1e100,0,0]}),
+            json!({"motion":"unknown"}),
+        ] {
+            let mut p = extra;
+            p["camera"] = json!(cam);
+            assert!(s.execute("view.navigate", &p).is_err(), "{p}");
+        }
+    }
 
     #[test]
     fn every_cube_direction_preserves_framing_without_editing_the_design() {
@@ -127,5 +289,63 @@ mod tests {
         ] {
             assert!(s.execute("view.navigate", &params).is_err());
         }
+    }
+}
+
+fn ambient_occlusion(_s: &mut Session, p: &Value) -> Result<Value> {
+    let enabled = p.get("enabled").and_then(Value::as_bool).ok_or_else(|| bad("view.ambient_occlusion", "enabled must be a boolean"))?;
+    Ok(json!({"enabled": enabled}))
+}
+
+#[cfg(test)]
+mod ambient_occlusion_tests {
+    use super::*;
+    #[test]
+    fn validates_display_setting_without_editing_design_or_history() {
+        let mut s = Session::default();
+        let before = s.doc.to_json();
+        for enabled in [true, false] {
+            assert_eq!(s.execute("view.ambient_occlusion", &json!({"enabled": enabled})).unwrap(), json!({"enabled": enabled}));
+        }
+        for p in [json!({}), json!({"enabled": 1}), json!({"enabled": "true"}), json!({"enabled": null})] {
+            assert!(s.execute("view.ambient_occlusion", &p).is_err());
+        }
+        assert_eq!(s.doc.to_json(), before);
+        assert!(s.undo.is_empty());
+    }
+}
+
+/// One preset for contact shading, tessellation and supersampling. MSAA stays independent.
+fn graphics_preset(_s: &mut Session, p: &Value) -> Result<Value> {
+    let preset = p.get("preset").and_then(Value::as_str);
+    let enabled = match preset {
+        Some("quality") => true,
+        Some("performance") => false,
+        _ => return Err(bad("view.graphics_preset", "preset must be performance or quality")),
+    };
+    Ok(json!({"preset": preset, "enabled": enabled, "display_quality": if enabled { "fine" } else { "normal" },
+        "supersampling": if enabled { 2.0 } else { 1.0 }, "supersampling_adaptive": true}))
+}
+
+#[cfg(test)]
+mod graphics_preset_tests {
+    use super::*;
+
+    #[test]
+    fn presets_validate_without_changing_design_or_history() {
+        let mut s = Session::default();
+        let before = s.doc.to_json();
+        for (preset, enabled) in [("quality", true), ("performance", false)] {
+            assert_eq!(
+                s.execute("view.graphics_preset", &json!({"preset":preset})).unwrap(),
+                json!({"preset":preset,"enabled":enabled,"display_quality":if enabled { "fine" } else { "normal" },
+                    "supersampling":if enabled { 2.0 } else { 1.0 },"supersampling_adaptive":true})
+            );
+        }
+        for params in [json!({}), json!({"preset":"fast"}), json!({"preset":true}), json!({"preset":null})] {
+            assert!(s.execute("view.graphics_preset", &params).is_err());
+        }
+        assert_eq!(s.doc.to_json(), before);
+        assert!(s.undo.is_empty());
     }
 }

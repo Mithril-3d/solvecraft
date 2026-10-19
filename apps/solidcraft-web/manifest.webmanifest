@@ -1,0 +1,16 @@
+{
+  "name": "SolidCraft",
+  "short_name": "SolidCraft",
+  "description": "Open-source parametric CAD built in Rust.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#e8ebf0",
+  "theme_color": "#343840",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "icons/32x32/ai.storyteller.solidcraft.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "icons/256x256/ai.storyteller.solidcraft.png", "sizes": "256x256", "type": "image/png" },
+    { "src": "icons/512x512/ai.storyteller.solidcraft.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

@@ -254,6 +254,11 @@ pub struct Renderer {
 
     options: RendererOptions,
 
+    /// The last `update_buffers` could not upload this frame's meshes (the GPU refused a
+    /// staging buffer: device lost or out of memory), so `render` draws nothing this frame
+    /// instead of panicking (SolidCraft #1469).
+    skip_frame: bool,
+
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
     /// See also [`CallbackTrait`].
@@ -453,6 +458,7 @@ impl Renderer {
                 slices: Vec::with_capacity(64),
                 capacity: INDEX_BUFFER_START_CAPACITY,
             },
+            skip_frame: false,
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
@@ -483,6 +489,10 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) {
         profiling::function_scope!();
+
+        if self.skip_frame {
+            return;
+        }
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
@@ -922,6 +932,7 @@ impl Renderer {
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
 
+        self.skip_frame = false;
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
         let uniform_buffer_content = UniformBuffer {
@@ -981,11 +992,13 @@ impl Renderer {
             );
 
             let Some(mut index_buffer_staging) = index_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                log::warn!(
+                    "Failed to create staging buffer for index data; skipping this frame. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.index_buffer.buffer.size(),
                     self.index_buffer.capacity
                 );
+                self.skip_frame = true;
+                return Vec::new();
             };
 
             let mut index_offset = 0;
@@ -1027,11 +1040,13 @@ impl Renderer {
             );
 
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                log::warn!(
+                    "Failed to create staging buffer for vertex data; skipping this frame. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.vertex_buffer.buffer.size(),
                     self.vertex_buffer.capacity
                 );
+                self.skip_frame = true;
+                return Vec::new();
             };
 
             let mut vertex_offset = 0;

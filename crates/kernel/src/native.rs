@@ -93,6 +93,7 @@ pub fn decode_native_body(bytes: &[u8]) -> Result<Body> {
             splits: None,
             face_sources: None,
             history: None,
+            display_of: None,
             regularization_protected: false,
         };
         metadata::apply(&mut body, saved.metadata)?;

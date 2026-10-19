@@ -3,7 +3,8 @@
 //!
 //! The body is rebuilt from its own topology. Faces away from the gap are kept as they are.
 //! Each neighbouring face (planar) keeps its edges that don't touch the gap; a loop that ran
-//! entirely along deleted faces (a hole's rim, a boss's footprint) is dropped; a corner on the
+//! entirely along deleted faces is dropped for a hole's rim or a boss's footprint, or restored
+//! at the moved corners for a face enclosed by rounds. A corner on the
 //! gap moves to where its planes meet the neighbours across the gap (a fillet's tangent points
 //! go to the sharp corner), and the stretch of loop that bordered deleted faces closes with a
 //! straight edge between the moved corners. Anything else (curved neighbours, a gap the
@@ -216,6 +217,28 @@ pub fn delete_faces(body: &Body, faces: &[usize]) -> Result<Body> {
             for w in f.boundaries() {
                 let edges: Vec<mt::Edge> = w.edge_iter().cloned().collect();
                 if edges.iter().all(gap) {
+                    // A hole or boss footprint disappears when its walls are removed. A
+                    // face surrounded by rounds does not: its whole boundary moves back to
+                    // the intersections of the remaining planes (#1557). Keep that loop,
+                    // sharing its restored edges with the adjacent rebuilt faces.
+                    let moving = edges.iter().any(|e| moved.contains_key(&e.front().id()) || moved.contains_key(&e.back().id()));
+                    if moving {
+                        if !edges.iter().all(|e| moved.contains_key(&e.front().id()) && moved.contains_key(&e.back().id())) {
+                            return Err(fail(format!("face {fi} has a closed gap boundary that cannot be restored completely")));
+                        }
+                        let mut boundary = Vec::new();
+                        for e in &edges {
+                            let (a, b) = (pos(e.front()), pos(e.back()));
+                            if a.dist(b) > q * 10.0 {
+                                let restored = line(a, b, &mut verts);
+                                rec.piece(&restored, e);
+                                boundary.push(restored);
+                            }
+                        }
+                        if !boundary.is_empty() {
+                            wires.push(boundary.into());
+                        }
+                    }
                     continue;
                 }
                 // Start after a gap stretch so stretches don't wrap around.
@@ -319,6 +342,21 @@ mod tests {
                 m.triangles.iter().zip(&m.tri_face).filter(|(_, x)| **x as usize == *f).all(|(t, _)| m.tri(t).unwrap().iter().all(|p| keep(*p)))
             })
             .collect()
+    }
+
+    #[test]
+    fn issue1557_delete_closed_fillet_ring_keeps_the_floor() {
+        let b = box_solid(Vec3::ZERO, Vec3::new(25.0, 25.0, 10.0)).unwrap();
+        let picks = [Vec3::new(12.5, 0.0, 0.0), Vec3::new(25.0, 12.5, 0.0), Vec3::new(12.5, 25.0, 0.0), Vec3::new(0.0, 12.5, 0.0)];
+        let rounded = fillet(&b, &picks, 2.0).unwrap();
+        let rounds: Vec<usize> =
+            rounded.solid.face_iter().enumerate().filter(|(_, f)| crate::blend::plane_normal(f).is_none()).map(|(i, _)| i).collect();
+        assert_eq!(rounds.len(), 4);
+        let restored = delete_faces(&rounded, &rounds).unwrap();
+        assert_eq!(restored.face_count(), 6);
+        assert_eq!(restored.unmeshed_faces(), 0);
+        assert!((volume(&restored) - 6250.0).abs() < 1e-6);
+        assert!(restored.contains(Vec3::new(0.1, 0.1, 0.1)));
     }
 
     #[test]

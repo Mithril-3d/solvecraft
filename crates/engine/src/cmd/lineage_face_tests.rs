@@ -309,7 +309,6 @@ fn every_flat_face_of_a_block_and_a_flush_step_takes_a_sketch() {
 /// #681 as reported: one sketch of a 2 x 2 grid, three cells extruded up (an elbow) and three
 /// joined down (the inverse elbow).
 #[test]
-#[ignore = "the join of the elbow down fails until #679 is fixed"]
 fn every_flat_face_of_an_elbow_up_and_an_elbow_down_takes_a_sketch() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Grid"}));
@@ -326,4 +325,77 @@ fn every_flat_face_of_an_elbow_up_and_an_elbow_down_takes_a_sketch() {
         json!({"sketch": "Grid", "distance": 10, "direction": "negative", "operation": "join", "profiles": down, "name": "Down"}),
     );
     every_flat_face_takes_a_sketch(&mut s);
+}
+
+/// #565: Split Body by a plane a parameter moves (a raw plane, a construction plane or a sketch
+/// line). The face the split cuts on each part is named after the half-space that cut it
+/// (`F<split>:section`): a sketch and an offset plane attach to it and follow the plane.
+#[test]
+fn the_face_a_split_cuts_takes_a_sketch_and_an_offset_plane_that_follow_the_plane() {
+    for tool in ["plane", "construction", "line"] {
+        let mut s = Session::default();
+        run(&mut s, "parameters.add", json!({"name": "split_x", "expression": "15 mm"}));
+        run(&mut s, "solid.box", json!({"length": 40, "width": 20, "height": 10, "body_name": "Block"}));
+        let split = match tool {
+            "plane" => json!({"body": "Block", "plane": {"origin": ["split_x", 0, 0], "normal": [1, 0, 0]}}),
+            "construction" => {
+                run(&mut s, "construct.plane.offset", json!({"base": "YZ", "offset": "split_x", "name": "Cut"}));
+                json!({"body": "Block", "plane": "Cut"})
+            }
+            _ => {
+                let id = run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Guide"}))["sketch"].as_u64().unwrap();
+                run(&mut s, "sketch.line", json!({"points": [[15, -10], [15, 30]], "ids": ["cut"], "connect": false}));
+                run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "cut", "mode": "vertical"}));
+                run(&mut s, "sketch.dimension", json!({"entities": ["origin", "cut.start"], "type": "horizontal", "value": "split_x"}));
+                run(&mut s, "sketch.finish", json!({}));
+                json!({"body": "Block", "sketch": id, "line": "cut"})
+            }
+        };
+        run(&mut s, "solid.split_body", split);
+        no_errors(&s);
+        // Each part's cut face (the two lie on one another, so each is picked by body and index).
+        let cut_face = |s: &Session, body: &str, x: f64| {
+            let state = s.model.state();
+            let b = &state.body(body).unwrap().body;
+            let index = (0..b.face_count())
+                .find(|i| b.planar_face(*i).is_some_and(|p| p.normal().x.abs() > 0.999 && (p.origin.x - x).abs() < 1e-9))
+                .unwrap_or_else(|| panic!("{tool}: no cut face on `{body}`"));
+            json!({"face": [x, 10, 5], "body": body, "index": index})
+        };
+        let mut normals = Vec::new();
+        for (k, body) in ["Block", "Block (1)"].into_iter().enumerate() {
+            let pick = cut_face(&s, body, 15.);
+            run(&mut s, "sketch.create", json!({"plane": pick, "name": format!("OnCut{k}")}));
+            run(&mut s, "sketch.finish", json!({}));
+            let (plane, certificate) = healthy(&s, &format!("OnCut{k}"));
+            assert_eq!(certificate, Some(FaceCertificate::Lineage), "{tool} {body}");
+            assert!((plane.origin.x - 15.).abs() < 1e-9 && plane.normal().x.abs() > 0.999, "{tool} {body}: {plane:?}");
+            normals.push(plane.normal().x);
+            let pick = cut_face(&s, body, 15.);
+            run(&mut s, "construct.plane.offset", json!({"base": pick, "offset": 2, "name": format!("Off{k}")}));
+        }
+        assert!(normals[0] * normals[1] < 0., "{tool}: the two cut faces face each other's way: {normals:?}");
+        no_errors(&s);
+
+        run(&mut s, "parameters.change", json!({"name": "split_x", "expression": "20 mm"}));
+        no_errors(&s);
+        let offset = |s: &Session, name: &str| {
+            let feature = s.doc.find_feature(name).map(|f| f.id).unwrap();
+            let state = s.model.state();
+            match state.construct.iter().find(|c| c.feature == feature).map(|c| &c.geom) {
+                Some(solidcraft_doc::construct::ConstructGeom::Plane(p)) => *p,
+                other => panic!("{tool} {name}: {other:?}"),
+            }
+        };
+        for (k, n) in normals.iter().enumerate() {
+            let (plane, _) = healthy(&s, &format!("OnCut{k}"));
+            assert!((plane.origin.x - 20.).abs() < 1e-9 && (plane.normal().x - n).abs() < 1e-9, "{tool} OnCut{k}: {plane:?}");
+            let off = offset(&s, &format!("Off{k}"));
+            assert!((off.origin.x - (20. + 2. * n)).abs() < 1e-9, "{tool} Off{k}: {off:?}");
+        }
+        let t = reopened(&s);
+        for k in 0..2 {
+            assert!((healthy(&t, &format!("OnCut{k}")).0.origin.x - 20.).abs() < 1e-9, "{tool} reopened OnCut{k}");
+        }
+    }
 }

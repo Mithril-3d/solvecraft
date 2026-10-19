@@ -101,11 +101,28 @@
   ]
  },
  {
-  "widget": "Export 3MF\u2026"
+  "widget": "Save as mesh\u2026"
  },
  {
   "expect": {
-   "file": "Untitled.3mf"
+   "dialog": "SaveMesh"
+  }
+ },
+ {
+  "click": {
+   "world": [
+    15,
+    10,
+    10
+   ]
+  }
+ },
+ {
+  "widget": "Save"
+ },
+ {
+  "expect": {
+   "file": "Body1.stl"
   }
  }
 ]

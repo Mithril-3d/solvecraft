@@ -134,6 +134,7 @@ fn a_sketch_sets_its_text_on_one_of_its_curves() {
         angle: 0.7,
         font: None,
         style: TextStyle { path: Some(path.into()), ..TextStyle::default() },
+        exprs: Default::default(),
     };
     // On the line: `at` and the angle do not place it.
     let on = sk.text_source_geometry(&source(&id)).unwrap();
@@ -149,7 +150,15 @@ fn a_sketch_sets_its_text_on_one_of_its_curves() {
 
 #[test]
 fn a_style_is_saved_only_when_it_is_not_plain_and_reads_back() {
-    let plain = LinkSource::Text { text: "A".into(), at: Vec2::ZERO, height: 5.0, angle: 0.0, font: None, style: TextStyle::default() };
+    let plain = LinkSource::Text {
+        text: "A".into(),
+        at: Vec2::ZERO,
+        height: 5.0,
+        angle: 0.0,
+        font: None,
+        style: TextStyle::default(),
+        exprs: Default::default(),
+    };
     let json = serde_json::to_value(&plain).unwrap();
     assert!(json.get("style").is_none(), "{json}");
     let styled = LinkSource::Text {
@@ -167,6 +176,7 @@ fn a_style_is_saved_only_when_it_is_not_plain_and_reads_back() {
             path: Some("l3".into()),
             reverse: true,
         },
+        exprs: Default::default(),
     };
     let json = serde_json::to_value(&styled).unwrap();
     assert_eq!(json["style"]["align"], "right");

@@ -544,3 +544,52 @@ fn switching_configurations_back_reuses_the_later_features() {
     assert!(rel(volume(&mut s), 40.0 * 30.0 * 10.0) < 1e-9);
     assert!(hits(&s) > before, "{r}");
 }
+
+/// The user parameters' names in the order the Parameters dialog lists them.
+fn user_order(s: &mut Session) -> Vec<String> {
+    let v = run(s, "parameters.list", json!({"filter": "user"}));
+    v["parameters"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn user_parameters_reorder_with_undo() {
+    // #1187: move a user parameter before or after another; nothing else changes.
+    let mut s = Session::default();
+    for (n, e) in [("a", "1 mm"), ("b", "2 mm"), ("c", "a + b")] {
+        run(&mut s, "parameters.add", json!({"name": n, "expression": e}));
+    }
+    assert_eq!(user_order(&mut s), ["a", "b", "c"]);
+    let r = run(&mut s, "parameters.move", json!({"name": "c", "before": "a"}));
+    assert_eq!(r["order"], json!(["c", "a", "b"]));
+    assert_eq!(user_order(&mut s), ["c", "a", "b"]);
+    run(&mut s, "parameters.move", json!({"name": "c", "after": "a"}));
+    assert_eq!(user_order(&mut s), ["a", "c", "b"]);
+    // Values and references are untouched; the order is kept in the design file.
+    let list = run(&mut s, "parameters.list", json!({"filter": "user"}));
+    let c = list["parameters"].as_array().unwrap().iter().find(|r| r["name"] == "c").unwrap().clone();
+    assert_eq!(c["expression"], "a + b");
+    assert!((c["value"].as_f64().unwrap() - 3.0).abs() < 1e-9, "{c}");
+    let back = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    let names: Vec<&str> = back.doc.params.iter().filter(|p| !p.model).map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "c", "b"]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(user_order(&mut s), ["c", "a", "b"]);
+}
+
+#[test]
+fn moving_a_parameter_refuses_bad_targets() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "a", "expression": "1 mm"}));
+    run(&mut s, "parameters.add", json!({"name": "b", "expression": "2 mm"}));
+    let before = s.doc.to_json();
+    for p in [
+        json!({"name": "a", "before": "a"}),
+        json!({"name": "a", "before": "nope"}),
+        json!({"name": "nope", "before": "a"}),
+        json!({"name": "a"}),
+        json!({"name": "a", "before": "b", "after": "b"}),
+    ] {
+        err(&mut s, "parameters.move", p);
+    }
+    assert_eq!(s.doc.to_json(), before);
+}

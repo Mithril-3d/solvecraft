@@ -27,6 +27,7 @@ impl<S> ShapeOpsSurface for S where S: ParametricSurface3D
 /// Only solids consisting of edges whose curve is implemented this trait can be used for set operations.
 pub trait ShapeOpsCurve<S: ShapeOpsSurface>:
     ParametricCurve3D
+    + TrySubs
     + ParameterDivision1D<Point = Point3>
     + Cut
     + Invertible
@@ -37,6 +38,7 @@ pub trait ShapeOpsCurve<S: ShapeOpsSurface>:
     + Sync {
 }
 impl<C, S: ShapeOpsSurface> ShapeOpsCurve<S> for C where C: ParametricCurve3D
+        + TrySubs
         + ParameterDivision1D<Point = Point3>
         + Cut
         + Invertible

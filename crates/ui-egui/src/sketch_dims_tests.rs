@@ -2,6 +2,7 @@
 
 use serde_json::json;
 
+use super::{BOX, in_view};
 use crate::scenario::Harness;
 
 fn drawing(command: &str) -> Harness {
@@ -248,4 +249,93 @@ fn rounded_rectangle_clicks_use_a_default_radius() {
     let r: f64 = 0.2 * 20.0;
     let want = w * hh - (4.0 - std::f64::consts::PI) * r * r;
     assert!((sketch.profiles[0].area - want).abs() < 0.05 * want, "area {} want about {want}", sketch.profiles[0].area);
+}
+
+/// A line from a circle's centre to the circle, ending a little off the quadrant: the preview
+/// snaps to horizontal or vertical, so the click must place exactly that line, on the circle.
+#[test]
+fn a_line_end_on_a_circle_within_the_axis_snap_lands_on_the_quadrant_the_preview_shows() {
+    use solidcraft_engine::geom::Vec2;
+    use solidcraft_engine::sketch::{ConstraintKind, CurveKind};
+    let r = 30.0_f64;
+    for (deg, end, horizontal) in [(-1.5_f64, Vec2::new(r, 0.0), true), (91.8, Vec2::new(0.0, r), false), (178.0, Vec2::new(-r, 0.0), true)] {
+        let mut h = Harness::new();
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center": [0, 0], "radius": r})).unwrap();
+        h.settle();
+        let sid = h.app.session.active_sketch.unwrap();
+        h.step(&json!({"start": "sketch.line"})).unwrap();
+        h.step(&json!({"click": {"world": [0, 0, 0]}})).unwrap();
+        let at = Vec2::from_angle(deg.to_radians()) * r;
+        h.step(&json!({"move": {"world": [at.x, at.y, 0]}})).unwrap();
+        let tool = h.app.tool.as_ref().unwrap();
+        let hover = tool.hover.clone().unwrap();
+        assert!(hover.1.as_deref().is_some_and(|s| s.starts_with("on:")), "{deg}: {hover:?}");
+        let shown = crate::sketch_dims::shown(&h.app, tool, &hover);
+        assert!(shown.dist(end) < 1e-9, "{deg}: preview at {shown:?}");
+        h.step(&json!({"click": {"world": [at.x, at.y, 0]}})).unwrap();
+        let st = h.app.session.world_state();
+        let sk = &st.sketch(sid).unwrap().sketch;
+        let (line, a, b) = sk
+            .curves
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| if let CurveKind::Line { a, b } = c.kind { Some((i, a, b)) } else { None })
+            .unwrap_or_else(|| panic!("{deg}: no line, {:?}", h.app.status));
+        assert!(sk.point(a).unwrap().dist(Vec2::ZERO) < 1e-9, "{deg}");
+        assert!(sk.point(b).unwrap().dist(end) < 1e-9, "{deg}: placed at {:?}", sk.point(b));
+        assert!(sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::PointOnCurve { p, c: 0 } if p == b)), "{deg}: end not on the circle");
+        let axis = |k: &ConstraintKind| {
+            if horizontal {
+                matches!(k, ConstraintKind::Horizontal { l } if *l == line)
+            } else {
+                matches!(k, ConstraintKind::Vertical { l } if *l == line)
+            }
+        };
+        assert!(sk.constraints.iter().any(|c| axis(&c.kind)), "{deg}: axis constraint missing");
+    }
+}
+
+/// Outside the axis snap a line end on a circle stays where the cursor meets the circle.
+#[test]
+fn a_line_end_on_a_circle_outside_the_axis_snap_stays_at_the_cursor() {
+    use solidcraft_engine::geom::Vec2;
+    use solidcraft_engine::sketch::CurveKind;
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center": [0, 0], "radius": 30})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    h.step(&json!({"start": "sketch.line"})).unwrap();
+    h.step(&json!({"click": {"world": [0, 0, 0]}})).unwrap();
+    let at = Vec2::from_angle(20f64.to_radians()) * 30.0;
+    h.step(&json!({"move": {"world": [at.x, at.y, 0]}})).unwrap();
+    h.step(&json!({"click": {"world": [at.x, at.y, 0]}})).unwrap();
+    let st = h.app.session.world_state();
+    let sk = &st.sketch(sid).unwrap().sketch;
+    let b = sk.curves.iter().find_map(|c| if let CurveKind::Line { b, .. } = c.kind { Some(b) } else { None }).unwrap();
+    let end = sk.point(b).unwrap();
+    assert!((end.len() - 30.0).abs() < 1e-9 && end.dist(at) < 0.5, "{end:?}");
+}
+
+/// A value box set off the cursor stays in the drawing area (#2201): past an edge it goes to the
+/// cursor's other side, still clear of it; with no room either side it is pushed inside.
+#[test]
+fn value_boxes_stay_in_view_and_off_the_cursor() {
+    let view = egui::Rect::from_min_max(egui::pos2(250.0, 130.0), egui::pos2(1650.0, 960.0));
+    let cursor = egui::pos2(565.0, 142.0);
+    // 50 px above the cursor: over the ribbon.
+    let above = cursor + egui::vec2(-34.0, -11.0 - 50.0);
+    let p = in_view(above, Some(view), Some(cursor));
+    let rect = egui::Rect::from_min_size(p, BOX);
+    assert!(view.contains_rect(rect), "{rect:?} in {view:?}");
+    assert!(!rect.expand(2.0).contains(cursor), "{rect:?} clear of {cursor:?}");
+    assert!(rect.min.y > cursor.y, "below the cursor now");
+    // A box that fits stays where it is; without a view nothing moves.
+    let inside = egui::pos2(700.0, 500.0);
+    assert_eq!(in_view(inside, Some(view), Some(cursor)), inside);
+    assert_eq!(in_view(above, None, Some(cursor)), above);
+    // No room on either side: inside the view all the same.
+    let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 30.0));
+    assert!(tiny.contains_rect(egui::Rect::from_min_size(in_view(egui::pos2(-200.0, -200.0), Some(tiny), Some(egui::pos2(40.0, 15.0))), BOX)));
 }

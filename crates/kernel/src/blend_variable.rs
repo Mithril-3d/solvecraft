@@ -205,17 +205,33 @@ pub fn fillet_variable_points(body: &Body, edge_at: Vec3, start: Vec3, points: &
 }
 
 /// Fillet one straight edge with the radius `spline` along it, its positions from the end
-/// nearest `start`. One end's radius may be zero.
+/// nearest `start`. One end's radius may be zero. A curved edge, or one between curved faces, is
+/// rolled by a ball of the law's radius instead ([`curved_variable`]).
 pub fn fillet_variable_spline(body: &Body, edge_at: Vec3, start: Vec3, spline: &RadiusSpline) -> Result<Body> {
     body.require_brep("fillet")?;
     spline.check()?;
     let edge = crate::surfaces::edge_near(body, edge_at).ok_or_else(|| KernelError::Invalid(format!("no edge at {edge_at:?}")))?;
     guard("variable fillet", || {
-        let s = EdgeSetup::new(body, &edge)?;
+        let Ok(s) = EdgeSetup::new(body, &edge) else {
+            return curved_variable(body, &edge, start, spline);
+        };
         // Positions from the end nearest `start` (the edge keeps its own direction).
         let law = if s.p1.dist(start) < s.p0.dist(start) { spline.reversed() } else { spline.clone() };
         build(body, &s, &edge, &law)
     })
+}
+
+/// The radius law along a curved edge: a ball whose radius is the law's at each station rolls
+/// along the edge's smooth chain (the same sections, contacts and trims as the straight-edge case,
+/// sized by the law there). A law that has run to zero at an end closes the blend to the edge's
+/// end point, as the straight-edge fillet does.
+fn curved_variable(body: &Body, edge: &mt::Edge, start: Vec3, law: &RadiusSpline) -> Result<Body> {
+    // Positions from the end nearest `start` (the chain runs along the edge's own direction).
+    let (p0, p1) = (vtx(edge.absolute_front()), vtx(edge.absolute_back()));
+    let law = if p1.dist(start) < p0.dist(start) { law.reversed() } else { law.clone() };
+    let chain = crate::blend::smooth_chain(&body.solid, edge).unwrap_or_else(|| vec![edge.id()]);
+    let (made, rec) = guard("variable fillet", || crate::curveblend::curve_blend_law(&body.solid, &chain, body.size(), &law, true))?;
+    crate::record::rebuilt(made, &[&body.solid], &rec)
 }
 
 /// A straight edge between two planar faces as the variable blend sees it: the shell it is in
@@ -570,8 +586,11 @@ pub fn fillet_tapered(body: &Body, edges: &[Vec3], radius: f64) -> Result<(Body,
     Ok((cur, tapers))
 }
 
-/// Chord-length fillet: each edge (straight, between planar faces) rounded so that the blend
-/// is `chord` wide across; edges with the same face angle share a radius.
+/// Chord-length fillet: each edge rounded so that the blend is `chord` wide across, from contact
+/// to contact at every station. A straight edge between planar faces is built exactly, the radius
+/// `chord / (2 cos(φ/2))` from its face angle and edges sharing that angle blended together; a
+/// curved edge, or one between curved faces (or a chain of selected edges running on into one),
+/// is rolled by a ball whose radius gives the same width, which follows the face angle along it.
 pub fn fillet_chord(body: &Body, edges: &[Vec3], chord: f64) -> Result<Body> {
     body.require_brep("fillet")?;
     if !(chord.is_finite() && chord > 1e-6 && chord < 1e6) {
@@ -580,25 +599,61 @@ pub fn fillet_chord(body: &Body, edges: &[Vec3], chord: f64) -> Result<Body> {
     if edges.is_empty() || edges.len() > 1000 {
         return Err(KernelError::Invalid("select 1…1000 edges".into()));
     }
-    // Radius per edge from its face angle.
-    let mut groups: Vec<(f64, Vec<Vec3>)> = Vec::new();
-    for p in edges {
-        let e = crate::surfaces::edge_near(body, *p).ok_or_else(|| KernelError::Invalid(format!("no edge at {p:?}")))?;
-        let shell =
-            body.solid.boundaries().iter().find(|sh| sh.edge_iter().any(|x| x.id() == e.id())).ok_or_else(|| KernelError::Failed("edge".into()))?;
-        let faces: Vec<&mt::Face> = shell.face_iter().collect();
-        let fr = edge_frame(&faces, &e)?;
-        let r = chord_radius(chord, fr.phi);
-        match groups.iter_mut().find(|(gr, _)| (gr - r).abs() <= 1e-9 * r) {
-            Some((_, v)) => v.push(*p),
-            None => groups.push((r, vec![*p])),
+    let found: Vec<mt::Edge> = edges
+        .iter()
+        .map(|p| crate::surfaces::edge_near(body, *p).ok_or_else(|| KernelError::Invalid(format!("no edge at {p:?}"))))
+        .collect::<Result<_>>()?;
+    // The exact radius of a straight edge between planar faces; None where the rolling ball has to
+    // take the edge (a curved edge, or one between curved faces).
+    let exact_radius = |e: &mt::Edge| -> Option<f64> {
+        if !matches!(e.curve(), mt::Curve::Line(_)) {
+            return None;
         }
+        let shell = body.solid.boundaries().iter().find(|sh| sh.edge_iter().any(|x| x.id() == e.id()))?;
+        let faces: Vec<&mt::Face> = shell.face_iter().collect();
+        Some(chord_radius(chord, edge_frame(&faces, e).ok()?.phi))
+    };
+    // A straight edge running on smoothly into a selected curved one goes with it: the ball rolls
+    // along the chain, so blending the parts apart would leave a step at their joint.
+    let meets = |a: &mt::Edge, b: &mt::Edge| [a.front(), a.back()].into_iter().any(|v| v == b.front() || v == b.back());
+    let mixed = |e: &mt::Edge| found.iter().any(|f| f.id() != e.id() && exact_radius(f).is_none() && meets(e, f));
+    // Radius per edge from its face angle; the rest roll a ball along their chain.
+    let mut groups: Vec<(f64, Vec<Vec3>)> = Vec::new();
+    let mut rolled: Vec<Vec<Vec3>> = Vec::new();
+    let mut done: Vec<mt::EdgeID> = Vec::new();
+    for (p, e) in edges.iter().zip(&found) {
+        if let Some(r) = exact_radius(e).filter(|_| !mixed(e)) {
+            match groups.iter_mut().find(|(gr, _)| (gr - r).abs() <= 1e-9 * r) {
+                Some((_, v)) => v.push(*p),
+                None => groups.push((r, vec![*p])),
+            }
+            continue;
+        }
+        if done.contains(&e.id()) {
+            continue;
+        }
+        // The whole smooth chain (as the constant-radius path rolls it): a ball cannot stop
+        // where the edge runs on, so the chain's other edges are blended with it.
+        let chain = crate::blend::smooth_chain(&body.solid, e).unwrap_or_else(|| vec![e.id()]);
+        done.extend(chain.iter().copied());
+        rolled.push(edges.iter().zip(&found).filter(|(_, f)| chain.contains(&f.id())).map(|(p, _)| *p).collect());
     }
     // Each step's result carries its history over `[body]`.
     let counts = crate::record::counts(&[body]);
     let mut cur = crate::boolean_record::operand(body, 0, &counts);
     for (r, pts) in groups {
         cur = crate::record::after(crate::fillet(&cur, &pts, r)?, &cur, &counts);
+    }
+    for picks in rolled {
+        // The chain as the current body has it: the blends before it rebuilt the faces it runs
+        // through, and a rebuilt face carries its edges again.
+        let edges: Vec<mt::Edge> = picks.iter().filter_map(|p| crate::surfaces::edge_near(&cur, *p)).collect();
+        let Some(first) = edges.first() else { continue };
+        let keep = |x: &mt::Edge| edges.iter().any(|e| e.id() == x.id());
+        let chain = crate::blend::smooth_chain_within(&cur.solid, first, &keep).unwrap_or_else(|| vec![first.id()]);
+        let (made, rec) = crate::guard("chord fillet", || crate::curveblend::curve_blend_chord(&cur.solid, &chain, cur.size(), chord, true))?;
+        let step = crate::record::rebuilt(made, &[&cur.solid], &rec)?;
+        cur = crate::record::after(step, &cur, &counts);
     }
     Ok(cur)
 }

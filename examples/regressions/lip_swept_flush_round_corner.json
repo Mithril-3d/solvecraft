@@ -1,0 +1,33 @@
+{
+  "description": "A 1 x 1 mm lip swept round three sides of a block's top, flush with its sides and round its R4.5 corners, joined to it: each straight inner side of the lip runs on tangent into its round inner corner, so imprinting the contact along the sides' whole surfaces left pieces that did not match, and the join failed.",
+  "commands": [
+    {"command": "sketch.create", "params": {"plane": "XY", "name": "Base"}},
+    {"command": "sketch.line", "params": {"points": [[20.5, -20.0], [-20.5, -20.0]]}},
+    {"command": "sketch.line", "params": {"points": [[-25.0, -15.5], [-25.0, 15.5]]}},
+    {"command": "sketch.line", "params": {"points": [[-20.5, 20.0], [20.5, 20.0]]}},
+    {"command": "sketch.line", "params": {"points": [[25.0, 15.5], [25.0, -15.5]]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [-20.5, -15.5], "start": [-25.0, -15.5], "end": [-20.5, -20.0]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [-20.5, 15.5], "start": [-20.5, 20.0], "end": [-25.0, 15.5]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [20.5, 15.5], "start": [25.0, 15.5], "end": [20.5, 20.0]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [20.5, -15.5], "start": [20.5, -20.0], "end": [25.0, -15.5]}},
+    {"command": "sketch.finish", "params": {}},
+    {"command": "solid.extrude", "params": {"sketch": "Base", "operation": "new", "distance": "10 mm", "body_name": "Block"}},
+    {"command": "sketch.create", "params": {"plane": {"origin": [20.5, 0.0, 0.0], "x_dir": [0.0, 1.0, 0.0], "y_dir": [0.0, 0.0, 1.0]}, "name": "Profile"}},
+    {"command": "sketch.line", "params": {"points": [[-20, 10], [-19, 10]]}},
+    {"command": "sketch.line", "params": {"points": [[-19, 10], [-19, 11]]}},
+    {"command": "sketch.line", "params": {"points": [[-19, 11], [-20, 11]]}},
+    {"command": "sketch.line", "params": {"points": [[-20, 11], [-20, 10]]}},
+    {"command": "sketch.finish", "params": {}},
+    {"command": "sketch.create", "params": {"plane": {"origin": [0.0, 0.0, 10.0], "x_dir": [1.0, 0.0, 0.0], "y_dir": [0.0, 1.0, 0.0]}, "name": "Path"}},
+    {"command": "sketch.line", "params": {"points": [[20.5, -20.0], [-20.5, -20.0]]}},
+    {"command": "sketch.line", "params": {"points": [[-25.0, -15.5], [-25.0, 15.5]]}},
+    {"command": "sketch.line", "params": {"points": [[-20.5, 20.0], [20.5, 20.0]]}},
+    {"command": "sketch.line", "params": {"points": [[25.0, 15.5], [25.0, -15.5]]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [-20.5, -15.5], "start": [-25.0, -15.5], "end": [-20.5, -20.0]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [-20.5, 15.5], "start": [-20.5, 20.0], "end": [-25.0, 15.5]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [20.5, 15.5], "start": [25.0, 15.5], "end": [20.5, 20.0]}},
+    {"command": "sketch.arc.center_point", "params": {"center": [20.5, -15.5], "start": [20.5, -20.0], "end": [25.0, -15.5]}},
+    {"command": "sketch.finish", "params": {}},
+    {"command": "solid.sweep", "params": {"sketch": "Profile", "path_sketch": "Path", "path": ["l1", "a1", "l2", "a2", "l3"], "operation": "join", "name": "Lip", "profiles": [{"point": [-19.5, 10.5]}], "targets": ["Block"]}}
+  ]
+}

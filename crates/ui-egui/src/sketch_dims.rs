@@ -107,6 +107,54 @@ pub fn effective(app: &SolveApp, t: &Tool, h: Vec2) -> Vec2 {
     }
 }
 
+/// The point a click places for the hover `p` (the preview draws this one): typed values win
+/// over the cursor and drop its snap; a line's free end snaps to horizontal/vertical, one on
+/// sketch geometry stays there, and one on a curve slides along it to where the axis crosses.
+pub fn placed(app: &SolveApp, t: &Tool, p: &(Vec2, Option<String>)) -> (Vec2, Option<String>) {
+    let line = t.cmd == "sketch.line";
+    if t.dims.iter().any(|b| b.locked) || (line && p.1.is_none()) {
+        return (effective(app, t, p.0), None);
+    }
+    if line && let Some(q) = on_curve_axis(app, t, p) {
+        return q;
+    }
+    p.clone()
+}
+
+/// Where the preview and the value boxes put the tool's next point for the hover `p`: for a
+/// line, exactly what a click places.
+pub fn shown(app: &SolveApp, t: &Tool, p: &(Vec2, Option<String>)) -> Vec2 {
+    if t.cmd == "sketch.line" { placed(app, t, p).0 } else { effective(app, t, p.0) }
+}
+
+/// A line end snapped onto a curve (`on:<curve>:x,y`) within the axis snap: the point where the
+/// horizontal/vertical line from the start crosses that curve near the cursor (from a circle's
+/// centre, its quadrant point), still on the curve. None: no axis snap there, or the axis misses
+/// the curve close by (the curve snap wins as it is).
+fn on_curve_axis(app: &SolveApp, t: &Tool, p: &(Vec2, Option<String>)) -> Option<(Vec2, Option<String>)> {
+    let a = t.pts.last()?.0;
+    let (curve, _) = p.1.as_deref()?.strip_prefix("on:")?.rsplit_once(':')?;
+    let v = p.0 - a;
+    let ang = snap_axis(v.angle());
+    if ang == v.angle() {
+        return None;
+    }
+    let st = app.session.world_state();
+    let sk = &st.sketch(app.session.active_sketch?)?.sketch;
+    let shape = sk.shape(sk.curve_index(curve)?)?;
+    let dir = Vec2::from_angle(ang);
+    let horizontal = dir.y.abs() < dir.x.abs();
+    let axis = solidcraft_engine::sketch::Shape::Line { a, b: a + dir };
+    let tol = 1e-9 * (1.0 + v.len());
+    let q = solidcraft_engine::sketch::intersections(&axis, &shape)
+        .into_iter()
+        // Exactly on the axis, so the command infers the horizontal/vertical constraint.
+        .map(|q| if horizontal { Vec2::new(q.x, a.y) } else { Vec2::new(a.x, q.y) })
+        .filter(|q| (*q - a).dot(dir) > tol && shape.dist(*q) <= tol && q.dist(p.0) <= v.len() * 0.1)
+        .min_by(|x, y| x.dist(p.0).total_cmp(&y.dist(p.0)))?;
+    Some((q, Some(format!("on:{curve}:{},{}", q.x, q.y))))
+}
+
 /// Angles within a few degrees of horizontal or vertical snap to it (the line is drawn
 /// horizontal or vertical, and the command infers the constraint).
 pub fn snap_axis(ang: f64) -> f64 {
@@ -172,7 +220,9 @@ fn live(app: &SolveApp, t: &Tool, e: Vec2, px: f64) -> Vec<(f64, Vec2)> {
         }
         ("sketch.arc.center_point", 2) => {
             let a0 = (a - first).angle();
-            vec![(((e - first).angle() - a0).rem_euclid(std::f64::consts::TAU), e)]
+            // Out along the radius, clear of the cursor: a box on it would take the hover and
+            // the click meant for a point there (#2201).
+            vec![(((e - first).angle() - a0).rem_euclid(std::f64::consts::TAU), e + dir_or_x(e - first) * (2.5 * off))]
         }
         ("sketch.conic", 2) => {
             // `rho` is the curve's fullness, not a distance: the conic passes through
@@ -186,7 +236,9 @@ fn live(app: &SolveApp, t: &Tool, e: Vec2, px: f64) -> Vec<(f64, Vec2)> {
         }
         ("sketch.slot.center_to_center" | "sketch.slot.overall", 2) => {
             let dir = dir_or_x(a - first);
-            vec![(2.0 * dir.cross(e - first).abs(), e)]
+            let side = if dir.cross(e - first) < 0.0 { -1.0 } else { 1.0 };
+            // Beyond the cursor, away from the centre line, as for the arc (#2201).
+            vec![(2.0 * dir.cross(e - first).abs(), e + dir.perp() * (side * 2.5 * off))]
         }
         _ => Vec::new(),
     }
@@ -325,8 +377,7 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     let sid = app.session.active_sketch?;
     let st = app.session.world_state();
     let plane = st.sketch(sid)?.plane;
-    let h = t.hover.as_ref().map(|x| x.0)?;
-    let e = effective(app, t, h);
+    let e = shown(app, t, t.hover.as_ref()?);
     let px = 2.0 * app.cam.half_height() / f64::from(proj.rect.height().max(1.0));
     let lv = live(app, t, e, px);
     let focus = std::mem::take(&mut t.dims_focus);
@@ -355,6 +406,7 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     }
     let mut completed = false;
     let mut any_focused = false;
+    let view = app.viewport.layout.as_ref().map(|l| l.drawable).filter(|r| r.is_finite() && r.is_positive());
     for (i, b) in t.dims.iter_mut().enumerate() {
         let Some((v, at)) = lv.get(i).copied() else { continue };
         if !b.locked {
@@ -370,7 +422,7 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
             s.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
             s.store(ui.ctx(), id);
         }
-        let pos: Pos2 = sp + vec2(-34.0, -11.0);
+        let pos = in_view(sp + vec2(-34.0, -11.0), view, ui.ctx().pointer_latest_pos());
         crate::frame::area(egui::Id::new(("sc_dim_area", i))).fixed_pos(pos).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
             let fill = if b.locked { tk.accent_soft } else { tk.panel };
             egui::Frame::popup(ui.style()).fill(fill).inner_margin(egui::Margin::symmetric(3, 1)).show(ui, |ui| {
@@ -416,6 +468,28 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     let nothing = ui.ctx().memory(|m| m.focused().is_none());
     (enter && (any_focused || nothing)).then_some(e)
+}
+
+/// About the size of a value box, for keeping it in view.
+const BOX: egui::Vec2 = egui::vec2(76.0, 24.0);
+
+/// Where a value box whose top left would be `pos` goes so it stays in the drawing area `view`:
+/// as it is when it fits; else mirrored through the pointer (a box set off the cursor, past the
+/// view's edge, goes to the cursor's other side, still clear of it, #2201); else pushed inside.
+fn in_view(pos: Pos2, view: Option<egui::Rect>, pointer: Option<Pos2>) -> Pos2 {
+    let Some(view) = view else { return pos };
+    let fits = |p: Pos2| view.contains_rect(egui::Rect::from_min_size(p, BOX));
+    if fits(pos) {
+        return pos;
+    }
+    if let Some(c) = pointer {
+        let mirrored = c + (c - (pos + BOX * 0.5)) - BOX * 0.5;
+        if fits(mirrored) {
+            return mirrored;
+        }
+    }
+    let max = (view.max - BOX).max(view.min);
+    pos.clamp(view.min, max)
 }
 
 #[cfg(test)]

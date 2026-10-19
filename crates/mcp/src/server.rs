@@ -25,8 +25,8 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 /// Most messages in one JSON-RPC batch.
 const MAX_BATCH: usize = 1000;
 
-const INSTRUCTIONS: &str = "SolidCraft is a parametric 3D CAD app in the style of Autodesk Fusion. Units are millimetres \
-and degrees in expressions (internally radians), Z is up. Model like in Fusion: `sketch.create {plane: XY}`, draw \
+const INSTRUCTIONS: &str = "SolidCraft is an independent parametric 3D CAD app. Units are millimetres \
+and degrees in expressions (internally radians), Z is up. Model like this: `sketch.create {plane: XY}`, draw \
 (`sketch.rectangle.two_point {p0, p1}`, `sketch.circle.center {center, radius}`, `sketch.line {points, closed}`), constrain \
 and dimension (`sketch.dimension {entities, value}`; values may name parameters), `sketch.finish`, then features \
 (`solid.extrude {distance, operation?: new|join|cut|intersect}`, `solid.revolve`, `solid.fillet {edges: [[x,y,z] point on \

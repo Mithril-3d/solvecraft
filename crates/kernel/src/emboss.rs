@@ -442,7 +442,7 @@ fn profile_interval_overlaps(plane: &Plane, regions: &[Region2], o: Vec3, axis: 
                         add(p)?;
                     }
                 }
-                Seg2::Bezier { n, p } if (1..=7).contains(&n) => {
+                Seg2::Bezier { n, p } if (1..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(&n) => {
                     for p in p.iter().take(usize::from(n) + 1) {
                         add(*p)?;
                     }

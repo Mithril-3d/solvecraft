@@ -64,6 +64,8 @@ fn sketch_dialog_mirror_toggles_clears_references_previews_and_cancels() {
 #[test]
 fn sketch_dialog_patterns_update_counts_and_place_an_unsnapped_centre() {
     let mut h = fixture();
+    // Keep the picked geometry clear of the two-column rectangular-pattern form.
+    step(&mut h, json!({"call":"ui.camera","params":{"target":[-60,0,0],"distance":120}}));
     step(&mut h, json!({"start":"sketch.pattern.rectangular"}));
     pick(&mut h, [-22.5, 10.0], false);
     if let crate::dialogs::Kind::SketchModify(Mod::PatternRect { count, count2, .. }) = &mut h.app.dialog.as_mut().unwrap().kind {
@@ -78,7 +80,7 @@ fn sketch_dialog_patterns_update_counts_and_place_an_unsnapped_centre() {
     pick(&mut h, [-22.5, 10.0], false);
     step(&mut h, json!({"call":"ui.dialogInput","params":{"index":1}}));
     pick(&mut h, [-40.0, -20.0], false);
-    if let crate::dialogs::Kind::SketchModify(Mod::PatternCirc { count, angle }) = &mut h.app.dialog.as_mut().unwrap().kind {
+    if let crate::dialogs::Kind::SketchModify(Mod::PatternCirc { count, angle, .. }) = &mut h.app.dialog.as_mut().unwrap().kind {
         *count = "4".into();
         *angle = "180 deg".into();
     }

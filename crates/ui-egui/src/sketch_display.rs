@@ -26,8 +26,35 @@ pub fn pixel_view(proj: &Proj, ppp: f32) -> PixelCurveView {
     PixelCurveView { vp: proj.vp, width_px: f64::from(proj.rect.width() * ppp), height_px: f64::from(proj.rect.height() * ppp) }
 }
 
+/// The pieces a curve is drawn and picked from. An infinite line (#1359) reaches across the whole
+/// view: through the point of its line nearest the view's centre, far past the view each way
+/// (the sampler clips it to the view). Only the display changes: the line keeps its two points.
+fn display_segs(sketch: &Sketch, index: usize, plane: &Plane, proj: &Proj) -> Vec<solidcraft_engine::geom::Seg2> {
+    use solidcraft_engine::geom::Seg2;
+    let segs = sketch.exact_segs(index).unwrap_or_else(|| sketch.segs(index));
+    if !sketch.curves.get(index).is_some_and(|c| c.infinite) {
+        return segs;
+    }
+    let target = proj.cam.target - plane.origin;
+    let centre = Vec2::new(target.dot(plane.x), target.dot(plane.y));
+    let reach = 4.0 * (proj.cam.distance.abs() + proj.cam.half_height().abs()) + 1.0;
+    segs.into_iter()
+        .map(|s| match s {
+            Seg2::Line { a, b } => match (b - a).normalized() {
+                Some(dir) => {
+                    let mid = a + dir * (centre - a).dot(dir);
+                    let reach = reach + mid.dist(centre);
+                    Seg2::Line { a: mid - dir * reach, b: mid + dir * reach }
+                }
+                None => s,
+            },
+            other => other,
+        })
+        .collect()
+}
+
 pub fn curve_with_budget(sketch: &Sketch, index: usize, plane: &Plane, proj: &Proj, ppp: f32, budget: &mut SamplingBudget) -> SampledPath {
-    let segments = sketch.exact_segs(index).unwrap_or_else(|| sketch.segs(index));
+    let segments = display_segs(sketch, index, plane, proj);
     let mut local = SamplingBudget::new(budget.remaining_vertices.min(4096), budget.remaining_nodes.min(65_536));
     let initial = local.clone();
     let mut out = SampledPath { parts: Vec::new(), quality: SamplingQuality::Complete, vertex_count: 0 };
@@ -47,7 +74,7 @@ pub fn curve_with_budget(sketch: &Sketch, index: usize, plane: &Plane, proj: &Pr
 pub fn curve_unclipped(sketch: &Sketch, index: usize, plane: &Plane, proj: &Proj, ppp: f32) -> SampledPath {
     let mut budget = SamplingBudget::new(4096, 65_536);
     let mut out = SampledPath { parts: Vec::new(), quality: SamplingQuality::Complete, vertex_count: 0 };
-    for segment in sketch.exact_segs(index).unwrap_or_else(|| sketch.segs(index)) {
+    for segment in display_segs(sketch, index, plane, proj) {
         let sampled = sample_segment_unclipped(&segment, plane, &pixel_view(proj, ppp), &mut budget);
         if sampled.quality != SamplingQuality::Complete {
             out.quality = sampled.quality;
@@ -244,3 +271,7 @@ pub fn curve_sample(app: &SolveApp, sketch: u64, index: usize, plane: &Plane, pr
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "infinite_line_display_tests.rs"]
+mod infinite_line_display_tests;

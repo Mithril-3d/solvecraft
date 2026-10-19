@@ -9,7 +9,11 @@
 # (and whenever the AppImage's path changes) install the .desktop entry and the
 # hicolor icons into $XDG_DATA_HOME, then launch. Every failure here must leave
 # the launch untouched. Opt out with SOLIDCRAFT_NO_DESKTOP_INTEGRATION=1 (the pre-rename
-# SOLVECRAFT_NO_DESKTOP_INTEGRATION still works: compatibility shim, docs/compatibility.md).
+# SOLVECRAFT_NO_DESKTOP_INTEGRATION still works: compatibility shim, docs/compatibility.md),
+# or for good with an empty file $XDG_DATA_HOME/solidcraft/no-desktop-integration. Nothing is
+# installed either when appimaged (go-appimage) already made an entry for this AppImage, or when
+# a launcher that manages AppImages (Gear Lever, AppImageLauncher) started it: it sets
+# DESKTOPINTEGRATION and owns the menu entry.
 
 set -u
 
@@ -36,12 +40,39 @@ integrate() {
   home="${HOME:-}"
   [ -n "$home" ] || return 0
   data="${XDG_DATA_HOME:-$home/.local/share}"
+  [ -e "$data/solidcraft/no-desktop-integration" ] && return 0
   src_desktop="$APPDIR/usr/share/applications/$DESK_ID.desktop"
   [ -f "$src_desktop" ] || return 0
 
+  apps="$data/applications"
+  # Gear Lever and AppImageLauncher write their own entry and start the AppImage with
+  # DESKTOPINTEGRATION set; treat that like appimaged: no entry from here, and drop the one
+  # this script wrote earlier (it would otherwise come back after the launcher's is removed).
+  if [ -n "${DESKTOPINTEGRATION:-}" ]; then
+    mine="$apps/$DESK_ID.desktop"
+    if [ -f "$mine" ] && grep -q '^Exec="' "$mine"; then
+      rm -f "$mine"
+      command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" >/dev/null 2>&1
+    fi
+    return 0
+  fi
+  # appimaged integrates AppImages itself (appimagekit_<hash>-<name>.desktop, Exec= this file):
+  # a second entry from here would show the app twice, so drop an entry this script wrote earlier
+  # (only one it wrote: it points Exec at a path in quotes) and leave the rest to appimaged.
+  for other in "$apps"/appimagekit_*.desktop; do
+    if ! { [ -f "$other" ] && grep -qF "$appimage" "$other" 2>/dev/null; }; then
+      continue
+    fi
+    mine="$apps/$DESK_ID.desktop"
+    if [ -f "$mine" ] && grep -q '^Exec="' "$mine"; then
+      rm -f "$mine"
+      command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" >/dev/null 2>&1
+    fi
+    return 0
+  done
+
   # Rewrite Exec to this AppImage (the binary is not on the host PATH) and drop
   # TryExec, which would hide the entry; everything else is shipped as packaged.
-  apps="$data/applications"
   mkdir -p "$apps" 2>/dev/null || return 0
   tmp="$apps/.$DESK_ID.tmp.$$"
   esc="$(printf '%s' "$appimage" | sed 's/[\\&|]/\\&/g')"

@@ -24,6 +24,15 @@ const MAX_CACHED_BYTES: usize = 128 << 20;
 /// Longest font name or path accepted.
 const MAX_FONT_NAME: usize = 1024;
 
+/// Asked before a font file named by its path is read. A design names such files, and an
+/// agent's folders (`vfs::PathScope`) live above this crate; the first check set stays.
+static FILE_CHECK: OnceLock<fn(&Path) -> std::result::Result<(), String>> = OnceLock::new();
+
+/// Set the check [`font_data`] runs on a font file's path before reading it.
+pub fn set_font_file_check(check: fn(&Path) -> std::result::Result<(), String>) {
+    let _ = FILE_CHECK.set(check);
+}
+
 /// The bytes of a font file and the face to use in it (collections hold several faces).
 #[derive(Clone)]
 pub struct FontData {
@@ -59,6 +68,10 @@ pub fn font_data(name: Option<&str>) -> Result<FontData> {
     }
     if is_path(name) {
         let path = expand(name);
+        // Before the cache too: a file read once for the user is not the agent's to read.
+        if let Some(check) = FILE_CHECK.get() {
+            check(&path).map_err(|e| SketchError::Invalid(format!("font file `{name}`: {e}")))?;
+        }
         let bytes = read_font(&path).map_err(|e| SketchError::Invalid(format!("font file `{name}`: {e}")))?;
         let index = 0;
         ttf_parser::Face::parse(&bytes, index)
@@ -304,13 +317,6 @@ fn face_names(path: &Path) -> Arc<Vec<FaceNames>> {
 /// Lower-case letters and digits only: "DejaVu_Sans", "Dejavu Sans" and "dejavu-sans" are one name.
 fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
-}
-
-/// The file a font name refers to (after `~` and `%VAR%` expansion), or `None` for the built-in
-/// font or an installed family, so callers can vet the path before [`font_data`] reads it.
-pub fn font_file_path(name: &str) -> Option<PathBuf> {
-    let name = name.trim();
-    (is_path(name) && name.len() <= MAX_FONT_NAME).then(|| expand(name))
 }
 
 fn is_path(name: &str) -> bool {

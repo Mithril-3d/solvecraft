@@ -560,3 +560,161 @@ mod close_pairs {
         assert!(budget < 10_000_000, "work was counted");
     }
 }
+
+mod blend {
+    use super::*;
+
+    /// `j!` for the small orders the Hermite and quotient identities use.
+    fn fact(j: usize) -> f64 {
+        (1..=j).fold(1.0, |a, b| a * b as f64)
+    }
+
+    /// The derivatives 1…`order` a Bézier's control polygon carries at its end `at_end`: the j-th
+    /// difference of the controls, scaled by `n!/(n − j)!`. This is the textbook endpoint identity
+    /// of a Bézier, written here independently of the library's.
+    fn control_derivatives(ctrl: &[Vec2], at_end: bool, order: usize) -> Vec<Vec2> {
+        let c: Vec<Vec2> = if at_end { ctrl.iter().rev().copied().collect() } else { ctrl.to_vec() };
+        let n = c.len() - 1;
+        let (mut diffs, mut scale) = (c, 1.0);
+        let mut out = Vec::new();
+        for j in 1..=order {
+            diffs = diffs.windows(2).map(|w| w[1] - w[0]).collect();
+            scale *= (n + 1 - j) as f64;
+            out.push(diffs.first().copied().unwrap_or_default() * scale);
+        }
+        // The reversed controls describe `P(1 − s)`, so reversing again to read the original
+        // parameterisation negates the odd orders.
+        if at_end {
+            for (i, v) in out.iter_mut().enumerate() {
+                if i % 2 == 0 {
+                    *v = -*v;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hermite_bezier_meets_the_derivative_data_at_both_ends() {
+        let (p0, p1) = (Vec2::new(1.0, 2.0), Vec2::new(-3.0, 4.5));
+        let d0 = [Vec2::new(2.0, 1.0), Vec2::new(-0.5, 3.0), Vec2::new(1.5, 1.0), Vec2::new(0.25, -2.0)];
+        let d1 = [Vec2::new(-1.0, 0.5), Vec2::new(2.0, -1.5), Vec2::new(-0.75, 0.5), Vec2::new(3.0, 1.25)];
+        for k in 0..=MAX_DERIVATIVE_ORDER {
+            let cps = hermite_bezier(p0, p1, &d0[..k], &d1[..k]).unwrap();
+            assert_eq!(cps.len(), 2 * k + 2, "degree 2k+1 has 2k+2 controls");
+            assert_eq!(cps[0], p0);
+            assert_eq!(*cps.last().unwrap(), p1);
+            for (got, want) in control_derivatives(&cps, false, k).iter().zip(&d0[..k]) {
+                assert!(got.dist(*want) < 1e-11, "k={k} at t=0: {got:?} vs {want:?}");
+            }
+            for (got, want) in control_derivatives(&cps, true, k).iter().zip(&d1[..k]) {
+                assert!(got.dist(*want) < 1e-11, "k={k} at t=1: {got:?} vs {want:?}");
+            }
+            // The piece is exactly the single Bézier `bezier` hands back, and its ends are the two
+            // joints.
+            let seg = bezier(&cps).unwrap();
+            assert!(seg.start().dist(p0) < 1e-12 && seg.end().dist(p1) < 1e-12);
+            for (got, want) in seg.derivatives(0.0, k).unwrap().iter().zip(&d0[..k]) {
+                assert!(got.dist(*want) < 1e-10, "k={k} at t=0: {got:?} vs {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hermite_bezier_refuses_hostile_data() {
+        let (p0, p1) = (Vec2::ZERO, Vec2::X);
+        let d = [Vec2::Y, Vec2::X];
+        assert!(hermite_bezier(p0, p1, &d, &d).is_some());
+        assert!(hermite_bezier(p0, p1, &d, &d[..1]).is_none(), "the ends must agree on the order");
+        assert!(hermite_bezier(p0, p1, &[Vec2::ZERO; 5], &[Vec2::ZERO; 5]).is_none(), "order above G4");
+        assert!(hermite_bezier(Vec2::new(f64::NAN, 0.0), p1, &[], &[]).is_none());
+        assert!(hermite_bezier(p0, p1, &[Vec2::new(f64::INFINITY, 0.0)], &[Vec2::Y]).is_none());
+        assert!(hermite_bezier(p0, p1, &[], &[Vec2::Y]).is_none());
+    }
+
+    #[test]
+    fn seg_derivatives_are_exact_for_lines_and_polynomial_pieces() {
+        let line = Seg2::Line { a: Vec2::new(-1.0, 2.0), b: Vec2::new(3.0, 5.0) };
+        let d = line.derivatives(0.0, MAX_DERIVATIVE_ORDER).unwrap();
+        assert!(d[0].dist(Vec2::new(4.0, 3.0)) < 1e-12);
+        assert_eq!(d[1].len() + d[2].len() + d[3].len(), 0.0, "a line has no curvature");
+        let cubic = Seg2::Cubic { p0: Vec2::new(0.0, 0.0), p1: Vec2::new(3.0, 9.0), p2: Vec2::new(7.0, -4.0), p3: Vec2::new(11.0, 2.0) };
+        let ctrl = [Vec2::new(0.0, 0.0), Vec2::new(3.0, 9.0), Vec2::new(7.0, -4.0), Vec2::new(11.0, 2.0)];
+        for (t, at_end) in [(0.0, false), (1.0, true)] {
+            for (got, want) in cubic.derivatives(t, MAX_DERIVATIVE_ORDER).unwrap().iter().zip(control_derivatives(&ctrl, at_end, 4)) {
+                assert!(got.dist(want) < 1e-9, "t={t}: {got:?} vs {want:?}");
+            }
+        }
+        for t in [0.0, 0.35, 1.0] {
+            assert!(cubic.derivatives(t, 1).unwrap()[0].dist(cubic.derivative(t)) < 1e-9, "t={t}");
+        }
+        // A degree-9 piece (the G4 blend's own shape) at both ends.
+        let pts: Vec<Vec2> = (0..10).map(|i| Vec2::new(i as f64 * 0.7, (i as f64 * 1.3).sin())).collect();
+        let seg = bezier(&pts).unwrap();
+        assert!(matches!(seg, Seg2::Bezier { n: 9, .. }));
+        for (t, at_end) in [(0.0, false), (1.0, true)] {
+            for (got, want) in seg.derivatives(t, MAX_DERIVATIVE_ORDER).unwrap().iter().zip(control_derivatives(&pts, at_end, 4)) {
+                assert!(got.dist(want) < 1e-9, "t={t}: {got:?} vs {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn seg_derivatives_follow_the_circular_recurrence() {
+        let arc = Seg2::Arc { center: Vec2::new(2.0, -1.0), radius: 5.0, start: 0.7, sweep: -1.9 };
+        let Seg2::Arc { center, sweep, .. } = arc else { panic!("an arc") };
+        for t in [0.0, 0.4, 1.0] {
+            let d = arc.derivatives(t, MAX_DERIVATIVE_ORDER).unwrap();
+            let p = arc.point_at(t);
+            let sw2 = sweep * sweep;
+            // On a circle every derivative follows from the second: P″ = −sw²(P − c), and the rest
+            // differentiate that relation, so a line and an arc have zero curvature rates.
+            assert!(d[1].dist((p - center) * -sw2) < 1e-9, "t={t}");
+            assert!(d[2].dist(d[0] * -sw2) < 1e-9, "t={t}");
+            assert!(d[3].dist(d[1] * -sw2) < 1e-9, "t={t}");
+            assert!(d[0].dist(arc.derivative(t)) < 1e-9, "t={t}");
+        }
+    }
+
+    #[test]
+    fn seg_derivatives_of_a_conic_satisfy_the_quotient_identity() {
+        let conic = Seg2::Conic { a: Vec2::new(-2.0, 0.0), apex: Vec2::new(0.0, 3.0), b: Vec2::new(4.0, 0.5), w: 0.7 };
+        let Seg2::Conic { a, apex, b, w } = conic else { panic!("a conic") };
+        // The rational quadratic's numerator and weight polynomials, straight from their Bernstein
+        // form, and their power coefficients at `t` by differences (exact for a quadratic).
+        let n_at = |x: f64| a * ((1.0 - x) * (1.0 - x)) + apex * (2.0 * w * x * (1.0 - x)) + b * (x * x);
+        let d_at = |x: f64| (1.0 - x) * (1.0 - x) + 2.0 * w * x * (1.0 - x) + x * x;
+        for t in [0.0, 0.25, 1.0] {
+            let h = 1e-3;
+            // Taylor coefficients at `t` (differences are exact for a quadratic): f, f′/1!, f″/2!.
+            let coef_v = |f: &dyn Fn(f64) -> Vec2| [f(t), (f(t + h) - f(t - h)) / (2.0 * h), (f(t + h) - f(t) * 2.0 + f(t - h)) / (2.0 * h * h)];
+            let coef_s = |f: &dyn Fn(f64) -> f64| [f(t), (f(t + h) - f(t - h)) / (2.0 * h), (f(t + h) - f(t) * 2.0 + f(t - h)) / (2.0 * h * h)];
+            let n = coef_v(&n_at);
+            let d = coef_s(&d_at);
+            let got = conic.derivatives(t, MAX_DERIVATIVE_ORDER).unwrap();
+            // Taylor coefficients of P: P(t) and P⁽ʲ⁾(t)/j!. Leibniz on N = P·D then reads
+            // Σ xᵢ·dⱼ₋ᵢ = nⱼ at every order, which the quotient rule must reproduce.
+            let x: Vec<Vec2> = std::iter::once(conic.point_at(t)).chain(got.iter().enumerate().map(|(i, v)| *v / fact(i + 1))).collect();
+            for j in 0..=4usize {
+                let lhs: Vec2 = (0..=j).fold(Vec2::ZERO, |acc, i| acc + x[i] * d.get(j - i).copied().unwrap_or(0.0));
+                let rhs = n.get(j).copied().unwrap_or(Vec2::ZERO);
+                assert!(lhs.dist(rhs) < 1e-8 * rhs.len().max(1.0), "t={t} j={j}: {lhs:?} vs {rhs:?}");
+            }
+            assert!(got[0].dist(conic.derivative(t)) < 1e-8, "t={t}");
+        }
+    }
+
+    #[test]
+    fn seg_derivatives_refuse_hostile_input_and_degenerate_pieces() {
+        let c = Seg2::Cubic { p0: Vec2::ZERO, p1: Vec2::X, p2: Vec2::Y, p3: Vec2::X + Vec2::Y };
+        assert!(c.derivatives(0.0, MAX_DERIVATIVE_ORDER + 1).is_none(), "no order above G4");
+        assert!(c.derivatives(f64::NAN, 2).is_none());
+        let nan = Seg2::Line { a: Vec2::new(f64::NAN, 0.0), b: Vec2::X };
+        assert!(nan.derivatives(0.0, 1).is_none());
+        // A conic whose weight vanishes is a straight chord drawn at zero speed: its derivatives
+        // are finite, but the first is zero, which is what a blend refuses.
+        let flat = Seg2::Conic { a: Vec2::ZERO, apex: Vec2::new(1.0, 1.0), b: Vec2::new(2.0, 0.0), w: 0.0 };
+        let d = flat.derivatives(0.0, 1).unwrap();
+        assert_eq!(d[0], Vec2::ZERO);
+    }
+}

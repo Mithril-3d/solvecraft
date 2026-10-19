@@ -50,6 +50,11 @@ mod imp {
         check(path)?;
         std::fs::remove_file(path)
     }
+    /// A folder and the folders above it, where missing.
+    pub fn create_dir_all(path: &str) -> Result<()> {
+        check(path)?;
+        std::fs::create_dir_all(path)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -93,6 +98,10 @@ mod imp {
     }
     pub fn remove(path: &str) -> Result<()> {
         FILES.with(|f| f.borrow_mut().remove(path)).map(|_| ()).ok_or_else(|| missing(path))
+    }
+    /// Files are keyed by their whole path here: a folder needs no making.
+    pub fn create_dir_all(_path: &str) -> Result<()> {
+        Ok(())
     }
     pub fn insert(path: &str, bytes: Vec<u8>) {
         FILES.with(|f| f.borrow_mut().insert(path.to_string(), bytes));
@@ -232,15 +241,52 @@ impl PathScope {
         {
             return Err(windows(why));
         }
-        let resolved = resolve(std::path::Path::new(path)).map_err(|_| refused())?;
+        let resolved = match resolve(std::path::Path::new(path)) {
+            Ok(r) => r,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(self.missing_folder(path).unwrap_or_else(refused)),
+            Err(_) => return Err(refused()),
+        };
         // Judged again once resolved: a link or junction inside an allowed folder may lead to a
         // network share or a device even though the path given looked local.
         if cfg!(windows) && !local_drive_path(&resolved) {
             return Err(windows("only paths on a local drive"));
         }
-        let inside_design =
-            || self.design_roots.iter().any(|r| resolved.strip_prefix(r).is_ok_and(|rel| !rel.components().any(|c| hidden(c.as_os_str()))));
-        if self.roots.iter().any(|r| resolved.starts_with(r)) || inside_design() { Ok(()) } else { Err(refused()) }
+        if self.contains(&resolved) { Ok(()) } else { Err(refused()) }
+    }
+
+    /// Whether the resolved path `p` lies inside one of the folders.
+    fn contains(&self, p: &std::path::Path) -> bool {
+        let inside_design = || self.design_roots.iter().any(|r| p.strip_prefix(r).is_ok_and(|rel| !rel.components().any(|c| hidden(c.as_os_str()))));
+        self.roots.iter().any(|r| p.starts_with(r)) || inside_design()
+    }
+
+    /// The "folder does not exist" error for a path whose folder is missing, but only when the
+    /// nearest folder that does exist is one of the scope's own: telling the user which folder is
+    /// missing must not become a way to probe the disk outside it.
+    fn missing_folder(&self, path: &str) -> Option<Error> {
+        let given = std::path::Path::new(path);
+        // A dangling link (the path itself, or in its folders) is not a missing folder: it leads
+        // somewhere, and that is refused.
+        let mut missing = given.parent()?;
+        let existing = loop {
+            let here = if missing.as_os_str().is_empty() { std::path::Path::new(".") } else { missing };
+            if let Ok(c) = std::fs::canonicalize(here) {
+                break c;
+            }
+            if std::fs::symlink_metadata(here).is_ok() {
+                return None;
+            }
+            missing = missing.parent()?;
+        };
+        if std::fs::symlink_metadata(given).is_ok() {
+            return None;
+        }
+        self.contains(&existing).then(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("{path}: its folder does not exist (nothing exists below {}); create the folder first", existing.display()),
+            )
+        })
     }
 }
 
@@ -293,7 +339,7 @@ pub fn windows_refusal(path: &str) -> Option<&'static str> {
         // A short (8.3) name such as `PROGRA~1` or `SSH~1` is another spelling of a folder whose
         // real name could be anything; canonicalising expands existing ones, and a new file's
         // name must not be one.
-        if name.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
+        if short_name(name) {
             return Some("short (8.3) names such as `PROGRA~1`");
         }
         let stem = name.split('.').next().unwrap_or("").trim_end_matches([' ', '.']).to_uppercase();
@@ -304,6 +350,45 @@ pub fn windows_refusal(path: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Whether a file or folder name looks like a short (8.3) name: a `~` and a digit (`PROGRA~1`).
+fn short_name(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// `path` spelled with long names, for the folders SolidCraft derives from the environment
+/// itself (the temporary folder, the recovery folder). On Windows those may hold a short (8.3)
+/// name: the temporary folder is often `…\NAME~1.XYZ\AppData\Local\Temp`, with the user folder's
+/// short name, when that folder's name is long, and [`windows_refusal`] refuses short names in
+/// every path an agent's commands reach, the server's own folders included. A path with a short
+/// name is resolved as far as it exists (the rest is appended as given) and loses the `\\?\`
+/// prefix resolving adds. It stays as it is when it has no short name, can't be resolved or
+/// doesn't resolve to a local drive, and off Windows.
+pub fn long_names(path: &std::path::Path) -> std::path::PathBuf {
+    if !cfg!(windows) || !path.iter().any(|n| short_name(&n.to_string_lossy())) {
+        return path.to_path_buf();
+    }
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(full) = std::fs::canonicalize(at) {
+            let local = full
+                .to_str()
+                .and_then(|f| f.strip_prefix(r"\\?\"))
+                .filter(|f| matches!(f.as_bytes(), [d, b':', b'\\', ..] if d.is_ascii_alphabetic()));
+            return local.map_or_else(|| path.to_path_buf(), |f| rest.iter().rev().fold(std::path::PathBuf::from(f), |p, n| p.join(n)));
+        }
+        let (Some(parent), Some(name)) = (at.parent(), at.file_name()) else { return path.to_path_buf() };
+        rest.push(name);
+        at = parent;
+    }
+}
+
+/// The temporary folder spelled with long names ([`long_names`]), for the folders SolidCraft
+/// makes in it.
+pub fn temp_dir() -> std::path::PathBuf {
+    long_names(&std::env::temp_dir())
 }
 
 /// `path` with symlinks and `..` resolved. A file that doesn't exist yet resolves through its
@@ -330,6 +415,8 @@ pub fn scoped<T>(scope: Option<PathScope>, f: impl FnOnce() -> T) -> T {
             SCOPE.with(|s| *s.borrow_mut() = prev);
         }
     }
+    // Sketch text reads the font files a design names, below this crate: it asks here first.
+    solidcraft_doc::sketch::set_font_file_check(|p| check(&p.to_string_lossy()).map_err(|e| e.to_string()));
     let _restore = Restore(SCOPE.with(|s| s.replace(scope)));
     f()
 }
@@ -435,6 +522,8 @@ mod tests {
                 assert!(super::write(&p, b"x").is_err() && super::remove(&p).is_err() && super::len(&p).is_err() && !super::exists(&p), "{p}");
             }
             assert!(super::write(&s(out.join("new.txt")), b"x").is_err());
+            let e = super::check(&s(root.join("dangling/x.txt"))).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
             assert!(super::check(&s(root.join("sub/../sub/b.txt"))).is_ok(), "`..` that stays inside is fine");
         });
         assert_eq!(std::fs::read_to_string(out.join("secret.txt")).unwrap(), "secret");
@@ -462,9 +551,16 @@ mod tests {
         let scope = PathScope::new([a.clone()]);
         let s = |p: std::path::PathBuf| p.to_string_lossy().to_string();
         assert!(scope.check(&s(a.join("new.txt"))).is_ok());
-        for refused in [ab.join("x.txt"), a.join("missing/x.txt"), a.join("link/new.txt")] {
+        for refused in [ab.join("x.txt"), a.join("link/new.txt"), base.join("missing/x.txt")] {
             let e = scope.check(&s(refused.clone())).unwrap_err();
             assert!(e.to_string().contains("outside the folders this agent may use"), "{}: {e}", refused.display());
+        }
+        // A folder that is missing inside an allowed one is reported as missing (#1077), not as
+        // out of scope: widening `--allow-path` would not help. Nothing is created.
+        for missing in [a.join("missing/x.txt"), a.join("missing/deeper/x.txt")] {
+            let e = scope.check(&s(missing.clone())).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{}: {e}", missing.display());
+            assert!(e.to_string().contains("its folder does not exist") && !e.to_string().contains("--allow-path"), "{e}");
         }
         super::scoped(Some(scope), || assert!(super::write(&s(a.join("link/new.txt")), b"x").is_err()));
         assert!(!out.join("new.txt").exists() && !a.join("missing").exists());
@@ -536,7 +632,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_unc_verbatim_drive_relative_and_device_paths_are_refused() {
-        let root = std::env::temp_dir().join(format!("solidcraft-vfs-win-{}", std::process::id()));
+        let root = super::temp_dir().join(format!("solidcraft-vfs-win-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let scope = super::PathScope::new([root.clone()]);
         let inside = |f: &str| root.join(f).to_string_lossy().to_string();
@@ -556,6 +652,45 @@ mod tests {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{bad}: {e}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The short (8.3) spelling of an existing `path` as `cmd` gives it (`NAME~1.XYZ`), or `None`
+    /// when it has no short name (the volume makes none).
+    #[cfg(windows)]
+    fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("cmd").raw_arg(format!("/d /c for %I in (\"{}\") do @echo %~sI", path.display())).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| s.split('\\').any(super::short_name)).map(Into::into)
+    }
+
+    /// The folders SolidCraft derives from the environment are spelled with long names: on Windows
+    /// the temporary folder's path often has a short (8.3) name (the user folder's `NAME~1.XYZ`
+    /// when its name is long), and the server's own folders in it were refused like an agent's
+    /// short names. An agent's own short spelling of a folder it may use stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn derived_folders_are_spelled_with_long_names_and_short_names_from_agents_stay_refused() {
+        use super::{PathScope, long_names, short_name, temp_dir};
+        assert!(!temp_dir().iter().any(|n| short_name(&n.to_string_lossy())), "{}", temp_dir().display());
+        let long = temp_dir().join(format!("solidcraft-vfs-long-names-{}", std::process::id()));
+        std::fs::create_dir_all(&long).unwrap();
+        let Some(short) = short_spelling(&long) else {
+            eprintln!("skipped: {} has no short (8.3) name on this volume", long.display());
+            let _ = std::fs::remove_dir_all(&long);
+            return;
+        };
+        let expanded = long_names(&short);
+        assert_eq!(std::fs::canonicalize(&expanded).unwrap(), std::fs::canonicalize(&long).unwrap());
+        assert!(super::windows_refusal(&expanded.to_string_lossy()).is_none(), "{}", expanded.display());
+        // What doesn't exist yet is kept as given; a path without a short name is left alone.
+        assert_eq!(long_names(&short.join("new folder").join("part.step")), expanded.join("new folder").join("part.step"));
+        assert_eq!(long_names(&long), long);
+        // The folder through a scope: its long spelling is in reach, an agent's short one is not.
+        let scope = PathScope::new([long.clone()]);
+        assert!(scope.check(&expanded.join("part.step").to_string_lossy()).is_ok());
+        let e = scope.check(&short.join("part.step").to_string_lossy()).unwrap_err();
+        assert!(e.to_string().contains("short (8.3) names"), "{e}");
+        let _ = std::fs::remove_dir_all(&long);
     }
 
     /// The open design's folder counts only when it is safe (#205): strictly inside home (or the

@@ -69,7 +69,7 @@ fn forget_removed(app: &SolveApp) {
 pub fn gpu_images(app: &SolveApp) -> Vec<GpuImage> {
     forget_removed(app);
     let doc = &app.session.doc;
-    if doc.canvases.is_empty() {
+    if doc.canvases.is_empty() || app.session.folder_hidden(crate::browser::CANVASES) {
         return Vec::new();
     }
     let (vals, _) = doc.param_values();
@@ -109,7 +109,7 @@ pub fn show(app: &SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &Proj)
     }
     forget_removed(app);
     let doc = &app.session.doc;
-    if doc.canvases.is_empty() {
+    if doc.canvases.is_empty() || app.session.folder_hidden(crate::browser::CANVASES) {
         return;
     }
     let (vals, _) = doc.param_values();

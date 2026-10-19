@@ -84,7 +84,45 @@ pub enum LinkSource {
         /// Bold or italic, alignment, spacing and the curve the text follows.
         #[serde(default, skip_serializing_if = "crate::text::TextStyle::is_plain")]
         style: crate::text::TextStyle,
+        /// The expressions behind the numbers above that were typed as expressions.
+        #[serde(default, skip_serializing_if = "TextExprs::is_empty")]
+        exprs: TextExprs,
     },
+}
+
+/// The expressions behind a text's numbers that were typed as expressions: its place (`x`, `y`),
+/// its height and its angle. A number without an expression is the number typed. The numbers
+/// of `LinkSource::Text` are what the expressions gave last: the document evaluates them against
+/// its parameters before the text's outlines are rebuilt (`Document::apply_text_values`), and
+/// the sketch crate, which knows no parameters, only keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TextExprs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<String>,
+}
+
+impl TextExprs {
+    pub fn is_empty(&self) -> bool {
+        *self == TextExprs::default()
+    }
+
+    /// The expressions set, each with what it sets.
+    pub fn list(&self) -> Vec<(&'static str, &String)> {
+        [("Text X", &self.x), ("Text Y", &self.y), ("Text height", &self.height), ("Text angle", &self.angle)]
+            .into_iter()
+            .filter_map(|(what, e)| e.as_ref().map(|e| (what, e)))
+            .collect()
+    }
+
+    pub fn list_mut(&mut self) -> Vec<&mut String> {
+        [&mut self.x, &mut self.y, &mut self.height, &mut self.angle].into_iter().filter_map(Option::as_mut).collect()
+    }
 }
 
 impl LinkSource {
@@ -106,6 +144,31 @@ impl LinkSource {
             LinkSource::Spun { body, .. } => format!("spun profile of {body}"),
             LinkSource::Iso { body, .. } => format!("isoparametric curve of {body}"),
             LinkSource::Text { text, .. } => format!("text \"{}\"", text.chars().take(20).collect::<String>()),
+        }
+    }
+
+    /// The bodies this source reads geometry from (an intersection reads two).
+    pub fn bodies(&self) -> Vec<&str> {
+        match self {
+            LinkSource::Edge { body, .. }
+            | LinkSource::Face { body, .. }
+            | LinkSource::Body { body }
+            | LinkSource::Vertex { body, .. }
+            | LinkSource::OnSurface { body, .. }
+            | LinkSource::Iso { body, .. }
+            | LinkSource::Spun { body, .. } => vec![body.as_str()],
+            LinkSource::Intersection { a, b } => {
+                let mut bodies = a.bodies();
+                bodies.extend(b.bodies());
+                bodies
+            }
+            LinkSource::SketchCurve { .. }
+            | LinkSource::SketchPoint { .. }
+            | LinkSource::Origin
+            | LinkSource::Axis { .. }
+            | LinkSource::SketchAxis { .. }
+            | LinkSource::Plane { .. }
+            | LinkSource::Text { .. } => Vec::new(),
         }
     }
 }
@@ -193,7 +256,7 @@ impl LinkGeom {
                 (!*periodic || (!*control && *degree == 3 && crate::periodic_beziers(pts).is_ok()))
                     && (2..=crate::curves::MAX_SPLINE_POINTS).contains(&pts.len())
                     && pts.iter().all(ok)
-                    && (1..=7).contains(degree)
+                    && (1..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(degree)
             }
         }
     }
@@ -356,6 +419,44 @@ fn same_geometry(a: &[(LCurve, Vec<Vec2>)], b: &[(LCurve, Vec<Vec2>)]) -> bool {
 }
 
 /// The point indices a layout curve uses, in order.
+/// Is `fresh` the boundary `old` was, with only the stations along its straight lines gone
+/// (#1049: straight edges that booleans left split at vertices nothing else used are now one
+/// edge)? Every old line lies along exactly one fresh line and the old pieces cover it end to
+/// end; every other curve is unchanged. A link saved with the stations keeps its pieces then:
+/// the region they bound is the same, and the features that name them by id still find them.
+fn only_stations_gone(old: &[(LCurve, Vec<Vec2>)], fresh: &[(LCurve, Vec<Vec2>)]) -> bool {
+    const TOL: f64 = 1e-6;
+    let is_line = |c: &&(LCurve, Vec<Vec2>)| matches!(c.0, LCurve::Line(..));
+    let ends = |c: &(LCurve, Vec<Vec2>)| match c.1.as_slice() {
+        [a, b] => Some((*a, *b)),
+        _ => None,
+    };
+    let (old_lines, old_rest): (Vec<_>, Vec<_>) = old.iter().partition(is_line);
+    let (fresh_lines, fresh_rest): (Vec<_>, Vec<_>) = fresh.iter().partition(is_line);
+    if fresh_lines.len() >= old_lines.len() || old_lines.len() > 512 {
+        return false;
+    }
+    let rest = |xs: Vec<&(LCurve, Vec<Vec2>)>| xs.into_iter().cloned().collect::<Vec<_>>();
+    if !same_geometry(&rest(old_rest), &rest(fresh_rest)) {
+        return false;
+    }
+    let Some(fresh_segs) = fresh_lines.iter().map(|c| ends(c)).collect::<Option<Vec<_>>>() else { return false };
+    let mut covered = vec![0.0; fresh_segs.len()];
+    for c in &old_lines {
+        let Some((p, q)) = ends(c) else { return false };
+        let on = |x: Vec2, (a, b): (Vec2, Vec2)| {
+            let ab = b - a;
+            let t = ((x - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+            x.dist(a + ab * t) <= TOL * (1.0 + a.len().max(b.len()))
+        };
+        let Some(k) = fresh_segs.iter().position(|seg| on(p, *seg) && on(q, *seg)) else { return false };
+        if let Some(slot) = covered.get_mut(k) {
+            *slot += p.dist(q);
+        }
+    }
+    fresh_segs.iter().zip(&covered).all(|((a, b), len)| (a.dist(*b) - len).abs() <= TOL * (1.0 + a.len().max(b.len())))
+}
+
 fn curve_points(c: &LCurve) -> Vec<usize> {
     match *c {
         LCurve::Line(a, b) => vec![a, b],
@@ -417,6 +518,30 @@ fn point_roles(curves: &[LCurve], point_count: usize) -> Vec<[usize; 10]> {
 impl Sketch {
     pub fn link(&self, id: &str) -> Option<&Link> {
         self.links.iter().find(|l| l.id == id)
+    }
+
+    /// The expressions of the sketch's texts, each with what it sets (`Text height`…).
+    pub fn text_exprs(&self) -> Vec<(&'static str, &String)> {
+        self.links
+            .iter()
+            .filter_map(|l| match &l.source {
+                LinkSource::Text { exprs, .. } => Some(exprs.list()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Mutable view of [`Sketch::text_exprs`], for renaming the parameters they refer to.
+    pub fn text_exprs_mut(&mut self) -> Vec<&mut String> {
+        self.links
+            .iter_mut()
+            .filter_map(|l| match &mut l.source {
+                LinkSource::Text { exprs, .. } => Some(exprs.list_mut()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// Curves owned by a link, in creation order.
@@ -530,6 +655,7 @@ impl Sketch {
                 link: Some(id.to_string()),
                 centerline: false,
                 fixed: false,
+                infinite: false,
             });
         }
         for li in &lay.lone {
@@ -677,9 +803,8 @@ impl Sketch {
             let lone_old: Vec<Vec2> = points.iter().filter_map(|pi| pos(*pi)).collect();
             if let (Some(old), Some(fresh)) = (old, fresh)
                 && lay.lone.is_empty()
-                && points.len() == lay.pts.len()
                 && lone_old.len() == points.len()
-                && same_geometry(&old, &fresh)
+                && (points.len() == lay.pts.len() && same_geometry(&old, &fresh) || only_stations_gone(&old, &fresh))
             {
                 return Ok(false);
             }

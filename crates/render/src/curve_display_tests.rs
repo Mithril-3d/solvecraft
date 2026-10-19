@@ -27,7 +27,7 @@ fn dense_error(s: &Seg2, plane: &Plane, v: &PixelCurveView, path: &SampledPath) 
 
 #[test]
 fn exact_arcs_ellipses_rational_and_looping_control_hulls_bound_pixels() {
-    let mut degree7 = [Vec2::ZERO; 8];
+    let mut degree7 = [Vec2::ZERO; solidcraft_geom::MAX_BEZIER_CTRL];
     for (i, p) in degree7.iter_mut().enumerate() {
         *p = Vec2::new(i as f64 / 4.0 - 0.875, if i % 2 == 0 { -0.8 } else { 0.8 });
     }

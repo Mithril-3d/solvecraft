@@ -34,7 +34,7 @@ pub fn watching<R>(watch: Arc<dyn Watch>, f: impl FnOnce() -> R) -> R {
 }
 
 /// The watch over this thread's work, to hand to the worker threads it starts.
-pub(crate) fn current() -> Option<Arc<dyn Watch>> {
+pub fn current() -> Option<Arc<dyn Watch>> {
     CURRENT.with(|c| c.borrow().clone())
 }
 

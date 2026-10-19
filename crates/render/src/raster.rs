@@ -1,54 +1,10 @@
 //! CPU rasterizer for headless snapshots: z-buffered, smooth-shaded triangles and depth-tested
 //! lines, rendered at 2× and downsampled for anti-aliasing.
 
-use std::sync::Arc;
-
-use solidcraft_geom::{Mesh, Vec3};
+use solidcraft_geom::Vec3;
 
 use crate::Camera;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rgb(pub u8, pub u8, pub u8);
-
-impl Rgb {
-    fn f(self) -> [f64; 3] {
-        [self.0 as f64 / 255.0, self.1 as f64 / 255.0, self.2 as f64 / 255.0]
-    }
-}
-
-pub struct SceneMesh {
-    pub mesh: Arc<Mesh>,
-    pub color: Rgb,
-    /// Faces in colours of their own: (B-rep face index, colour).
-    pub face_colors: Vec<(u32, Rgb)>,
-}
-
-pub struct SceneLine {
-    pub points: Vec<Vec3>,
-    pub color: Rgb,
-    /// Width in output pixels.
-    pub width: f64,
-    /// Draw over everything (sketch geometry being edited).
-    pub on_top: bool,
-}
-
-#[derive(Default)]
-pub struct Scene {
-    pub meshes: Vec<SceneMesh>,
-    pub lines: Vec<SceneLine>,
-    /// Background gradient top → bottom.
-    pub background: Option<(Rgb, Rgb)>,
-    /// Scene radius for clipping planes.
-    pub radius: f64,
-    /// A section cut: (normal, d); what lies where normal·p > d is cut away, and the inside
-    /// shows as a hatched cap.
-    pub clip: Option<(Vec3, f64)>,
-    /// The colour the section cap is tinted toward (default: [`SECTION_CAP`]).
-    pub cap: Option<Rgb>,
-}
-
-/// The section cap's default tint, as in the viewport.
-pub const SECTION_CAP: Rgb = Rgb(214, 128, 72);
+use crate::scene::{Rgb, SECTION_CAP, Scene, png};
 
 /// RGBA pixels plus depth.
 pub struct Canvas {
@@ -79,7 +35,7 @@ impl Canvas {
     }
 }
 
-fn shade(n: Vec3, view_dir: Vec3, base: [f64; 3]) -> [f64; 3] {
+pub(crate) fn shade(n: Vec3, view_dir: Vec3, base: [f64; 3]) -> [f64; 3] {
     let n = if n.dot(view_dir) < 0.0 { -n } else { n };
     let key = (view_dir * 0.8 + Vec3::new(-0.3, 0.2, 0.6)).normalized().unwrap_or(view_dir);
     let diff = n.dot(key).max(0.0);
@@ -220,7 +176,7 @@ pub fn render(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
             *s = s.max(cap_slope);
         }
     }
-    for l in &scene.lines {
+    for l in scene.grid.iter().chain(&scene.lines) {
         let col = l.color.f();
         let half = (l.width * SS as f64 * 0.5).max(0.5);
         for seg in l.points.windows(2) {
@@ -326,14 +282,6 @@ pub fn render_png(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Option<Vec
     png(c.w, c.h, c.rgba)
 }
 
-/// RGBA pixels (`w × h`) to PNG bytes.
-pub fn png(w: usize, h: usize, rgba: Vec<u8>) -> Option<Vec<u8>> {
-    let img = image::RgbaImage::from_raw(u32::try_from(w).ok()?, u32::try_from(h).ok()?, rgba)?;
-    let mut buf = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
-    Some(buf.into_inner())
-}
-
 /// Render on a transparent background: the scene drawn over black and over white, and the
 /// alpha recovered from the difference (exact for the anti-aliased edges).
 pub fn render_transparent(scene: &mut Scene, cam: &Camera, w: usize, h: usize) -> Canvas {
@@ -359,6 +307,9 @@ pub fn render_transparent(scene: &mut Scene, cam: &Camera, w: usize, h: usize) -
 mod tests {
     use super::*;
     use crate::StandardView;
+    use crate::scene::{SceneLine, SceneMesh};
+    use solidcraft_geom::Mesh;
+    use std::sync::Arc;
 
     /// Lines are cut by the section in 3D: the kept piece ends on the plane.
     #[test]
@@ -391,6 +342,7 @@ mod tests {
             radius: 20.0,
             clip: None,
             cap: None,
+            ..Default::default()
         };
         let mut cam = Camera { distance: 50.0, ..Default::default() };
         cam.set_view(StandardView::Front);

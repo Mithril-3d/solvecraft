@@ -379,6 +379,34 @@ fn a_fillet_rounds_every_picked_corner_to_one_radius() {
 }
 
 #[test]
+fn fully_constrained_center_rectangle_corners_can_be_picked_and_filleted() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.rectangle.center", json!({"center":[0,0],"corner":[20,15]})).unwrap();
+    h.app.run("sketch.constraint.coincident", json!({"a":"p5","b":"origin"})).unwrap();
+    h.app.run("sketch.dimension", json!({"entities":["l1"],"value":40})).unwrap();
+    h.app.run("sketch.dimension", json!({"entities":["l2"],"value":30})).unwrap();
+    h.frames(2);
+    h.step(&json!({"start":"sketch.fillet"})).unwrap();
+    h.frames(2);
+    for corner in [[-20, -15, 0], [20, -15, 0], [20, 15, 0], [-20, 15, 0]] {
+        h.step(&json!({"click":{"world":corner}})).unwrap();
+        h.frames(2);
+    }
+    assert_eq!(h.app.dialog.as_ref().map(|d| d.inputs[0].items.len()), Some(4));
+    set_size(&mut h.app, "3");
+    apply(&mut h);
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.status);
+    let info = h.app.run("sketch.inspect", json!({})).unwrap();
+    assert_eq!(info["dof"], 0, "{info}");
+    assert_eq!(info["status"], "solved", "{info}");
+    let st = h.app.session.world_state();
+    let ss = st.sketch(h.app.session.active_sketch.unwrap()).unwrap();
+    assert_eq!(ss.sketch.curves.iter().filter(|c| matches!(c.kind, CurveKind::Arc { .. })).count(), 4);
+    assert!((ss.profiles[0].area - (1200.0 - 36.0 * (1.0 - std::f64::consts::PI / 4.0))).abs() < 1e-6);
+}
+
+#[test]
 fn ordinary_drawing_keeps_origin_snap_and_real_origin_corners_work() {
     let mut h = crate::scenario::Harness::new();
     h.app.ui.show_origin = true;
@@ -402,4 +430,88 @@ fn ordinary_drawing_keeps_origin_snap_and_real_origin_corners_work() {
     assert_eq!(ss.sketch.point(0), Some(Vec2::ZERO));
     assert!(ss.sketch.curves.iter().any(|c| matches!(c.kind, CurveKind::Arc { .. })));
     assert_eq!(ss.profiles.len(), 1);
+}
+
+/// #1824: where a third line ends at a corner's point, the point names no single corner; the
+/// Fillet window takes the corner's two lines instead and rounds the corner between them.
+#[test]
+fn fillet_window_rounds_the_corner_between_two_picked_lines() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[10,0]],"ids":["left"]})).unwrap();
+    h.app.run("sketch.line", json!({"points":["left.end",[20,0]],"ids":["right"]})).unwrap();
+    h.app.run("sketch.line", json!({"points":["left.end",[18,8]],"ids":["diag"]})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    h.step(&json!({"start":"sketch.fillet"})).unwrap();
+    // The shared point ends three lines, so it names no single corner: pick the two lines.
+    h.step(&json!({"click":{"world":[16,0,0]}})).unwrap();
+    h.step(&json!({"click":{"world":[13,3,0]}})).unwrap();
+    assert_eq!(dialog_curves(&h), vec!["right".to_string(), "diag".to_string()], "{:?}", h.app.status);
+    h.step(&json!({"widget":"OK"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.status);
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    assert_eq!(sk.curves.iter().filter(|c| matches!(c.kind, CurveKind::Arc { .. })).count(), 1, "{:?}", h.app.status);
+}
+
+/// #1824 (review): the Chamfer window takes a corner's two lines the same way.
+#[test]
+fn chamfer_window_cuts_the_corner_between_two_picked_lines() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[10,0]],"ids":["left"]})).unwrap();
+    h.app.run("sketch.line", json!({"points":["left.end",[20,0]],"ids":["right"]})).unwrap();
+    h.app.run("sketch.line", json!({"points":["left.end",[18,8]],"ids":["diag"]})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    let before = h.app.session.model.state().sketch(sid).unwrap().sketch.curves.len();
+    h.step(&json!({"start":"sketch.chamfer.equal_distance"})).unwrap();
+    h.step(&json!({"click":{"world":[16,0,0]}})).unwrap();
+    h.step(&json!({"click":{"world":[13,3,0]}})).unwrap();
+    assert_eq!(dialog_curves(&h), vec!["right".to_string(), "diag".to_string()], "{:?}", h.app.status);
+    h.step(&json!({"widget":"OK"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.status);
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    assert_eq!(sk.curves.len(), before + 1, "a chamfer line: {:?}", h.app.status);
+    assert!(sk.curve_index("left").is_some(), "the third line stays");
+}
+
+/// Corner previews draw new curves when a corner is picked, just like Mirror and Offset do.
+/// This tests that `previews()` for Corner produces sketch preview curves visible in the viewport.
+#[test]
+fn fillet_chamfer_corner_preview_draws_curves() {
+    let mut h = crate::scenario::Harness::new();
+    // Create a simple L-shape with two lines meeting at (0, 10).
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points": [[-30,10],[0,10]], "ids": ["top"]})).unwrap();
+    h.app.run("sketch.line", json!({"points": ["top.end",[0,-20]], "ids": ["right"]})).unwrap();
+    h.frames(2);
+
+    // Open the fillet tool and pick the corner at (0, 10).
+    h.step(&json!({"start":"sketch.fillet"})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"world":[0.0,10.0,0.0]}})).unwrap();
+    h.frames(3);
+
+    // The preview should have drawn new curves (fillet arcs at picked corners).
+    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":1}}})).unwrap();
+
+    // Verify the sketch itself hasn't been modified yet.
+    let sid = h.app.session.active_sketch.unwrap();
+    let sk = h.app.session.world_state().sketch(sid).unwrap().sketch.clone();
+    assert_eq!(sk.curves.len(), 2, "fillet preview must not modify the sketch");
+
+    // Now test chamfer too. Close the fillet dialog first.
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.frames(3);
+    h.step(&json!({"start":"sketch.chamfer.equal_distance"})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"world":[0.0,10.0,0.0]}})).unwrap();
+    h.frames(3);
+
+    // Chamfer preview should also produce curves.
+    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":1}}})).unwrap();
+
+    let sk = h.app.session.world_state().sketch(sid).unwrap().sketch.clone();
+    assert_eq!(sk.curves.len(), 2, "chamfer preview must not modify the sketch");
 }

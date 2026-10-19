@@ -106,3 +106,34 @@ fn parameter_enter_comment_uses_selected_unit_and_unrelated_focus_does_not_submi
     assert!(result["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "length" && p["unit"] == "cm" && p["comment"] == "Overall length"));
     assert_eq!(h.app.session.undo.len(), undo + 1);
 }
+#[test]
+fn parameter_rename_arrow_keys_move_cursor_and_keep_editing() {
+    let mut h = open();
+    h.app.session.execute("parameters.add", &json!({"name":"width","expression":"10 mm"})).unwrap();
+    // Let the click that opened the dialog age, or egui counts the double-click as a triple.
+    h.frames(30);
+    h.run(&json!([{"click":{"handle":"param:name:width"},"double":true}])).unwrap();
+    h.frames(2);
+    let renaming = |h: &Harness| h.app.params.as_ref().unwrap().renaming.clone();
+    assert_eq!(renaming(&h), Some(("width".to_string(), "width".to_string())));
+    // Move the cursor to the start and type there; every arrow key keeps the rename open.
+    h.run(&json!([{"key":"ArrowLeft"}, {"key":"ArrowUp"}, {"key":"ArrowDown"}, {"key":"ArrowRight"}, {"key":"Home"}, {"text":"plate_"}])).unwrap();
+    assert_eq!(renaming(&h), Some(("width".to_string(), "plate_width".to_string())));
+    enter(&mut h, false);
+    assert_eq!(renaming(&h), None);
+    let result = h.app.session.execute("parameters.list", &json!({})).unwrap();
+    assert!(result["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "plate_width"));
+}
+#[test]
+fn parameter_add_resets_expression_for_next_row() {
+    let mut h = open();
+    let initial = h.app.params.as_ref().unwrap().new_expr.clone();
+    fill(&mut h, "name", "width");
+    fill(&mut h, "expression", "25 mm");
+    enter(&mut h, false);
+    let result = h.app.session.execute("parameters.list", &json!({})).unwrap();
+    assert!(result["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "width" && p["expression"] == "25 mm"));
+    let d = h.app.params.as_ref().unwrap();
+    assert!(d.new_name.is_empty());
+    assert_eq!(d.new_expr, initial);
+}

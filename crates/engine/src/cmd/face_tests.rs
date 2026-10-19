@@ -35,7 +35,7 @@ fn generated_face_profiles_keep_exact_links_live_after_edit_and_reopen() {
         let result = run(&mut s, "solid.extrude", json!({"face":[5,5,20],"distance":10,"operation":"new","name":"Pad"}));
         let pad = s.doc.feature(result["feature"].as_u64().unwrap()).unwrap();
         let FeatureKind::Extrude { sketch, .. } = pad.kind else { panic!("extrude") };
-        let generated = s.doc.feature(sketch).unwrap();
+        let generated = s.doc.feature(sketch.0).unwrap();
         let FeatureKind::Sketch { plane, sketch: profile } = &generated.kind else { panic!("sketch") };
         let PlaneRef::Face { anchor: Some(anchor), .. } = plane else { panic!("the original Box cap remains exact after a hole cut") };
         assert_eq!(anchor.target.origin_feature, base);
@@ -50,8 +50,8 @@ fn generated_face_profiles_keep_exact_links_live_after_edit_and_reopen() {
         let edited = s.model.state();
         assert!(edited.bodies.iter().any(|body| body.body.contains(Vec3::new(49.0, 5.0, 34.0))));
         assert!(!edited.bodies.iter().any(|body| body.body.contains(Vec3::new(51.0, 5.0, 34.0))));
-        assert!(edited.sketch(sketch).unwrap().sketch.links.iter().all(|link| link.auto_face && !link.lost));
-        let solved = edited.sketch(sketch).unwrap().plane;
+        assert!(edited.sketch(sketch.0).unwrap().sketch.links.iter().all(|link| link.auto_face && !link.lost));
+        let solved = edited.sketch(sketch.0).unwrap().plane;
         assert!((solved.origin.z - 25.0).abs() < 1e-6);
         let before = s.model.state();
         let before_volume: f64 = before.bodies.iter().map(|body| solidcraft_kernel::measure(&body.body).unwrap().volume).sum();

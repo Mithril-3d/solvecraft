@@ -1,21 +1,122 @@
-//! Render capability discovery. No rendering, host probing or document mutation occurs here.
+//! Render capability discovery and persistent intent. No rendering or host probing.
 
+use std::sync::Arc;
+
+use serde::Deserialize;
 use serde_json::{Value, json};
+use solidcraft_doc::render_settings::{RenderSettings, RenderSetup};
 
 use super::CommandSpec;
 use crate::params::bad;
 use crate::{Result, Session};
 
-pub static COMMANDS: &[CommandSpec] = &[CommandSpec::new("render.backends", "Render Backends", backends)
+mod jobs;
+
+pub static COMMANDS: &[CommandSpec] = &[
+CommandSpec::new("render.preflight", "Check Render Request", jobs::preflight).icon("inspect").noundo().doc_only()
+    .params("setup?: saved name OR settings?: full RenderSetup; transparent_background?: false; replace?: false. Validates the installed image host and bounded captured product scene without starting work. Stale geometry is rejected. See docs/render-jobs.md"),
+CommandSpec::new("render.start", "Render Image", jobs::start).noundo().doc_only().at("RENDER", "IMAGE").icon("render_image")
+    .params("Same request as render.preflight. Captures an immutable product scene and queues a bounded image job. Returns its session-scoped job identity, captured scene_generation and progress. Does not change the design. See docs/render-jobs.md"),
+CommandSpec::new("render.status", "Render Progress", jobs::status).icon("list").noundo().doc_only()
+    .params("job: {session, serial, generation}. Non-blocking progress, error and completed frame metadata; no image bytes and no rendering in this call."),
+CommandSpec::new("render.cancel", "Cancel Render", jobs::cancel).icon("delete").noundo().doc_only()
+    .params("job: {session, serial, generation}. Requests cooperative cancellation; completed jobs remain completed. Late cancelled frames cannot be published."),
+CommandSpec::new("render.export", "Export Render Image", jobs::export).icon("export").noundo().doc_only()
+    .params("job: {session, serial, generation}, path: PNG destination, overwrite?: false. Exports a retained completed image atomically; an existing destination is preserved on failure. See docs/render-jobs.md"),
+CommandSpec::new("render.backends", "Render Backends", backends).icon("list")
     .noundo()
     .doc_only()
-    .params("No parameters. Returns {schema_version: 1, default_backend: builtin, backends: [{id, label, availability, executors: [{id, availability, profiles, limits, scratch}]}]}. Metadata only; does not start rendering or probe a GPU. See docs/render-backends.md")];
+    .params("No parameters. Returns {schema_version: 1, default_backend: builtin, backends: [{id, label, availability, executors: [{id, availability, profiles, limits, scratch}]}]}. Metadata only; does not start rendering or probe a GPU. See docs/render-backends.md"),
+CommandSpec::new("render.settings.get", "Render Settings", get_settings).icon("settings").noundo().doc_only()
+    .params("name?: saved setup. Without name returns {setups, defaults}; with name returns {name, setup}. Does not evaluate the model or apply a camera. See docs/render-settings.md"),
+CommandSpec::new("render.settings.set", "Save Render Settings", set_settings).icon("settings").doc_only()
+    .params("name: setup name, set: object of fields to replace (backend, mode, camera, width, height, format, exposure_ev, environment_rotation, environment_intensity, background). Creates from defaults, validates atomically, one undo step; identical edits are no-ops. See docs/render-settings.md"),
+CommandSpec::new("render.scene", "Inspect Render Scene", scene).noundo().at("RENDER", "SCENE").icon("render_scene")
+    .params("No parameters. Authoritative product-scene metadata, without modelling overlays or mesh payloads. Explicitly settles stale geometry; does not render an image. See docs/render-workspace.md"),
+CommandSpec::new("render.settings.apply", "Apply Render Camera", apply_settings).icon("camera").noundo().doc_only()
+    .params("name: saved setup. Applies its existing Camera snapshot including roll/up as view state, without modifying the document or starting a render."),
+];
 
-fn backends(_: &mut Session, params: &Value) -> Result<Value> {
+fn scene(s: &mut Session, params: &Value) -> Result<Value> {
+    if !params.as_object().is_some_and(|p| p.is_empty()) {
+        return Err(bad("render.scene", "expected an empty parameter object"));
+    }
+    let scene = crate::product_scene::extract(s)?;
+    let bodies: Vec<_> = scene
+        .meshes
+        .iter()
+        .map(|m| json!({"name":m.name,"triangles":m.mesh.triangles.len(),"color":m.color,"opacity":m.opacity,"face_appearances":m.faces.len()}))
+        .collect();
+    Ok(
+        json!({"bodies":bodies,"bounds":if scene.bounds.is_empty() { Value::Null } else { json!({"min":scene.bounds.min,"max":scene.bounds.max}) },"overlays":false}),
+    )
+}
+
+fn apply_settings(s: &mut Session, params: &Value) -> Result<Value> {
+    let request: GetSettings = serde_json::from_value(params.clone()).map_err(|e| bad("render.settings.apply", e.to_string()))?;
+    let name = request.name.ok_or_else(|| bad("render.settings.apply", "`name` is required"))?;
+    RenderSettings::validate_name(&name).map_err(|e| bad("render.settings.apply", e.to_string()))?;
+    let setup = s.doc.render.setups.get(&name).ok_or_else(|| bad("render.settings.apply", "no saved render setup with that name"))?;
+    setup.validate().map_err(|e| bad("render.settings.apply", e.to_string()))?;
+    s.camera = Some(setup.camera);
+    Ok(json!({"name":name,"camera":setup.camera}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetSettings {
+    name: Option<String>,
+}
+
+fn get_settings(s: &mut Session, params: &Value) -> Result<Value> {
+    let cmd = "render.settings.get";
+    let request: GetSettings = serde_json::from_value(params.clone()).map_err(|e| bad(cmd, e.to_string()))?;
+    match request.name {
+        None => Ok(json!({"setups": s.doc.render.setups, "defaults": RenderSetup::default()})),
+        Some(name) => {
+            RenderSettings::validate_name(&name).map_err(|e| bad(cmd, e.to_string()))?;
+            let setup = s.doc.render.setups.get(&name).ok_or_else(|| bad(cmd, "no saved render setup with that name"))?;
+            Ok(json!({"name": name, "setup": setup}))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSettings {
+    name: String,
+    set: Value,
+}
+
+fn set_settings(s: &mut Session, params: &Value) -> Result<Value> {
+    let cmd = "render.settings.set";
+    let request: SetSettings = serde_json::from_value(params.clone()).map_err(|e| bad(cmd, e.to_string()))?;
+    RenderSettings::validate_name(&request.name).map_err(|e| bad(cmd, e.to_string()))?;
+    let patch = request.set.as_object().filter(|p| p.len() <= 10).ok_or_else(|| bad(cmd, "`set` must be an object with at most 10 fields"))?;
+    let current = s.doc.render.setups.get(&request.name).cloned().unwrap_or_default();
+    let mut value = serde_json::to_value(&current).map_err(|e| bad(cmd, e.to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| bad(cmd, "invalid render setup"))?;
+    for (key, value) in patch {
+        object.insert(key.clone(), value.clone());
+    }
+    let setup: RenderSetup = serde_json::from_value(value).map_err(|e| bad(cmd, e.to_string()))?;
+    setup.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    let reply = json!({"name": request.name, "setup": setup});
+    if s.doc.render.setups.get(&request.name) == Some(&setup) {
+        return Ok(reply);
+    }
+    let mut settings = (*s.doc.render).clone();
+    settings.setups.insert(request.name, setup);
+    settings.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    s.doc_mut().render = Arc::new(settings);
+    Ok(reply)
+}
+
+fn backends(s: &mut Session, params: &Value) -> Result<Value> {
     if !params.as_object().is_some_and(|p| p.is_empty()) {
         return Err(bad("render.backends", "expected an empty parameter object"));
     }
-    Ok(json!({"schema_version": 1, "default_backend": "builtin", "backends": [crate::render::builtin_backend()]}))
+    Ok(json!({"schema_version": 1, "default_backend": "builtin", "backends": [s.render_backend()]}))
 }
 
 #[cfg(test)]
@@ -89,3 +190,9 @@ mod tests {
         assert_eq!(s.evaluations, 0);
     }
 }
+
+#[cfg(test)]
+mod settings_tests;
+
+#[cfg(test)]
+mod job_tests;

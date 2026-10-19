@@ -97,53 +97,6 @@ where
     res
 }
 
-fn colliding_segment_pairs(sort_endpoints: Vec<EndPoint>) -> impl Iterator<Item = (usize, usize)> {
-    let mut current = [Vec::<usize>::new(), Vec::<usize>::new()];
-    sort_endpoints
-        .into_iter()
-        .filter_map(
-            move |EndPoint {
-                      r#type,
-                      segnum,
-                      index,
-                      ..
-                  }| match r#type {
-                EndPointType::Front => {
-                    current[segnum].push(index);
-                    Some(current[1 - segnum].clone().into_iter().map(move |i| {
-                        if segnum == 0 {
-                            (index, i)
-                        } else {
-                            (i, index)
-                        }
-                    }))
-                }
-                EndPointType::Back => {
-                    let i = current[segnum]
-                        .iter()
-                        .enumerate()
-                        .find(|(_, idx)| **idx == index)
-                        .unwrap()
-                        .0;
-                    current[segnum].swap_remove(i);
-                    None
-                }
-            },
-        )
-        .flatten()
-}
-
-fn disjoint_bdbs(tri0: [Point3; 3], tri1: [Point3; 3]) -> bool {
-    let bdb0: BoundingBox<Point3> = tri0.iter().collect();
-    let bdb1: BoundingBox<Point3> = tri1.iter().collect();
-    bdb0.max()[0] < bdb1.min()[0]
-        || bdb1.max()[0] < bdb0.min()[0]
-        || bdb0.max()[1] < bdb1.min()[1]
-        || bdb1.max()[1] < bdb0.min()[1]
-        || bdb0.max()[2] < bdb1.min()[2]
-        || bdb1.max()[2] < bdb0.min()[2]
-}
-
 fn collide_seg_triangle(seg: [Point3; 2], tri: [Point3; 3]) -> Option<Point3> {
     let ab = tri[1] - tri[0];
     let bc = tri[2] - tri[1];
@@ -208,25 +161,99 @@ fn make_pos_tri(poly: &PolygonMesh, face: [StandardVertex; 3]) -> [Point3; 3] {
     array![i => poly.positions()[face[i].pos]; 3]
 }
 
+/// Triangles of a mesh with their bounding boxes, each computed once.
+fn boxed_triangles(poly: &PolygonMesh) -> Vec<([Point3; 3], BoundingBox<Point3>)> {
+    poly.faces()
+        .triangle_iter()
+        .map(|face| {
+            let tri = make_pos_tri(poly, face);
+            (tri, tri.iter().collect())
+        })
+        .collect()
+}
+
+/// Whether two triangles' bounding boxes miss each other (touching boxes do not miss).
+#[inline(always)]
+fn disjoint_boxes(bdb0: &BoundingBox<Point3>, bdb1: &BoundingBox<Point3>) -> bool {
+    bdb0.max()[0] < bdb1.min()[0]
+        || bdb1.max()[0] < bdb0.min()[0]
+        || bdb0.max()[1] < bdb1.min()[1]
+        || bdb1.max()[1] < bdb0.min()[1]
+        || bdb0.max()[2] < bdb1.min()[2]
+        || bdb1.max()[2] < bdb0.min()[2]
+}
+
+/// Pairs of triangles (one from each mesh) whose bounding boxes overlap, in the order the
+/// sweep along `unit` meets them.
+///
+/// The sweep keeps the triangles whose interval along `unit` is open. When a triangle opens,
+/// it pairs with every open triangle of the other mesh whose box it overlaps. The pairs and
+/// their order are the same as the earlier version, which cloned the open list for every
+/// triangle and rejected disjoint boxes afterwards (rebuilding both boxes for each pair).
+fn candidate_pairs(
+    tris0: &[([Point3; 3], BoundingBox<Point3>)],
+    tris1: &[([Point3; 3], BoundingBox<Point3>)],
+    unit: Vector3,
+) -> Vec<(usize, usize)> {
+    let endpoints = sorted_endpoints(
+        tris0.iter().map(|(t, _)| *t),
+        tris1.iter().map(|(t, _)| *t),
+        unit,
+    );
+    let boxes = [tris0, tris1];
+    let mut open = [Vec::<usize>::new(), Vec::<usize>::new()];
+    let mut pairs = Vec::new();
+    for EndPoint {
+        r#type,
+        segnum,
+        index,
+        ..
+    } in endpoints
+    {
+        match r#type {
+            EndPointType::Front => {
+                let mine = &boxes[segnum][index].1;
+                for &other in &open[1 - segnum] {
+                    if !disjoint_boxes(mine, &boxes[1 - segnum][other].1) {
+                        pairs.push(if segnum == 0 {
+                            (index, other)
+                        } else {
+                            (other, index)
+                        });
+                    }
+                }
+                open[segnum].push(index);
+            }
+            EndPointType::Back => {
+                // Every interval opens before it closes unless a NaN broke the sort. Then the
+                // interval stays open: more box tests, never a panic (the web build aborts on any).
+                if let Some(i) = open[segnum].iter().position(|idx| *idx == index) {
+                    open[segnum].swap_remove(i);
+                }
+            }
+        }
+    }
+    pairs
+}
+
 fn collision(poly0: &PolygonMesh, poly1: &PolygonMesh) -> Vec<(Point3, Point3)> {
     let unit = match poly0.positions().is_empty() {
         true => return Vec::new(),
         false => hash::take_one_unit(poly0.positions()[0]),
     };
-    let tris0 = poly0.faces().triangle_iter().collect::<Vec<_>>();
-    let tris1 = poly1.faces().triangle_iter().collect::<Vec<_>>();
-    let iter0 = tris0.iter().map(|face| make_pos_tri(poly0, *face));
-    let iter1 = tris1.iter().map(|face| make_pos_tri(poly1, *face));
-    colliding_segment_pairs(sorted_endpoints(iter0, iter1, unit))
-        .filter_map(|(idx0, idx1)| {
-            let tri0 = make_pos_tri(poly0, tris0[idx0]);
-            let tri1 = make_pos_tri(poly1, tris1[idx1]);
-            match disjoint_bdbs(tri0, tri1) {
-                true => None,
-                false => collide_triangles(tri0, tri1),
-            }
-        })
-        .collect()
+    let (tris0, tris1) = (boxed_triangles(poly0), boxed_triangles(poly1));
+    let pairs = candidate_pairs(&tris0, &tris1, unit);
+    let test = |&(i, j): &(usize, usize)| collide_triangles(tris0[i].0, tris1[j].0);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        // Indexed parallel collect: results in the same order as the sequential loop.
+        pairs.par_iter().filter_map(test).collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        pairs.iter().filter_map(test).collect()
+    }
 }
 
 fn are_colliding(poly0: &PolygonMesh, poly1: &PolygonMesh) -> Option<(Point3, Point3)> {
@@ -234,18 +261,19 @@ fn are_colliding(poly0: &PolygonMesh, poly1: &PolygonMesh) -> Option<(Point3, Po
         true => return None,
         false => hash::take_one_unit(poly0.positions()[0]),
     };
-    let tris0 = poly0.faces().triangle_iter().collect::<Vec<_>>();
-    let tris1 = poly1.faces().triangle_iter().collect::<Vec<_>>();
-    let iter0 = tris0.iter().map(|face| make_pos_tri(poly0, *face));
-    let iter1 = tris1.iter().map(|face| make_pos_tri(poly1, *face));
-    colliding_segment_pairs(sorted_endpoints(iter0, iter1, unit)).find_map(|(idx0, idx1)| {
-        let tri0 = make_pos_tri(poly0, tris0[idx0]);
-        let tri1 = make_pos_tri(poly1, tris1[idx1]);
-        match disjoint_bdbs(tri0, tri1) {
-            true => None,
-            false => collide_triangles(tri0, tri1),
-        }
-    })
+    let (tris0, tris1) = (boxed_triangles(poly0), boxed_triangles(poly1));
+    let pairs = candidate_pairs(&tris0, &tris1, unit);
+    let test = |&(i, j): &(usize, usize)| collide_triangles(tris0[i].0, tris1[j].0);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        // The first collision in sweep order, as the sequential search returns.
+        pairs.par_iter().find_map_first(test)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        pairs.iter().find_map(test)
+    }
 }
 
 #[test]
@@ -272,4 +300,121 @@ fn collide_triangles_test() {
         Point3::new(1.0, 1.0, 1.0),
     ];
     assert!(collide_triangles(tri0, tri1).is_none());
+}
+
+/// The candidate search before boxes were computed once and the open list stopped being
+/// cloned: kept to check the new search finds the same collisions in the same order.
+///
+/// Not part of the API. Built only for tests, or with the `test-hooks` feature, so the
+/// SolidCraft kernel tests can run these checks in CI (this crate's own tests do not run there).
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod test_hooks {
+    use super::*;
+
+    fn old_pairs(sort_endpoints: Vec<EndPoint>) -> Vec<(usize, usize)> {
+        let mut current = [Vec::<usize>::new(), Vec::<usize>::new()];
+        let mut out = Vec::new();
+        for EndPoint { r#type, segnum, index, .. } in sort_endpoints {
+            match r#type {
+                EndPointType::Front => {
+                    current[segnum].push(index);
+                    for i in current[1 - segnum].clone() {
+                        out.push(if segnum == 0 { (index, i) } else { (i, index) });
+                    }
+                }
+                EndPointType::Back => {
+                    if let Some(i) = current[segnum].iter().position(|idx| *idx == index) {
+                        current[segnum].swap_remove(i);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn old_disjoint(tri0: [Point3; 3], tri1: [Point3; 3]) -> bool {
+        let b0: BoundingBox<Point3> = tri0.iter().collect();
+        let b1: BoundingBox<Point3> = tri1.iter().collect();
+        disjoint_boxes(&b0, &b1)
+    }
+
+    /// Small seeded generator (no extra dependency).
+    struct Lcg(u64);
+    impl Lcg {
+        fn unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// On a coarse grid half the time, so shared vertices, touching boxes and
+        /// degenerate triangles come up.
+        fn coord(&mut self) -> f64 {
+            if self.unit() < 0.5 { (self.unit() * 8.0).floor() * 0.5 } else { self.unit() * 4.0 }
+        }
+        fn tri(&mut self) -> [Point3; 3] {
+            array![_ => Point3::new(self.coord(), self.coord(), self.coord()); 3]
+        }
+    }
+
+    /// A NaN coordinate breaks the endpoint sort: the search must go on without a panic.
+    pub fn nan_triangles_do_not_panic() -> Result<(), String> {
+        let good = [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)];
+        let nan = [Point3::new(f64::NAN, 0.0, 0.0), Point3::new(1.0, f64::NAN, 0.0), Point3::new(0.0, 1.0, 0.5)];
+        let crossing = [Point3::new(0.2, 0.2, -1.0), Point3::new(0.2, 0.2, 1.0), Point3::new(0.6, 0.2, 0.0)];
+        for (a, b) in [(vec![good, nan], vec![crossing, nan]), (vec![nan, nan], vec![nan]), (vec![nan], vec![good])] {
+            let ba: Vec<_> = a.iter().map(|t| (*t, t.iter().collect())).collect();
+            let bb: Vec<_> = b.iter().map(|t| (*t, t.iter().collect())).collect();
+            let r = std::panic::catch_unwind(|| candidate_pairs(&ba, &bb, Vector3::new(1.0, 0.0, 0.0)));
+            if r.is_err() {
+                return Err(format!("panicked on {a:?} / {b:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The new candidate search finds the same collisions, in the same order, as the old one
+    /// on random triangle sets. Returns how many collisions were compared.
+    pub fn same_collisions_in_the_same_order(seeds: std::ops::Range<u64>) -> Result<usize, String> {
+        let mut compared = 0;
+        for seed in seeds {
+            let mut r = Lcg(seed * 7919 + 1);
+            let n0 = 1 + (r.unit() * 60.0) as usize;
+            let n1 = 1 + (r.unit() * 60.0) as usize;
+            let t0: Vec<[Point3; 3]> = (0..n0).map(|_| r.tri()).collect();
+            let t1: Vec<[Point3; 3]> = (0..n1).map(|_| r.tri()).collect();
+            let unit = hash::take_one_unit(t0[0][0]);
+
+            let old: Vec<(Point3, Point3)> = old_pairs(sorted_endpoints(t0.iter().copied(), t1.iter().copied(), unit))
+                .into_iter()
+                .filter(|&(i, j)| !old_disjoint(t0[i], t1[j]))
+                .filter_map(|(i, j)| collide_triangles(t0[i], t1[j]))
+                .collect();
+
+            let b0: Vec<_> = t0.iter().map(|t| (*t, t.iter().collect())).collect();
+            let b1: Vec<_> = t1.iter().map(|t| (*t, t.iter().collect())).collect();
+            let new: Vec<(Point3, Point3)> = candidate_pairs(&b0, &b1, unit)
+                .into_iter()
+                .filter_map(|(i, j)| collide_triangles(t0[i], t1[j]))
+                .collect();
+
+            if old.len() != new.len() {
+                return Err(format!("seed {seed}: {} collisions before, {} now", old.len(), new.len()));
+            }
+            for (k, (a, b)) in old.iter().zip(&new).enumerate() {
+                if !(a.0 == b.0 && a.1 == b.1) {
+                    return Err(format!("seed {seed}: collision {k} differs: {a:?} vs {b:?}"));
+                }
+            }
+            compared += old.len();
+        }
+        Ok(compared)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn hooks_pass() {
+        assert_eq!(nan_triangles_do_not_panic(), Ok(()));
+        let n = same_collisions_in_the_same_order(0..200);
+        assert!(matches!(n, Ok(n) if n > 0), "{n:?}");
+    }
 }

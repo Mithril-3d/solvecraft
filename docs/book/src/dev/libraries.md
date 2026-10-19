@@ -1,5 +1,10 @@
 # Extensible libraries: materials, appearances and components
 
+The first [local scalar-library consumer](local-libraries.md) implements only copied
+colour/opacity and density/look definitions. Its separate v1 catalog is not the complete
+resource-pack/provenance/update system proposed below. Texture/environment descriptors
+remain coordinated with the maintainer's renderer work.
+
 Proposal for [#785](https://github.com/bherbruck/solidcraft/issues/785),
 [#786](https://github.com/bherbruck/solidcraft/issues/786) and
 [#787](https://github.com/bherbruck/solidcraft/issues/787). This page describes planned

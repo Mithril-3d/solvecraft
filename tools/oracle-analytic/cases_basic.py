@@ -515,6 +515,16 @@ def c29_two_sided_partial_revolve():
                   1, mp.v, A, mp.com(), [-20, -25, 0], [20, 10, 20], 12)
 
 
+def c82_thin_extrude_frame():
+    a, t_in, t_out, h = 40.0, 3.0, 1.0, 10.0
+    outer, inner = a + 2 * t_out, a - 2 * t_in
+    ring = outer * outer - inner * inner
+    return result("square frame: the lines' 40 mm square walled 3 mm inside and 1 mm outside (mitred corners) is "
+                  "42 x 42 less 34 x 34, 10 mm tall: V = (42^2 - 34^2) * 10, A = 2 (42^2 - 34^2) + 4 * 42 * 10 + 4 * 34 * 10",
+                  1, ring * h, 2 * ring + 4 * outer * h + 4 * inner * h, [0, 0, h / 2], [-outer / 2, -outer / 2, 0],
+                  [outer / 2, outer / 2, h], 10)
+
+
 CASES = {
     "01-box": c01_box,
     "02-cylinder": c02_cylinder,
@@ -542,6 +552,7 @@ CASES = {
     "26-sketch-belt": c26_sketch_belt,
     "27-sketch-trapezoid": c27_sketch_trapezoid,
     "29-two-sided-and-partial-revolve": c29_two_sided_partial_revolve,
+    "82-thin-extrude-frame": c82_thin_extrude_frame,
 }
 
 

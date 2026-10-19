@@ -27,7 +27,13 @@ new uses of it anywhere else. Public docs/web/Flatpak deployments use project Pa
 ## Never crash
 People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
-  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
+  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The three exceptions, in the app crate
+  (which denies it instead), have no safe API: two functions in
+  `apps/solidcraft/src/open_documents.rs` (macOS hands Finder files only to an Objective-C
+  method), the Windows-only `apps/solidcraft/src/native_crash.rs` (the exception filter that
+  records crashes inside native code such as graphics drivers) and the Windows-only
+  `apps/solidcraft/src/native_frame.rs` (the window procedure that answers the resize-border hit
+  test of the window without OS decorations).
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: …"); it never panics.
 - **Input-derived numbers are hostile** (command parameters, design files, control-channel
@@ -59,8 +65,11 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   nothing from FreeCAD is linked, vendored or shipped.) The sketch solver and the blend
   operations are our own.
 - **Assets — absolutely essential.** SolidCraft contains **no iconography, images, fonts or
-  artwork from commercial CAD products — ever.** Every UI icon is drawn in collected code
-  (`assets/icons/ui/source/`, compiled through `crates/ui-egui/src/icons.rs`). Any file asset must be original or openly licensed and **must have a row in ATTRIBUTION.md**
+  artwork from commercial CAD products — ever.** Command icons are the original SVG masters in
+  `assets/icons/ui/design/svg/`, compiled through `crates/ui-egui/src/icon_svg.rs`.
+  **Before any icon, icon assignment or media edit, read `assets/AGENTS.md`,
+  `assets/icons/ui/AGENTS.md` and `assets/icons/ui/STYLE_GUIDE.md`.** Use the canonical
+  bases and named finished references there; never invent a parallel icon style. Any file asset must be original or openly licensed and **must have a row in ATTRIBUTION.md**
   (`cargo xtask assets` enforces it). Screenshots of commercial CAD software are never committed.
   Breaking this rule is the most serious mistake you can make in this repo.
 - **Everything is a command.** User-visible behaviour = a command in `crates/engine/src/cmd/*`
@@ -75,7 +84,13 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   egui/eframe/winit/wgpu/rfd. **The UI crate is swappable.** Only `crates/kernel` may use `truck`.
 - **The UI is thin**: panels read engine state and act through `app.run(id, params)` /
   `app.start(id)`. Colours come from `theme::Tokens`.
-- **Rust only.** Units are millimetres and radians internally; Z is up. The one exception is
+- **One set of camera controls**: every page or canvas with a camera (viewport, Render
+  preview, future flat pattern or drawing pages) calls `navigation::handle` with its `NavCaps`
+  (orbit off for flat 2D pages). New canvases must use `navigation::handle`; never hand-roll
+  camera input (a test rejects it).
+- **Application code is Rust only.** Units are millimetres and radians internally; Z is up.
+  Local asset authoring, lint and review tools use Python 3.11+ as documented in
+  `assets/AGENTS.md`; Python is not an application runtime dependency. The application exception is
   JavaScript the browser requires: the service worker `apps/solidcraft-web/sw.js` (browsers only
   run service workers as JavaScript) and the small inline scripts in `apps/solidcraft-web/index.html`.
   Keep them minimal; `cargo xtask web-offline-test` covers the service worker.
@@ -113,6 +128,27 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   keep monitoring it while the task is active and make its pending status clear at handoff;
   do not claim it merged without checking.
 
+## Claim = a draft PR
+- Before working on issue #N, check nobody has it: `gh pr list -R bherbruck/solidcraft --state open --search "#N"`.
+- If none, branch from the latest `origin/main`, `git commit --allow-empty -m "claim: #N"`, push,
+  and open a **draft** PR titled `<summary> (#N)` right away. **The lowest-numbered open PR for an
+  issue wins**; if yours lost, close it. A comment or file edit alone does not replace the draft PR.
+- After opening the draft PR, comment `/claim` on the issue so the bot records the claimant and
+  adds the `in progress` label. **Do both:** the draft PR establishes ownership and `/claim` marks
+  the issue as taken. Reference `#N` in the PR so the bot can find it.
+- Push work in progress at least daily. A draft with no pushes for 72 hours may be taken over:
+  comment on it first, then open your own claim (you may start from its branch).
+  This takeover policy is separate from the bot's automatic cleanup deadlines in CONTRIBUTING.md.
+- On a shared build machine, check the load before a big build (`cut -d' ' -f1 /proc/loadavg`)
+  and wait while it is over 24; build with `nice`.
+
+## Design file format
+A change that saves something new in a design adds ONE file, `crates/doc/src/format/pending/<name>.rs`
+(a `//!` note, and `pub fn step` if older designs must be rewritten). Never edit `FORMAT`,
+`JSON_STEPS`, the history in `format.rs`, another change's file or a `v<N>/` folder: the build
+works out the number (the next one while anything is pending), and the release folds pending
+changes into `v<N>/` with `scripts/fold-format-pending.sh`. See CONTRIBUTING.md.
+
 ## Application releases
 Development pushes are not application releases. Follow `docs/releasing.md` when asked to
 prepare or ship a release: choose the version from the actual changes, update Cargo.toml and
@@ -143,5 +179,11 @@ before the draft is verified.
 
 ## Roadmap
 `ROADMAP.md` (committed) tracks status, milestones and estimates. Update it whenever a
-milestone task lands. `cargo xtask features` regenerates `docs/features.md` (SolidCraft's
-commands by area, from the registry) when commands are added or renamed.
+milestone task lands. `docs/features.md` (SolidCraft's commands by area, from the registry) and
+`THIRD-PARTY-LICENSES.txt` are regenerated on `main` after each merge by the Generated files
+workflow; never regenerate them in a PR.
+
+## Lists many PRs add to
+Keep them conflict-free (CONTRIBUTING.md, "Lists many changes add to"): message catalogs sorted
+(`cargo xtask lists --fix`), `mod` lines in their sorted group, the language list English first
+then by id, generated files left to `main`, and a design-format change as one new file.

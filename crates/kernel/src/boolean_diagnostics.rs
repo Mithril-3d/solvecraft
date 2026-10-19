@@ -14,8 +14,12 @@ pub enum BooleanStrategy {
     ShiftedOperands,
     CoplanarSeparation,
     CommonBore,
+    /// A boss in the other body's bore, grown into the material around it (nothing recut).
+    GrownBoss,
     PlanarFallback,
     ToolNudge,
+    /// A rotationally symmetric tool turned about its own axis; its volume is unchanged.
+    ToolReseam,
     Piecewise,
     /// No retry gave a result, and the answer from sample points was kept although the bodies'
     /// facetings disagree with it.
@@ -34,6 +38,15 @@ pub struct BooleanFallback {
     pub tolerance_mm: f64,
 }
 
+impl BooleanStrategy {
+    /// Whether a result made this way can differ from the exact one: the tool was moved
+    /// against the other body, or part of where they meet was ignored. The other retries work
+    /// on temporary geometry or tolerances only, and their results are the exact ones.
+    pub fn alters_result(self) -> bool {
+        matches!(self, BooleanStrategy::ToolNudge | BooleanStrategy::UnverifiedShortcut)
+    }
+}
+
 impl BooleanFallback {
     pub(crate) fn new(strategy: BooleanStrategy) -> Self {
         Self { strategy, translation_mm: 0., rotation_rad: 0., face_shift_mm: 0., tolerance_mm: 0. }
@@ -47,8 +60,10 @@ impl BooleanFallback {
             }
             BooleanStrategy::CoplanarSeparation => format!("temporary coincident-face separation up to {:.6e} mm per face", self.face_shift_mm),
             BooleanStrategy::CommonBore => format!("temporary bore offset {:.6e} mm, followed by recutting the original bore", self.face_shift_mm),
+            BooleanStrategy::GrownBoss => format!("boss grown {:.6e} mm into the material around the bore it fills", self.face_shift_mm),
             BooleanStrategy::PlanarFallback => "exact planar fallback (no displacement)".into(),
             BooleanStrategy::ToolNudge => format!("tool displacement {:.6e} mm, rotation {:.6e} rad", self.translation_mm, self.rotation_rad),
+            BooleanStrategy::ToolReseam => format!("axisymmetric tool reseamed by {:.6e} rad (no displacement)", self.rotation_rad),
             BooleanStrategy::Piecewise => "piecewise retry (no displacement)".into(),
             BooleanStrategy::UnverifiedShortcut => format!(
                 "not verified: the bodies' facets pass through each other by more than {:.6e} mm, but they could not be intersected there; that part is ignored",
@@ -79,13 +94,26 @@ impl BooleanDiagnostics {
         self.events.iter().find(|event| event.strategy == BooleanStrategy::UnverifiedShortcut).map(BooleanFallback::description)
     }
 
+    /// Every retry the result took, for a message about the boolean (one that failed its
+    /// checks lists what was tried).
+    pub fn summary(&self) -> Option<String> {
+        self.described(&self.events.iter().collect::<Vec<_>>())
+    }
+
+    /// The note a feature carries: the retries that can make its result differ from the exact
+    /// one ([`BooleanStrategy::alters_result`]). Exact retries are in `events` all the same
+    /// (`timeline.inspect`), but they leave the result as it should be: no reason to warn.
     pub fn warning(&self) -> Option<String> {
-        if self.events.is_empty() && !self.truncated {
+        self.described(&self.events.iter().filter(|e| e.strategy.alters_result()).collect::<Vec<_>>())
+    }
+
+    fn described(&self, events: &[&BooleanFallback]) -> Option<String> {
+        if events.is_empty() && !self.truncated {
             return None;
         }
-        let mut descriptions: Vec<String> = self.events.iter().take(4).map(BooleanFallback::description).collect();
-        if self.events.len() > 4 {
-            descriptions.push(format!("{} additional retries", self.events.len() - 4));
+        let mut descriptions: Vec<String> = events.iter().take(4).map(|e| e.description()).collect();
+        if events.len() > 4 {
+            descriptions.push(format!("{} additional retries", events.len() - 4));
         }
         if self.truncated {
             descriptions.push(format!("report capped at {MAX_EVENTS} retries"));
@@ -167,6 +195,26 @@ mod tests {
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
         record(BooleanFallback::new(BooleanStrategy::ToolNudge));
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
+    }
+
+    /// Only retries whose result can differ from the exact one make a warning; the summary
+    /// lists every retry.
+    #[test]
+    fn only_retries_that_alter_the_result_warn() {
+        let report = |strategies: &[BooleanStrategy]| {
+            capture_boolean_diagnostics(|| {
+                for s in strategies {
+                    record(BooleanFallback::new(*s));
+                }
+            })
+            .1
+        };
+        let exact = report(&[BooleanStrategy::ShiftedOperands, BooleanStrategy::GrownBoss, BooleanStrategy::CoplanarSeparation]);
+        assert!(exact.warning().is_none(), "{exact:?}");
+        assert!(exact.summary().is_some_and(|s| s.contains("shifted operands") && s.contains("boss grown")));
+        let nudged = report(&[BooleanStrategy::GrownBoss, BooleanStrategy::ToolNudge]);
+        let warning = nudged.warning().unwrap();
+        assert!(warning.contains("tool displacement") && !warning.contains("boss grown"), "{warning}");
     }
 
     #[test]

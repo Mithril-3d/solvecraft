@@ -1,9 +1,11 @@
 //! Plastic (enclosure) features: Boss, Lip / Groove, Snap Fit and Rest, and plastic rules.
 
 use serde_json::{Value, json};
+use solidcraft_doc::BodyName;
 use solidcraft_doc::FeatureKind;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::plastic::PlasticRule;
+use solidcraft_doc::{Dir, FacePick, Position};
 use solidcraft_geom::Vec3;
 
 use super::CommandSpec;
@@ -19,7 +21,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("plastic.lip", "Lip", lip).at("PLASTIC", "CREATE").icon("lip").params(
         "face: [x,y,z] on the rim face of a shelled body; width, height; type?: lip|groove; gap? (groove clearance); side?: inside|outside (which rim edge); body?",
     ),
-    CommandSpec::new("plastic.snap_fit", "Snap Fit", snap_fit).at("PLASTIC", "CREATE").icon("snap").params(
+    CommandSpec::new("plastic.snap_fit", "Snap Fit", snap_fit).at("PLASTIC", "CREATE").icon("snap_fit").params(
         "position: [x,y,z] on a face; direction? (default: out of the face); hook: [x,y,z] (the catch's direction); length, thickness, width, catch_depth, catch_length; body?",
     ),
     CommandSpec::new("plastic.rest", "Rest", rest).at("PLASTIC", "CREATE").icon("rest").params(
@@ -34,7 +36,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("plastic.assign_rule", "Assign Plastic Rule", assign_rule).at("PLASTIC", "SETUP").icon("plastic_assign").params(
         "bodies: [names]; rule: name (empty: no rule) — plastic features on these bodies take its draft and clearance as defaults",
     ),
-    CommandSpec::new("plastic.rules", "List Plastic Rules", list_rules).noundo().params("→ rules with their expressions and values, the active rule and the rules assigned to bodies"),
+    CommandSpec::new("plastic.rules", "List Plastic Rules", list_rules).icon("plastic_rule").noundo().params("→ rules with their expressions and values, the active rule and the rules assigned to bodies"),
 ];
 
 fn rule_json(s: &Session, r: &PlasticRule) -> Value {
@@ -87,7 +89,7 @@ fn manage_rules(s: &mut Session, p: &Value) -> Result<Value> {
             let probe = e.replace("Thickness", "(1 mm)");
             check_expr(s, &probe, kind, cmd, k)?;
             if let Some(slot) = rule.field_mut(k) {
-                *slot = e;
+                *slot = e.into();
             }
         }
     }
@@ -159,20 +161,20 @@ fn rest(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
     };
     let kind = FeatureKind::Rest {
-        position,
-        direction,
-        along,
+        position: FacePick(position),
+        direction: Dir(direction),
+        along: along.map(Dir),
         width: required(s, p, "width", Kind::Length, cmd)?,
         length: checked(s, p, "length", Kind::Length, cmd)?,
         height: required(s, p, "height", Kind::Length, cmd)?,
         draft: checked(s, p, "draft", Kind::Angle, cmd)?,
         thickness: checked(s, p, "thickness", Kind::Length, cmd)?,
-        body: str_(p, "body").map(str::to_string),
+        body: str_(p, "body").map(BodyName::from),
     };
     add_feature(s, p, kind)
 }
 
-fn checked(s: &Session, p: &Value, k: &str, kind: Kind, cmd: &str) -> Result<Option<String>> {
+fn checked(s: &Session, p: &Value, k: &str, kind: Kind, cmd: &str) -> Result<Option<solidcraft_doc::Expr>> {
     match expr(p, k) {
         Some(e) => {
             check_expr(s, &e, kind, cmd, k)?;
@@ -182,7 +184,7 @@ fn checked(s: &Session, p: &Value, k: &str, kind: Kind, cmd: &str) -> Result<Opt
     }
 }
 
-fn required(s: &Session, p: &Value, k: &str, kind: Kind, cmd: &str) -> Result<String> {
+fn required(s: &Session, p: &Value, k: &str, kind: Kind, cmd: &str) -> Result<solidcraft_doc::Expr> {
     let e = req_expr(cmd, p, k)?;
     check_expr(s, &e, kind, cmd, k)?;
     Ok(e)
@@ -202,8 +204,8 @@ fn boss(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "plastic.boss";
     let (position, direction) = placed(s, p, cmd)?;
     let kind = FeatureKind::Boss {
-        position,
-        direction,
+        position: FacePick(position),
+        direction: Dir(direction),
         diameter: required(s, p, "diameter", Kind::Length, cmd)?,
         height: required(s, p, "height", Kind::Length, cmd)?,
         hole_diameter: checked(s, p, "hole_diameter", Kind::Length, cmd)?,
@@ -214,7 +216,7 @@ fn boss(s: &mut Session, p: &Value) -> Result<Value> {
         rib_thickness: checked(s, p, "rib_thickness", Kind::Length, cmd)?,
         rib_length: checked(s, p, "rib_length", Kind::Length, cmd)?,
         rib_offset: checked(s, p, "rib_offset", Kind::Length, cmd)?,
-        body: str_(p, "body").map(str::to_string),
+        body: str_(p, "body").map(BodyName::from),
     };
     add_feature(s, p, kind)
 }
@@ -233,13 +235,13 @@ fn lip(s: &mut Session, p: &Value) -> Result<Value> {
         Some(o) => return Err(bad(cmd, format!("unknown side `{o}` (inside or outside)"))),
     };
     let kind = FeatureKind::Lip {
-        face,
+        face: Position(face),
         width: required(s, p, "width", Kind::Length, cmd)?,
         height: required(s, p, "height", Kind::Length, cmd)?,
         groove,
         gap: checked(s, p, "gap", Kind::Length, cmd)?,
         outside: outside || bool_(p, "outside").unwrap_or(false),
-        body: str_(p, "body").map(str::to_string),
+        body: str_(p, "body").map(BodyName::from),
     };
     add_feature(s, p, kind)
 }
@@ -252,15 +254,15 @@ fn snap_fit(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`hook` must point across the arm"));
     }
     let kind = FeatureKind::SnapFit {
-        position,
-        direction,
-        hook,
+        position: FacePick(position),
+        direction: Dir(direction),
+        hook: Dir(hook),
         length: required(s, p, "length", Kind::Length, cmd)?,
         thickness: required(s, p, "thickness", Kind::Length, cmd)?,
         width: required(s, p, "width", Kind::Length, cmd)?,
         catch_depth: required(s, p, "catch_depth", Kind::Length, cmd)?,
         catch_length: required(s, p, "catch_length", Kind::Length, cmd)?,
-        body: str_(p, "body").map(str::to_string),
+        body: str_(p, "body").map(BodyName::from),
     };
     add_feature(s, p, kind)
 }

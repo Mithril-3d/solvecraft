@@ -74,8 +74,23 @@ pub(crate) fn truck_step(bodies: &[&Body], system: &str) -> Result<String> {
         let cs: Vec<_> = bodies.iter().map(|b| plain_curves(b).map(|solid| solid.compress())).collect::<Result<_>>()?;
         let models: out::StepModels<_, _, _> = cs.iter().collect();
         let header = out::StepHeaderDescriptor { organization_system: system.to_owned(), ..Default::default() };
-        Ok(out::CompleteStepDisplay::new(models, header).to_string())
+        written(&out::CompleteStepDisplay::new(models, header))
     })
+}
+
+/// The text of truck's STEP writer, or an error. The writer refuses some geometry by returning
+/// `fmt::Error` after a line saying why; `to_string` would turn that into a panic (caught by
+/// `guard` on the desktop, but the browser build aborts on any panic).
+fn written(display: &impl std::fmt::Display) -> Result<String> {
+    use std::fmt::Write;
+    let mut text = String::new();
+    match write!(text, "{display}") {
+        Ok(()) => Ok(text),
+        Err(_) => {
+            let why = text.lines().last().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("unsupported geometry");
+            Err(KernelError::Failed(format!("not supported yet: STEP export of this body ({why})")))
+        }
+    }
 }
 
 /// STEP (ISO 10303-21, AP242) text for the given bodies as one part (`Body1`…, with the

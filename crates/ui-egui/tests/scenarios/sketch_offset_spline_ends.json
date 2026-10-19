@@ -1,0 +1,22 @@
+[
+ {"note": "#2424: lines close the gap between an open spline and its associated offset. A click near the offset's end snaps to it; the line gets its own point there, coincident with the offset's end, and follows it when the source spline moves."},
+ {"call": "engine.execute", "params": {"command": "sketch.create", "params": {"plane": "XY"}}},
+ {"call": "engine.execute", "params": {"command": "sketch.spline.fit_point", "params": {"points": [[5,-5],[15,0],[25,-5],[35,0]], "ids": ["s1"]}}},
+ {"call": "engine.execute", "params": {"command": "sketch.offset", "params": {"curves": ["s1"], "distance": "2 mm", "chain": true}}},
+ {"call": "ui.view", "params": {"view": "top"}},
+ {"call": "ui.view", "params": {"view": "fit"}},
+ {"start": "sketch.line"},
+ {"click": {"sketch": [5,-5]}},
+ {"click": {"sketch": [3.85,-3.36]}},
+ {"key": "Escape"},
+ {"start": "sketch.line"},
+ {"click": {"sketch": [33.85,1.64]}},
+ {"click": {"sketch": [35,0]}},
+ {"key": "Escape"},
+ {"shot": "closed"},
+ {"expect": {"errors": 0, "sketch_curves": {"own": 4}, "dof": 8}},
+ {"call": "engine.execute", "params": {"command": "sketch.drag", "params": {"entity": "s1.start", "from": [5,-5], "to": [2,-2]}}},
+ {"shot": "source-dragged"},
+ {"expect": {"errors": 0, "dof": 8}},
+ {"expect": {"query": {"command": "sketch.inspect", "path": ["curves", 2, "start_at", 0], "value": 2}}}
+]

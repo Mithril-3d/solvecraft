@@ -1,0 +1,216 @@
+body_transfer
+  remap_bodies: bodies[0]
+sketch
+  remap_refs: plane.base.base.name
+sketch_along_path
+extrude
+  sketches: [1]
+  remap_refs: sketch
+  remap_bodies: targets[0]
+extrude_thin
+  sketches: [1]
+  remap_refs: sketch
+  remap_bodies: targets[0]
+revolve
+  sketches: [1]
+  remap_refs: sketch
+  remap_bodies: targets[0]
+fillet_constant
+  remap_bodies: body
+fillet_chord
+  remap_bodies: body
+fillet_curvature
+  remap_bodies: body
+fillet_variable
+  remap_bodies: body
+fillet_spline
+  remap_bodies: body
+chamfer
+  remap_bodies: body
+box
+cylinder
+sphere
+torus
+combine
+  remap_bodies: target, tools[0]
+pattern_rectangular
+  remap_refs: features[0]
+  remap_bodies: bodies[0]
+pattern_circular
+  remap_refs: features[0]
+  remap_bodies: bodies[0]
+pattern_path
+  sketches: [1]
+  remap_refs: features[0], pattern.path_sketch
+  remap_bodies: bodies[0]
+mirror
+  remap_refs: features[0], plane.base.base.name
+  remap_bodies: bodies[0]
+hole_simple
+  sketches: [3]
+  remap_refs: points.sketch
+hole_drilled
+  sketches: [3]
+  remap_refs: points.sketch
+hole_counterbore
+  sketches: [3]
+  remap_refs: points.sketch
+hole_countersink
+  sketches: [3]
+  remap_refs: points.sketch
+thread
+loft
+  sketches: [4, 5]
+  remap_refs: sections[0].sketch, sections[1].sketch
+  remap_bodies: targets[0]
+sweep
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+  remap_bodies: targets[0]
+sweep_options
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+  remap_bodies: targets[0]
+shell
+  remap_bodies: body
+draft
+  remap_refs: neutral.base.base.name
+  remap_bodies: body
+construction_plane
+  remap_refs: plane.base.base.name
+split
+  remap_refs: plane.base.base.name
+  remap_bodies: body, tool.body
+split_line
+  sketches: [6]
+  remap_refs: plane.base.base.name, sketch
+  remap_bodies: body
+construction_axis
+construction_point_planes
+construction_point_along
+split_face
+  sketches: [6]
+  remap_refs: plane.base.base.name, sketch
+  remap_bodies: body, tool.body
+scale
+  remap_bodies: bodies[0]
+offset_face
+  remap_bodies: body
+delete_face
+  remap_bodies: body
+bounding_solid
+  remap_bodies: bodies[0]
+pipe
+  sketches: [1]
+  remap_refs: path_sketch
+  remap_bodies: targets[0]
+emboss
+  sketches: [1]
+  remap_refs: sketch
+  remap_bodies: face.body, targets[0]
+rib
+  sketches: [1]
+  remap_refs: sketch
+replace_face
+  remap_refs: target.base.base.name
+  remap_bodies: body
+align
+  remap_bodies: bodies[0]
+coil
+  remap_bodies: targets[0]
+sheet_base
+  sketches: [1]
+  remap_refs: sketch
+sheet_contour
+  sketches: [1]
+  remap_refs: sketch
+sheet_flange
+  remap_bodies: body
+sheet_hem
+  remap_bodies: body
+sheet_perforate
+  remap_bodies: body
+sheet_fold
+  sketches: [7]
+  remap_refs: sketch
+  remap_bodies: body
+sheet_unfold
+  remap_bodies: body
+sheet_convert
+  remap_bodies: body
+boss
+  remap_bodies: body
+lip
+  remap_bodies: body
+snap_fit
+  remap_bodies: body
+rest
+  remap_bodies: body
+boundary_fill
+  remap_bodies: tools[0]
+remove
+  remap_bodies: bodies[0]
+patch
+  sketches: [8]
+  remap_refs: sketch
+  remap_bodies: body
+stitch
+  remap_bodies: bodies[0]
+thicken
+  remap_bodies: bodies[0], targets[0]
+surface_extrude
+  sketches: [1]
+  remap_refs: sketch
+surface_revolve
+  sketches: [1]
+  remap_refs: sketch
+surface_sweep
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+surface_sweep_options
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+surface_loft
+  sketches: [4, 5]
+  remap_refs: sections[0].sketch, sections[1].sketch
+surface_blend
+  remap_bodies: from.body
+surface_offset
+  remap_bodies: body
+surface_blend
+  remap_bodies: from.body
+surface_boundary
+  sketches: [1]
+  remap_refs: sketch
+surface_network
+  sketches: [1, 2]
+  remap_refs: u[0].sketch, v[0].sketch
+  remap_bodies: u[1].body
+surface_match
+  remap_bodies: body
+surface_fair
+  remap_bodies: body
+unstitch
+  remap_bodies: body
+reverse_normal
+  remap_bodies: body
+surface_untrim
+  remap_bodies: face.body
+surface_extend
+  remap_bodies: body
+surface_extend_to_plane
+  remap_refs: up_to.plane.base.base.name
+  remap_bodies: body
+surface_extend_to_face
+  remap_bodies: body, up_to.face.body
+surface_ruled
+  remap_bodies: body
+surface_trim
+  remap_refs: plane.base.base.name
+  remap_bodies: body, tool.body
+move
+  remap_bodies: bodies[0]
+import
+mesh_convert
+  remap_bodies: body
+mesh_import

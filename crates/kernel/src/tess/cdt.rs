@@ -102,7 +102,14 @@ pub(crate) fn triangulate(boundary: &[[f64; 2]], loops: &[std::ops::Range<usize>
                 .exclude_outer_faces(true)
                 .with_angle_limit(AngleLimit::from_deg(MIN_ANGLE_DEG))
                 .with_max_additional_vertices(budget.saturating_sub(added));
+            let before = cdt.num_vertices();
             cdt.refine(params);
+            let shaped = cdt.num_vertices().saturating_sub(before);
+            // Shaping flips sides and adds points of its own; the triangles it leaves may
+            // sag again (a long strip round a cylinder), so the sag is checked once more.
+            if shaped > 0 {
+                refine_sag(&mut cdt, sag, budget.saturating_sub(added + shaped), &from);
+            }
         }
         // A split constraint would put a point on the boundary the neighbour does not have.
         if cdt.num_constraints() != constraints {
@@ -133,6 +140,69 @@ pub(crate) fn triangulate(boundary: &[[f64; 2]], loops: &[std::ops::Range<usize>
     }
     let extra = uv.split_off(boundary.len());
     Some((extra, tris))
+}
+
+/// The band between a face's boundary `loops` (ranges of the first `n` points of `points`) and
+/// the staircase around a block of grid cells inside it (`stairs`, sides between grid points
+/// of `points`): a constrained Delaunay triangulation of both with no point added, keeping the
+/// faces inside the boundary and outside the block (an odd number of constraints from the
+/// outside). Distances in the metric `scale`. Triangles counter-clockwise in (u, v), indices
+/// into `points`; `None` when a constraint cannot be kept (the staircase meets the boundary).
+pub(crate) fn band(points: &[[f64; 2]], n: usize, loops: &[std::ops::Range<usize>], stairs: &[(u32, u32)], scale: [f64; 2]) -> Option<Vec<[u32; 3]>> {
+    let to = |p: &[f64; 2]| spade::mitigate_underflow(Point2::new(p[0] * scale[0], p[1] * scale[1]));
+    let mut cdt = Cdt::new();
+    let mut index: HashMap<FixedVertexHandle, u32> = HashMap::new();
+    let mut handle: HashMap<u32, FixedVertexHandle> = HashMap::new();
+    let mut add = |cdt: &mut Cdt, i: u32| -> Option<FixedVertexHandle> {
+        if let Some(h) = handle.get(&i) {
+            return Some(*h);
+        }
+        let p = points.get(i as usize)?;
+        if !p.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let h = cdt.insert(to(p)).ok()?;
+        // Two points at one place (pole copies) share a vertex: the first index names it.
+        index.entry(h).or_insert(i);
+        handle.insert(i, h);
+        Some(h)
+    };
+    let mut sides: Vec<(FixedVertexHandle, FixedVertexHandle)> = Vec::new();
+    for r in loops {
+        let len = r.len();
+        for k in 0..len {
+            let (a, b) = (u32::try_from(r.start + k).ok()?, u32::try_from(r.start + (k + 1) % len).ok()?);
+            if (a as usize) >= n || (b as usize) >= n {
+                return None;
+            }
+            sides.push((add(&mut cdt, a)?, add(&mut cdt, b)?));
+        }
+    }
+    for &(a, b) in stairs {
+        sides.push((add(&mut cdt, a)?, add(&mut cdt, b)?));
+    }
+    for (a, b) in sides {
+        if a == b || cdt.exists_constraint(a, b) {
+            continue;
+        }
+        if !cdt.can_add_constraint(a, b) {
+            return None;
+        }
+        cdt.add_constraint(a, b);
+    }
+    let region = region(&cdt);
+    let mut tris = Vec::new();
+    for face in cdt.inner_faces() {
+        if !region.get(face.index()).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut t = [0u32; 3];
+        for (slot, v) in t.iter_mut().zip(face.vertices()) {
+            *slot = *index.get(&v.fix())?;
+        }
+        tris.push(t);
+    }
+    Some(tris)
 }
 
 /// Insert the parameters of the surface point under every triangle centre that lies more than

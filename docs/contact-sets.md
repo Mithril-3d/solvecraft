@@ -16,6 +16,12 @@ to leave the bodies just short of penetration, within the tessellated contact to
 Motion links and limits participate in the trajectory checks. Moving a body between
 components preserves its placement for contact checks through its body offset.
 
+A drive can also stop where a closed loop of joints (a four-bar, a slider-crank) can no longer
+close; it then returns `stopped_by_loop` instead, with the joint whose loop opens and the
+fraction reached. When both apply, the motion stops at whichever comes first, and only that
+one is reported. The Drive Joints dialog shows the reached value and the reason while it
+previews, and the status line repeats it after OK.
+
 The trajectory uses bounded samples of cached tessellated geometry. Spacing accounts for
 effective joint travel, angular motion, distance from joint pivots and whole-body widths
 along sampled face directions. This handles tilted thin plates while keeping curved bodies

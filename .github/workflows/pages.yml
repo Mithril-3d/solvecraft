@@ -1,5 +1,5 @@
-# The documentation site on GitHub Pages: the book (docs/book) at /solidcraft/ and the web app
-# at /solidcraft/app/. Needs Settings → Pages → Source = GitHub Actions; skipped while the
+# The documentation site on GitHub Pages: the book (docs/book) at https://docs.solidcraft.io/
+# and the bundled web app at /app/. Needs Settings → Pages → Source = GitHub Actions; skipped while the
 # repository is private.
 name: Pages
 
@@ -45,7 +45,14 @@ jobs:
           curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
           curl -sSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install a software Vulkan driver (lavapipe)
+        # The book's pictures are `solidcraft-cli snapshot`s, drawn on the GPU; the runner has none.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
       - name: Build the book
+        env:
+          SOLIDCRAFT_GPU: software
         run: cargo xtask book
       - name: Build the web app
         working-directory: apps/solidcraft-web

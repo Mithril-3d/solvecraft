@@ -14,10 +14,9 @@ use super::uv::Domain;
 /// Longest side, as a fraction of the body's extent.
 const MAX_LEN_FRACTION: f64 = 1.0 / 5.0;
 /// Longest side relative to the side the curvature asks for: along a straight direction (a
-/// cylinder's axis) triangles may be this many times longer than across it. With a 30° facet
-/// angle and [`MAX_LEN_FRACTION`] this puts the oracle parts' display meshes at about the
-/// reference mesher's triangle count (1.2×; 5× with equilateral triangles and 15°).
-const ASPECT: f64 = 4.0;
+/// cylinder's axis) cells may be this many times longer than across it. 2: cells stay close to
+/// square (patches mesh as grids) without doubling the rows along every straight surface.
+const ASPECT: f64 = 2.0;
 /// Shortest side the aspect limit may ask for, as a fraction of the longest side. A bend whose
 /// radius is tiny next to the body (a hem) would otherwise tie the whole length of its
 /// straight edges to that radius; along a straight direction the normal does not turn, so
@@ -172,15 +171,16 @@ mod tests {
             transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
             swap: false,
         };
-        // A 20 mm body: sides from 0.5 mm (the floor) to 4 mm.
+        // A 20 mm body: sides from 1 mm (the floor, a quarter of the longest) to 4 mm.
         let rules = Rules::new(0.01, 20.0, THIRTY);
         let (h, speed) = face_size(&s, &super::super::uv::domain(&s), &rules);
-        // r = 3: 30° of turn is 1.57 mm; the 0.01 mm sag chord is √(8·3·0.01) = 0.49 mm.
-        assert!((h - ASPECT * (8.0 * 3.0 * 0.01f64).sqrt()).abs() < 0.01, "{h}");
+        // r = 3: 30° of turn is 1.57 mm; the 0.01 mm sag chord is √(8·3·0.01) = 0.49 mm, times the
+        // aspect, unless that is under the floor.
+        assert!((h - (ASPECT * (8.0 * 3.0 * 0.01f64).sqrt()).max(20.0 * MAX_LEN_FRACTION * MIN_LEN_FRACTION)).abs() < 0.01, "{h}");
         assert!((speed[0] - 40.0).abs() < 1e-6 && (speed[1] - 3.0).abs() < 1e-6, "{speed:?}");
         // Coarser: the turn limit governs.
         let (h, _) = face_size(&s, &super::super::uv::domain(&s), &Rules::new(0.5, 100.0, THIRTY));
-        assert!((h - ASPECT * 3.0 * std::f64::consts::PI / 6.0).abs() < 0.01, "{h}");
+        assert!((h - (ASPECT * 3.0 * std::f64::consts::PI / 6.0).max(100.0 * MAX_LEN_FRACTION * MIN_LEN_FRACTION)).abs() < 0.01, "{h}");
         // Without a facet angle the sag alone: √(8·3·0.5) = 3.46 mm, four times along.
         let (h, _) = face_size(&s, &super::super::uv::domain(&s), &Rules::new(0.5, 100.0, None));
         assert!((h - ASPECT * (8.0 * 3.0 * 0.5f64).sqrt()).abs() < 0.01, "{h}");

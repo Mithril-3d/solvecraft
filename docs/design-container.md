@@ -7,7 +7,7 @@ self-contained input/output format. `io::write_design` keeps its JSON contract;
 `io::write_design_container` is the fallible container writer.
 
 Packages have `container.json` with `{"format":"solidcraft-container/1"}` and
-`document.json` with the versioned parametric document (currently `solidcraft/19`).
+`document.json` with the versioned parametric document (`solidcraft/N`, the format in `crates/doc/src/format.rs`).
 The independent versions let document migrations evolve without changing blob encodings.
 Existing serialized document fields are retained automatically, without a second copy
 of the document schema or a deep clone of embedded payloads.

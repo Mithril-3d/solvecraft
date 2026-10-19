@@ -42,21 +42,7 @@ fn vertex(h: HPoint) -> Result<mt::Vertex> {
 
 /// One face from a clamped tensor surface, bounded by its four boundary curves.
 fn tensor_face(n: &NurbsSurface) -> Result<mt::Face> {
-    let [nu, nv] = n.count();
-    let [ku, kv] = n.knots();
-    let (ku, kv) = (mt::KnotVec::from(ku.clone()), mt::KnotVec::from(kv.clone()));
-    let corners = [n.point(0, 0), n.point(nu - 1, 0), n.point(nu - 1, nv - 1), n.point(0, nv - 1)];
-    let v: Vec<mt::Vertex> = corners.into_iter().map(vertex).collect::<Result<_>>()?;
-    let row = |j: usize| -> Vec<HPoint> { (0..nu).map(|i| n.point(i, j)).collect() };
-    let column = |i: usize| -> Vec<HPoint> { (0..nv).map(|j| n.point(i, j)).collect() };
-    let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v.first(), v.get(1), v.get(2), v.get(3)) else { return Err(fail("corners")) };
-    let edge = |a: &mt::Vertex, b: &mt::Vertex, c: mt::Curve| mt::Edge::try_new(a, b, c).map_err(fail);
-    let bottom = edge(v0, v1, nurbs_curve(ku.clone(), &row(0))?)?;
-    let right = edge(v1, v2, nurbs_curve(kv.clone(), &column(nu - 1))?)?;
-    let top = edge(v3, v2, nurbs_curve(ku.clone(), &row(nv - 1))?)?;
-    let left = edge(v0, v3, nurbs_curve(kv.clone(), &column(0))?)?;
-    let wire: mt::Wire = vec![bottom, right, top.inverse(), left.inverse()].into();
-    mt::Face::try_new(vec![wire], crate::spline_conv::surface(n)?).map_err(fail)
+    crate::spline_conv::tensor_face(n)
 }
 
 /// A parameter point, exact (knot values are shared, so equal points have equal bits).

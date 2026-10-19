@@ -376,7 +376,7 @@ fn generated_copy_parameters_cannot_heal_an_unrelated_missing_reference() {
     let feature = s.doc_mut().feature_mut(broken).unwrap();
     feature.component = 0;
     if let solidcraft_doc::FeatureKind::Box { width, .. } = &mut feature.kind {
-        *width = missing;
+        *width = missing.into();
     }
     s.refresh();
     let original_error = s.model.result(broken).unwrap().error.clone();
@@ -551,4 +551,170 @@ fn frozen_r6_bore_copy_uses_current_geometry_despite_mesh_measure_bias() {
     assert_eq!(s.doc.to_json(), before);
     run(&mut s, "edit.redo", json!({}));
     check(&s);
+}
+
+/// A STEP file of three 10 mm boxes at x = 0, 30 and 60 (`Aa`, `Bb`, `Cc`). With `shared` the three
+/// solids carry one label (`X`), as the parts of many assembly files do.
+fn three_box_step(tag: &str, shared: bool) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solidcraft-paste-new-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    for (i, label) in ["Aa", "Bb", "Cc"].iter().enumerate() {
+        let corner = [30.0 * i as f64, 0.0, 0.0];
+        run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10,"corner":corner,"operation":"new_body","body_name":label}));
+    }
+    let path = dir.join("Three.step");
+    run(&mut s, "file.export", json!({"path":path.to_string_lossy()}));
+    if shared {
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        for label in ["Aa", "Bb", "Cc"] {
+            assert!(text.contains(&format!("MANIFOLD_SOLID_BREP('{label}'")), "the file names its solids: {label}");
+            text = text.replace(&format!("MANIFOLD_SOLID_BREP('{label}'"), "MANIFOLD_SOLID_BREP('X'");
+        }
+        std::fs::write(&path, text).unwrap();
+    }
+    path
+}
+
+fn body_names(s: &Session) -> Vec<String> {
+    s.model.state().bodies.iter().map(|b| b.name.clone()).collect()
+}
+
+/// Where the bodies of component `part` are: the lowest corner of each, rounded, in model order.
+fn corners(s: &Session, part: u64) -> Vec<Vec<f64>> {
+    let state = s.model.state();
+    state
+        .bodies
+        .iter()
+        .filter(|b| s.doc.model_body_component(b) == part)
+        .map(|b| {
+            let min = b.mesh().bounds().min;
+            vec![min.x.round(), min.y.round(), min.z.round()]
+        })
+        .collect()
+}
+
+/// Lifts the first of the three bodies by 20 and the second by 50, as two features of the active
+/// component.
+fn lift_two(s: &mut Session, bodies: [&str; 3]) {
+    run(s, "solid.move", json!({"bodies":[bodies[0]],"translate":[0,0,20],"name":"Lift first"}));
+    run(s, "solid.move", json!({"bodies":[bodies[1]],"translate":[0,0,50],"name":"Lift second"}));
+}
+
+const LIFTED: [[f64; 3]; 3] = [[0.0, 0.0, 20.0], [30.0, 0.0, 50.0], [60.0, 0.0, 0.0]];
+
+fn lifted() -> Vec<Vec<f64>> {
+    LIFTED.iter().map(|c| c.to_vec()).collect()
+}
+
+/// A component whose Import feature holds the three solids of `path`. `file.insert_step` puts its
+/// feature into the root even while a component is active, so the feature is moved into it afterwards.
+fn component_with_import(s: &mut Session, path: &std::path::Path) -> u64 {
+    let part = component(s, "Part");
+    let import = run(s, "file.insert_step", json!({"path":path.to_string_lossy()}))["feature"].as_u64().unwrap();
+    s.doc_mut().feature_mut(import).unwrap().component = part;
+    s.refresh();
+    part
+}
+
+/// A control: solids with labels of their own are built as they are labelled.
+#[test]
+fn paste_new_of_a_component_with_an_import_moves_the_copy_of_each_body() {
+    let path = three_box_step("distinct", false);
+    let mut s = Session::default();
+    let part = component_with_import(&mut s, &path);
+    assert_eq!(body_names(&s), ["Aa", "Bb", "Cc"]);
+    lift_two(&mut s, ["Aa", "Bb", "Cc"]);
+    let copied = run(&mut s, "component.paste_new", json!({"component":part}))["component"].as_u64().unwrap();
+    assert_eq!(corners(&s, part), lifted());
+    assert_eq!(corners(&s, copied), lifted());
+}
+
+/// Solids of a STEP file that share one label are stored as `X`, `X`, `X` and built as `X`,
+/// `X (2)`, `X (3)`, and the features made on them name them so. The copy of the component has
+/// those features act on its own bodies, each on its own.
+#[test]
+fn paste_new_of_an_import_with_one_label_on_all_solids_moves_the_copy_of_each_body() {
+    let path = three_box_step("shared", true);
+    let mut s = Session::default();
+    let part = component_with_import(&mut s, &path);
+    assert_eq!(body_names(&s), ["X", "X (2)", "X (3)"]);
+    lift_two(&mut s, ["X", "X (2)", "X (3)"]);
+    let copied = run(&mut s, "component.paste_new", json!({"component":part}))["component"].as_u64().unwrap();
+    assert_eq!(corners(&s, part), lifted());
+    assert_eq!(corners(&s, copied), lifted(), "{:?}", body_names(&s));
+    // The copy keeps its bodies and their places when the design is saved and opened again.
+    let names = body_names(&s);
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_eq!(body_names(&reopened), names);
+    assert_eq!(corners(&reopened, copied), lifted());
+}
+
+/// No shared label is needed: a design linked a second time builds `Aa (2)`, `Bb (2)`, `Cc (2)`
+/// from the names `Aa`, `Bb`, `Cc`, and the features made on those bodies name them so.
+#[test]
+fn paste_new_of_a_design_linked_twice_moves_the_copy_of_each_body() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-paste-new-linked-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("Three.solidcraft");
+    let mut part = Session::default();
+    for (i, label) in ["Aa", "Bb", "Cc"].iter().enumerate() {
+        let corner = [30.0 * i as f64, 0.0, 0.0];
+        run(&mut part, "solid.box", json!({"length":10,"width":10,"height":10,"corner":corner,"operation":"new_body","body_name":label}));
+    }
+    run(&mut part, "file.save_as", json!({"path":design.to_string_lossy()}));
+    let mut s = Session::default();
+    run(&mut s, "component.insert_design", json!({"path":design.to_string_lossy()}));
+    let second = run(&mut s, "component.insert_design", json!({"path":design.to_string_lossy()}));
+    let linked = second["component"].as_u64().unwrap();
+    assert_eq!(body_names(&s), ["Aa", "Bb", "Cc", "Aa (2)", "Bb (2)", "Cc (2)"]);
+    run(&mut s, "material.assign", json!({"bodies":["Aa"],"material":"Steel"}));
+    run(&mut s, "material.assign", json!({"bodies":["Aa (2)"],"material":"Brass"}));
+    run(&mut s, "component.activate", json!({"component":linked}));
+    lift_two(&mut s, ["Aa (2)", "Bb (2)", "Cc (2)"]);
+    let copied = run(&mut s, "component.paste_new", json!({"component":linked}))["component"].as_u64().unwrap();
+    assert_eq!(corners(&s, linked), lifted());
+    assert_eq!(corners(&s, copied), lifted(), "{:?}", body_names(&s));
+    // The material of a body goes to its copy, and no material is kept for a body that does not exist.
+    let names = body_names(&s);
+    assert!(s.doc.materials.contains_key("Aa (2) (copy)"));
+    assert_eq!(s.doc.materials.get("Aa (2) (copy)"), s.doc.materials.get("Aa (2)"));
+    assert!(s.doc.materials.keys().all(|body| names.contains(body)), "{:?} for {names:?}", s.doc.materials.keys().collect::<Vec<_>>());
+}
+
+/// An OBJ file of three 10 mm cubes at x = 0, 30 and 60, every object called `X`.
+fn three_cube_obj(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solidcraft-paste-new-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let corners = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];
+    let faces = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2], [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5]];
+    let mut text = String::new();
+    for i in 0..3 {
+        text += "o X\n";
+        for c in corners {
+            text += &format!("v {} {} {}\n", 30 * i + 10 * c[0], 10 * c[1], 10 * c[2]);
+        }
+        for f in faces {
+            text += &format!("f {} {} {}\n", 8 * i + f[0] + 1, 8 * i + f[1] + 1, 8 * i + f[2] + 1);
+        }
+    }
+    let path = dir.join("Three.obj");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// The same for the objects of an OBJ file (3MF and STL files give the same kind of import).
+#[test]
+fn paste_new_of_a_mesh_import_with_one_label_on_all_objects_moves_the_copy_of_each_body() {
+    let path = three_cube_obj("shared-obj");
+    let mut s = Session::default();
+    let part = component(&mut s, "Part");
+    let import = run(&mut s, "file.insert_mesh", json!({"path":path.to_string_lossy()}))["feature"].as_u64().unwrap();
+    s.doc_mut().feature_mut(import).unwrap().component = part;
+    s.refresh();
+    assert_eq!(body_names(&s), ["X", "X (2)", "X (3)"]);
+    lift_two(&mut s, ["X", "X (2)", "X (3)"]);
+    let copied = run(&mut s, "component.paste_new", json!({"component":part}))["component"].as_u64().unwrap();
+    assert_eq!(corners(&s, part), lifted());
+    assert_eq!(corners(&s, copied), lifted(), "{:?}", body_names(&s));
 }

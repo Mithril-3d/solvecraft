@@ -108,13 +108,14 @@ fn holes_and_trimmed_faces_are_watertight() {
     let bx = ok(crate::box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 4.0)));
     let pin = ok(crate::cylinder(Vec3::new(5.0, 5.0, -1.0), Vec3::Z, 2.0, 6.0));
     check("box with a hole", &cut(&bx, &pin), tol, 400.0 - PI * 4.0 * 4.0);
-    // A cylinder with a cross hole: trimmed cylinder halves (Delaunay) and intersection-curve walls.
+    // A cylinder with a cross hole: trimmed cylinder halves (an iso-line grid cut by the hole)
+    // and intersection-curve walls; no face needs Delaunay.
     let cyl = ok(crate::cylinder(Vec3::new(5.0, 5.0, -1.0), Vec3::Z, 2.0, 6.0));
     let cross = ok(crate::cylinder(Vec3::new(5.0, -1.0, 2.0), Vec3::Y, 1.0, 12.0));
     let body = cut(&cyl, &cross);
     let (m, stats) = plan_body(&body, tol);
     assert_watertight(&m, "cross hole");
-    assert!(stats.delaunay > 0, "{stats:?}");
+    assert_eq!(stats.delaunay, 0, "{stats:?}");
     // Against the reference mesher's volume (no closed form for the two-cylinder intersection).
     let Ok(reference) = body.tessellate(tol * 0.2) else { panic!("reference mesh") };
     let (a, b) = (m.measure().volume, reference.measure().volume);
@@ -278,4 +279,20 @@ fn a_placed_body_meshes_like_the_original() {
     let (m, _) = plan_body(&b, 0.005);
     let (p, _) = plan_body(&placed, 0.005);
     assert_eq!(m.tri_face, p.tri_face);
+}
+
+/// Seeds on a motorcycle trace start at the spacing of the boundary it leaves and grow
+/// geometrically to the spacing at its other end (here 0.1 to 1 over 5 mm).
+#[test]
+fn trace_seeds_grade_from_one_end_to_the_other() {
+    let t = graded([0.0, 0.0], [5.0, 0.0], 0.1, 1.0, 10.0, [1.0, 1.0], &|_, _| true);
+    let all: Vec<f64> = std::iter::once(0.0).chain(t.iter().copied()).chain(std::iter::once(1.0)).map(|f| f * 5.0).collect();
+    let sizes: Vec<f64> = all.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!((sizes[0] - 0.1).abs() < 0.03, "first {}", sizes[0]);
+    assert!((sizes[sizes.len() - 1] - 1.0).abs() < 0.3, "last {}", sizes[sizes.len() - 1]);
+    assert!(sizes.windows(2).all(|w| w[1] >= w[0] - 1e-12), "growing: {sizes:?}");
+    // Equal ends: even; a segment no longer than its spacing: no seeds.
+    let even = graded([0.0, 0.0], [4.0, 0.0], 1.0, 1.0, 10.0, [1.0, 1.0], &|_, _| true);
+    assert_eq!(even.len(), 3);
+    assert!(graded([0.0, 0.0], [0.5, 0.0], 1.0, 1.0, 10.0, [1.0, 1.0], &|_, _| true).is_empty());
 }

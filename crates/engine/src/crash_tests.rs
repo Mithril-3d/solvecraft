@@ -20,6 +20,24 @@ fn child() {
     };
     let fresh = install(PathBuf::from(dir), build());
     println!("FRESH {}", serde_json::to_string(&fresh).unwrap());
+    // Dying while starting up, before any command: in a graphics driver, with or without what
+    // a native crash handler caught.
+    if mode == "startup" || mode == "native" {
+        phase("window");
+        phase("adapter request");
+        set_environment("Renderer: Vulkan Test GPU (driver 1.2.3)");
+        phase("device creation");
+        if mode == "native" {
+            let (info, dump) = native_paths().unwrap();
+            fs::write(
+                info,
+                r#"{"code":"0xC0000005","name":"EXCEPTION_ACCESS_VIOLATION","detail":"read of 0x0000000000000010","address":"0x00007FFB12345678","module":"C:\\Windows\\System32\\DriverStore\\igvk64.dll","offset":"0x64EA72","thread":4242}"#,
+            )
+            .unwrap();
+            fs::write(dump, b"MDMP fake").unwrap();
+        }
+        std::process::abort();
+    }
     set_environment("Renderer: test");
     let mut s = Session { crash_journal: true, ..Default::default() };
     s.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30})).unwrap();
@@ -28,6 +46,14 @@ fn child() {
         s.execute("document.inspect", &json!({})).unwrap();
     }
     match mode.as_str() {
+        "render" => {
+            s.execute("render.settings.set", &json!({"name":"Studio","set":{"exposure_ev":2}})).unwrap();
+            s.execute("render.settings.get", &json!({"name":"Studio"})).unwrap();
+            s.execute("render.settings.set", &json!({"name":"Studio","set":{"exposure_ev":3}})).unwrap();
+            s.execute("edit.undo", &json!({})).unwrap();
+            s.execute("edit.redo", &json!({})).unwrap();
+            let _ = s.execute("diagnostics.crash_test", &json!({"mode":"abort"}));
+        }
         "command" => {
             for _ in 0..3 {
                 let r = s.execute("diagnostics.crash_test", &json!({"mode": "panic"}));
@@ -154,6 +180,93 @@ fn an_abort_is_reported_at_the_next_start_with_a_replay() {
     // Told once: the start after that has nothing new.
     let (out, _) = run_child(&d, "none");
     assert!(out.contains("FRESH []"), "{out}");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn render_settings_survive_unclean_exit_and_journal_replay() {
+    let d = fresh_dir("render");
+    assert!(!run_child(&d, "render").1);
+    assert!(run_child(&d, "none").1);
+    let (_, report) = only_report(&d);
+    let replay: Value = serde_json::from_slice(&fs::read(report["replay_path"].as_str().unwrap()).unwrap()).unwrap();
+    let commands = replay["commands"].as_array().unwrap();
+    assert!(!commands.iter().any(|c| c["command"] == "render.settings.get"));
+    assert_eq!(commands.iter().filter(|c| c["command"] == "render.settings.set").count(), 2);
+    let mut recovered = Session::default();
+    for command in commands {
+        let id = command["command"].as_str().unwrap();
+        if id != "diagnostics.crash_test" {
+            recovered.execute(id, &command["params"]).unwrap();
+        }
+    }
+    assert_eq!(recovered.doc.features.len(), 1);
+    assert_eq!(recovered.doc.render.setups["Studio"].exposure_ev, 3.0);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_crash_while_starting_up_names_the_step_and_the_renderer() {
+    let d = fresh_dir("startup");
+    let (_, ok) = run_child(&d, "startup");
+    assert!(!ok, "the child aborted");
+    let (_, ok) = run_child(&d, "none");
+    assert!(ok);
+    let (s, v) = only_report(&d);
+    assert_eq!(s.kind, "unclean_exit");
+    assert!(s.message.contains("during startup (device creation"), "{}", s.message);
+    assert_eq!(v["location"], "unclean exit during startup: device creation");
+    assert_eq!(v["startup_phase"]["step"], "device creation");
+    assert_eq!(v["system"]["environment"], "Renderer: Vulkan Test GPU (driver 1.2.3)", "{v}");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_native_crash_is_reported_with_the_module_the_step_and_the_minidump() {
+    let d = fresh_dir("native");
+    let (_, ok) = run_child(&d, "native");
+    assert!(!ok, "the child aborted");
+    let (_, ok) = run_child(&d, "none");
+    assert!(ok);
+    let (s, v) = only_report(&d);
+    assert_eq!(s.kind, "unclean_exit");
+    assert!(s.message.contains("EXCEPTION_ACCESS_VIOLATION (0xC0000005) in igvk64.dll+0x64EA72 during startup (device creation"), "{}", s.message);
+    assert_eq!(v["location"], "native exception in igvk64.dll+0x64EA72");
+    assert_eq!(v["native"]["thread"], 4242);
+    let bt: Vec<&str> = v["backtrace"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    assert_eq!(bt[0], "0xC0000005 EXCEPTION_ACCESS_VIOLATION (read of 0x0000000000000010)");
+    assert!(bt[1].contains("igvk64.dll+0x64EA72"), "{bt:?}");
+    assert_eq!(fs::read(v["minidump_path"].as_str().unwrap()).unwrap(), b"MDMP fake");
+    assert_eq!(v["files"]["minidump"], "minidump.dmp");
+    // Nothing is left behind next to the journals.
+    let left: Vec<_> = fs::read_dir(d.join("sessions")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(left.iter().all(|n| n.to_string_lossy().ends_with(".jsonl")), "{left:?}");
+    // The same crash again is counted, not written again.
+    let _ = run_child(&d, "native");
+    let _ = run_child(&d, "none");
+    let (s, _) = only_report(&d);
+    assert_eq!(s.count, 2);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn startup_steps_survive_a_rebase_and_running_ends_startup() {
+    let d = fresh_dir("rebase");
+    fs::create_dir_all(d.join("sessions")).unwrap();
+    let mut j = Journal::open(&d, &build(), now());
+    j.phase = Some(json!({"phase": "first frame", "ms": 5}).to_string());
+    j.environment = Some(json!({"environment": "Renderer: X"}).to_string());
+    j.rebase(&json!("new"), 1);
+    // Read through the journal's own handle, as `read_live_journal` does: Windows refuses a
+    // second handle on a live journal's locked range (#1448).
+    let r = read_journal_file(j.file.as_ref().unwrap().try_clone().unwrap());
+    assert_eq!(r.phase, Some(("first frame".to_string(), 5)));
+    assert_eq!(r.environment.as_deref(), Some("Renderer: X"));
+    j.write(&json!({"phase": RUNNING, "ms": 9}).to_string());
+    let r = read_journal_file(j.file.as_ref().unwrap().try_clone().unwrap());
+    assert_eq!(r.phase, Some((RUNNING.to_string(), 9)));
+    assert!(from_journal(r).fields.get("startup_phase").is_none(), "a running app is past startup");
+    drop(j);
     let _ = fs::remove_dir_all(&d);
 }
 

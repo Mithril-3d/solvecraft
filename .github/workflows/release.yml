@@ -429,6 +429,32 @@ jobs:
         run: |
           (cd artifacts && sha256sum -- * | tee SHA256SUMS.txt)
           sed "s/{version}/$VERSION/g" .github/release-notes.md >notes.md
+      - name: Sign the checksum list for in-app updates
+        # Optional until the UPDATE_SIGNING_KEY secret exists (docs/releasing.md, "Update
+        # signing"). The trusted comment names the release, which the app checks.
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          # The key the app checks against (crates/ui-egui/src/update/install.rs, PUBLIC_KEY).
+          public_key=$(sed -n 's/^pub const PUBLIC_KEY: Option<&str> = Some("\([^"]*\)");/\1/p' crates/ui-egui/src/update/install.rs)
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            if [ -n "$public_key" ]; then
+              echo "::error::the app expects signed updates (PUBLIC_KEY is set) but the UPDATE_SIGNING_KEY secret is missing"
+              exit 1
+            fi
+            echo "UPDATE_SIGNING_KEY isn't set: SHA256SUMS.txt stays unsigned"
+            exit 0
+          fi
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends minisign
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" >"$RUNNER_TEMP/update.key"
+          minisign -S -s "$RUNNER_TEMP/update.key" -m artifacts/SHA256SUMS.txt \
+            -x artifacts/SHA256SUMS.txt.minisig -t "SolidCraft v$VERSION" </dev/null
+          rm -f "$RUNNER_TEMP/update.key"
+          if [ -n "$public_key" ]; then
+            minisign -V -P "$public_key" -m artifacts/SHA256SUMS.txt -x artifacts/SHA256SUMS.txt.minisig
+          fi
       - name: Publish nightly pre-release
         if: github.event_name == 'schedule'
         working-directory: artifacts

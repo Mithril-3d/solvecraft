@@ -96,10 +96,14 @@ impl Vec3 {
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Vec3 { x, y, z }
     }
-    pub fn dot(self, o: Vec3) -> f64 {
+    /// Takes a [`Vec3`] or a [`UnitVec3`](crate::UnitVec3).
+    pub fn dot(self, o: impl Into<Vec3>) -> f64 {
+        let o = o.into();
         self.x * o.x + self.y * o.y + self.z * o.z
     }
-    pub fn cross(self, o: Vec3) -> Vec3 {
+    /// Takes a [`Vec3`] or a [`UnitVec3`](crate::UnitVec3).
+    pub fn cross(self, o: impl Into<Vec3>) -> Vec3 {
+        let o = o.into();
         Vec3::new(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
     }
     pub fn len(self) -> f64 {

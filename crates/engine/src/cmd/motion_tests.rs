@@ -130,7 +130,7 @@ fn motion_study_plays_and_exports() {
     // The B occurrence's origin moves by the slider value (it starts at 0 offset with value 0 at 10 mm… so 10 → −5).
     assert!((bx(&rows[1]) - bx(&rows[0]) + 3.75).abs() < 1e-6, "{e}");
     assert!(rows[4]["stopped_by_contact"].is_object());
-    let dir = std::env::temp_dir().join(format!("solidcraft-motion-{}", std::process::id()));
+    let dir = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-motion-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv = dir.join("push.csv");
     run(&mut s, "motion.export", json!({"study": "Push", "samples": 3, "path": csv.to_string_lossy()}));
@@ -172,4 +172,236 @@ fn exploded_views_show_without_changing_the_design() {
         (run(&mut s, "inspect.measure", json!({"bodies": [names[1]]}))["bodies"][0]["bbox"]["min"][2].as_f64().unwrap_or(0.0) - 50.0).abs() < 1e-6
     );
     assert_eq!(run(&mut s, "explode.list", json!({}))["views"].as_array().map(Vec::len), Some(2));
+}
+
+/// Pictures drawn by the CPU rasterizer (the engine has no GPU): real views of the scene.
+fn cpu(scene: &crate::render::Scene, cam: &crate::render::Camera, w: u32, h: u32) -> Result<crate::capture::Picture, String> {
+    Ok(crate::capture::Picture { rgba: crate::render::render(scene, cam, w as usize, h as usize).rgba, renderer: "cpu" })
+}
+
+/// A folder of its own for one test's files.
+fn out_dir(test: &str) -> std::path::PathBuf {
+    let dir = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-anim-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A GIF's logical screen size and the number of its frames (image descriptors).
+fn gif_frames(gif: &[u8]) -> (usize, usize, usize) {
+    let u16_at = |i: usize| usize::from(u16::from_le_bytes([gif[i], gif[i + 1]]));
+    assert_eq!(&gif[..6], b"GIF89a");
+    let mut at = 13 + if gif[10] & 0x80 != 0 { 3 << ((gif[10] & 7) + 1) } else { 0 };
+    let mut frames = 0;
+    // Each block: a size byte and that many bytes, up to a 0.
+    let skip_blocks = |mut at: usize| {
+        while gif[at] != 0 {
+            at += usize::from(gif[at]) + 1;
+        }
+        at + 1
+    };
+    loop {
+        match gif[at] {
+            0x3B => return (u16_at(6), u16_at(8), frames),
+            0x21 => at = skip_blocks(at + 2),
+            0x2C => {
+                frames += 1;
+                at = skip_blocks(at + 11);
+            }
+            b => panic!("unexpected GIF block {b:#x}"),
+        }
+    }
+}
+
+/// A PNG's width and height (its IHDR).
+fn png_size(png: &[u8]) -> (u32, u32) {
+    let be = |i: usize| u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]);
+    (be(16), be(20))
+}
+
+#[test]
+fn an_animation_has_the_frames_and_the_size_asked_for() {
+    let mut s = rail();
+    run(&mut s, "motion.study", json!({"name": "Push", "steps": 10, "keys": [{"joint": "Rail", "points": [[0, 10], [10, 0]]}]}));
+    let dir = out_dir("size");
+    let before = s.doc.clone();
+    let gif = dir.join("push.gif");
+    let p = json!({"study": "Push", "path": gif.to_string_lossy(), "samples": 6, "width": 64, "height": 40, "fps": 25});
+    let r = super::animation::export_with(&s, &p, Some(&cpu)).unwrap();
+    assert_eq!(
+        (r["format"].as_str(), r["frames"].as_u64(), r["width"].as_u64(), r["height"].as_u64()),
+        (Some("gif"), Some(6), Some(64), Some(40)),
+        "{r}"
+    );
+    assert_eq!(r["fps"], 25.0, "{r}");
+    let bytes = std::fs::read(&gif).unwrap();
+    assert_eq!(r["bytes"].as_u64(), Some(bytes.len() as u64));
+    assert_eq!(gif_frames(&bytes), (64, 40, 6));
+    // Without samples: the study's steps + 1.
+    let r =
+        super::animation::export_with(&s, &json!({"study": "Push", "path": gif.to_string_lossy(), "width": 32, "height": 32}), Some(&cpu)).unwrap();
+    assert_eq!(gif_frames(&std::fs::read(&gif).unwrap()), (32, 32, 11), "{r}");
+    // A folder of PNG frames, made where missing; a joint driven instead of a study.
+    let frames = dir.join("frames").join("rail");
+    let p = json!({"joint": "Rail", "from": 10, "to": 0, "path": frames.to_string_lossy(), "samples": 3, "width": 48, "height": 30});
+    let r = super::animation::export_with(&s, &p, Some(&cpu)).unwrap();
+    assert_eq!((r["format"].as_str(), r["frames"].as_u64()), (Some("png"), Some(3)), "{r}");
+    let mut names: Vec<String> = std::fs::read_dir(&frames).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    assert_eq!(names, ["frame-0001.png", "frame-0002.png", "frame-0003.png"]);
+    assert!(names.iter().all(|n| png_size(&std::fs::read(frames.join(n)).unwrap()) == (48, 30)));
+    // A shorter export into the same folder leaves no frames of a longer one behind, past a gap
+    // too; other files stay.
+    std::fs::write(frames.join("notes.txt"), "mine").unwrap();
+    std::fs::write(frames.join("frame-0005.png"), "older").unwrap();
+    super::animation::export_with(&s, &json!({"joint": "Rail", "from": 10, "to": 0, "path": frames.to_string_lossy(), "samples": 2}), Some(&cpu))
+        .unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(&frames).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    assert_eq!(names, ["frame-0001.png", "frame-0002.png", "notes.txt"]);
+    assert_eq!(*s.doc, *before, "the design is not changed");
+    // Through the registry, with the renderer the host installed.
+    crate::capture::install_test_renderer();
+    let r = run(&mut s, "motion.export_animation", json!({"study": "Push", "path": gif.to_string_lossy(), "samples": 2, "width": 16, "height": 16}));
+    assert_eq!(r["frames"], 2, "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_two_frame_drive_gives_two_different_frames() {
+    let s = rail();
+    let dir = out_dir("two");
+    let frames = |name: &str, to: f64| {
+        let folder = dir.join(name);
+        let p = json!({"joint": "Rail", "from": 10, "to": to, "path": folder.to_string_lossy(), "samples": 2, "width": 120, "height": 80});
+        super::animation::export_with(&s, &p, Some(&cpu)).unwrap();
+        (std::fs::read(folder.join("frame-0001.png")).unwrap(), std::fs::read(folder.join("frame-0002.png")).unwrap())
+    };
+    let (a, b) = frames("moved", -5.0);
+    assert_ne!(a, b, "B moved 15 mm between the frames");
+    // Held still, the two frames are the same picture: the difference is the motion.
+    let (c, d) = frames("still", 10.0);
+    assert_eq!(c, d);
+    assert_eq!(a, c, "both start at 10 mm");
+    // Without the ground grid and the axes, the same pose is another picture.
+    let bare = dir.join("bare");
+    let p = json!({"joint": "Rail", "from": 10, "to": 10, "path": bare.to_string_lossy(), "samples": 2, "width": 120, "height": 80, "grid": false, "axes": false});
+    super::animation::export_with(&s, &p, Some(&cpu)).unwrap();
+    assert_ne!(std::fs::read(bare.join("frame-0001.png")).unwrap(), c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_animation_is_drawn_from_the_camera_given() {
+    let mut s = rail();
+    let dir = out_dir("camera");
+    // A renderer is 'static (hosts install it for the process): it shares what it saw.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = {
+        let seen = seen.clone();
+        move |scene: &crate::render::Scene, cam: &crate::render::Camera, w: u32, h: u32| {
+            seen.lock().unwrap().push(*cam);
+            cpu(scene, cam, w, h)
+        }
+    };
+    let path = dir.join("cam.gif");
+    let base = json!({"joint": "Rail", "from": 10, "to": 0, "path": path.to_string_lossy(), "samples": 3, "width": 40, "height": 30});
+    let with = |camera: Value| {
+        let mut p = base.clone();
+        p["camera"] = camera;
+        p
+    };
+    // ui.camera's reply, every field.
+    let reply = json!({"target": [1.0, 2.0, 3.0], "yaw": 0.5, "pitch": -0.25, "roll": 0.1, "distance": 300.0, "fov": 0.6, "up": "y"});
+    super::animation::export_with(&s, &with(reply.clone()), Some(&record)).unwrap();
+    let cams = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(cams.len(), 3);
+    assert!(cams.iter().all(|c| json!(c) == reply), "{cams:?}");
+    // Fields left out keep the default view: view.apply's camera.
+    run(&mut s, "view.apply", json!({"camera": {"target": [0, 0, 0], "yaw": 1, "pitch": 0.2, "distance": 80}}));
+    super::animation::export_with(&s, &with(json!({"yaw": 2.0})), Some(&record)).unwrap();
+    let cams = std::mem::take(&mut *seen.lock().unwrap());
+    assert!(cams.iter().all(|c| c.yaw == 2.0 && c.pitch == 0.2 && c.distance == 80.0), "{cams:?}");
+    // Without one: view.apply's camera as it is; and another camera draws another picture.
+    super::animation::export_with(&s, &base, Some(&record)).unwrap();
+    assert!(seen.lock().unwrap().iter().all(|c| Some(*c) == s.camera));
+    let pictures = |camera: Value| {
+        let folder = dir.join(format!("p{}", camera["yaw"]));
+        let mut p = with(camera);
+        p["path"] = json!(folder.to_string_lossy());
+        super::animation::export_with(&s, &p, Some(&cpu)).unwrap();
+        std::fs::read(folder.join("frame-0001.png")).unwrap()
+    };
+    assert_ne!(pictures(json!({"yaw": 0.3})), pictures(json!({"yaw": 1.3})));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hostile_animation_params_are_refused() {
+    let mut s = rail();
+    run(&mut s, "motion.study", json!({"name": "Push", "steps": 10, "keys": [{"joint": "Rail", "points": [[0, 10], [10, 0]]}]}));
+    let dir = out_dir("hostile");
+    let gif = dir.join("x.gif").to_string_lossy().to_string();
+    let base = json!({"study": "Push", "path": gif, "samples": 2, "width": 16, "height": 16});
+    let refused = |change: Value| {
+        let mut p = base.clone();
+        if let (Some(p), Some(change)) = (p.as_object_mut(), change.as_object()) {
+            for (k, v) in change {
+                if v.is_null() {
+                    p.remove(k);
+                } else {
+                    p.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        super::animation::export_with(&s, &p, Some(&cpu)).err().map(|e| e.to_string())
+    };
+    for change in [
+        json!({"samples": 0}),
+        json!({"samples": 1}),
+        json!({"samples": 1e9}),
+        json!({"samples": "many"}),
+        json!({"samples": 1001}),
+        json!({"width": 1e9}),
+        json!({"width": -16}),
+        json!({"height": 3}),
+        json!({"height": f64::MAX}),
+        json!({"fps": 0}),
+        json!({"fps": 1e9}),
+        json!({"path": ""}),
+        json!({"path": null}),
+        json!({"path": "one.png"}),
+        json!({"path": "a\u{0}b.gif"}),
+        json!({"path": "x".repeat(5000)}),
+        json!({"camera": "iso"}),
+        json!({"camera": {"distance": -1}}),
+        json!({"camera": {"distance": 1e300}}),
+        json!({"camera": {"pitch": 4}}),
+        json!({"camera": {"fov": 9}}),
+        json!({"camera": {"target": [1, 2]}}),
+        json!({"camera": {"fit": true}}),
+        json!({"grid": "no"}),
+        json!({"axes": 1}),
+        json!({"study": null}),
+        json!({"study": "Nope"}),
+        json!({"study": null, "joint": "Rail"}),
+        // 4096 × 4096 frames: a GIF holds four of them.
+        json!({"width": 4096, "height": 4096, "samples": 5}),
+    ] {
+        assert!(refused(change.clone()).is_some(), "{change} was accepted");
+    }
+    let e = refused(json!({"width": 4096, "height": 4096, "samples": 5})).unwrap();
+    assert!(e.contains("2…4 for 4096 × 4096"), "{e}");
+    assert!(super::animation::export_with(&s, &base, None).unwrap_err().to_string().contains("no renderer"));
+    assert!(!std::path::Path::new(&gif).exists(), "nothing refused was written");
+    // An agent's export lands only inside its folders.
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    solidcraft_io::vfs::scoped(Some(solidcraft_io::vfs::PathScope::new([root.clone()])), || {
+        let e = refused(json!({"path": dir.join("out").to_string_lossy()})).unwrap();
+        assert!(e.contains("outside the folders this agent may use"), "{e}");
+        assert!(refused(json!({"path": root.join("in.gif").to_string_lossy()})).is_none());
+    });
+    assert!(root.join("in.gif").exists() && !dir.join("out").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

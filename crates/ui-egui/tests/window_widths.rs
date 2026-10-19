@@ -52,6 +52,7 @@ fn command_dialogs_shrink_to_their_content_within_limits() {
         }
         h.app.dialog = None;
         h.app.params = None;
+        h.app.design_properties = None;
         h.app.tool = None;
         if h.app.session.active_sketch.is_some() {
             h.app.finish_sketch();
@@ -83,6 +84,7 @@ fn floating_windows_stay_within_limits() {
     h.app.help.about = true;
     h.app.ui.palette_open = true;
     solidcraft_ui_egui::params_dialog::open(&mut h.app);
+    solidcraft_ui_egui::design_properties::open(&mut h.app);
     h.frames(6);
     let ws = window_widths(&h);
     // Keyboard Shortcuts is a page of Preferences (one window, #36).

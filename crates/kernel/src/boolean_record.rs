@@ -116,9 +116,30 @@ pub(crate) fn shapeops(h: &truck_shapeops::History, tool: &Solid, tool_edges: Op
     Some((faces, edges))
 }
 
+/// Samples along each edge when checking that its curve evaluates.
+const EVALUATION_SAMPLES: usize = 32;
+
+/// Whether every edge of `solid` evaluates along its whole range. An intersection curve projects
+/// its leader's point onto both surfaces, which fails to converge where a boolean made the edge
+/// from an approximation that strayed (#1252). Such a result is no solid to keep: the mesher,
+/// healing and measuring all sample the edge and stumble over the gap.
+pub(crate) fn edges_evaluate(solid: &Solid) -> bool {
+    use truck_meshalgo::prelude::TrySubs;
+    use truck_modeling::BoundedCurve;
+    solid.boundaries().iter().flat_map(|shell| shell.edge_iter()).all(|edge| {
+        let curve = edge.curve();
+        let (t0, t1) = curve.range_tuple();
+        (0..=EVALUATION_SAMPLES).all(|k| {
+            let t = t0 + (t1 - t0) * k as f64 / EVALUATION_SAMPLES as f64;
+            curve.try_subs(t).is_some_and(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
+        })
+    })
+}
+
 /// The body made of `solid` healed (keeping faces apart along `keep`), with the history whose
 /// faces and edges (in `solid`'s orders) are given before healing, carried through it.
-/// Operands with `counts` faces and edges.
+/// Operands with `counts` faces and edges. A result with an edge that does not evaluate is
+/// refused (see [`edges_evaluate`]).
 pub(crate) fn heal_build(
     solid: Solid,
     size: f64,
@@ -128,6 +149,9 @@ pub(crate) fn heal_build(
     counts: &[(usize, usize)],
 ) -> Result<Body> {
     let (healed, map) = crate::heal::heal_traced(solid, size, keep);
+    if !edges_evaluate(&healed) {
+        return Err(crate::KernelError::Failed("an edge of the result does not evaluate".into()));
+    }
     let carried = faces.zip(edges).zip(map).and_then(|((f, e), m)| m.carry(&f, &e));
     let (faces, edges) = carried.unzip();
     record::build(healed, counts, faces, edges.as_ref())

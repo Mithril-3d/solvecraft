@@ -132,3 +132,80 @@ fn legacy_extension_and_format_tag_still_open() {
     let reopened = solidcraft_engine::io::read_design(&std::fs::read(&resaved).unwrap()).unwrap();
     assert!(reopened.to_json().contains("\"solidcraft/"));
 }
+
+/// `snapshot` starts from `--in` as `run` does (its script runs on that design), and refuses an
+/// option it doesn't take rather than ignoring it.
+#[test]
+fn snapshot_runs_its_script_on_the_in_design() {
+    let dir = Scratch::new();
+    let base = dir.0.join("base.solidcraft");
+    json_output(cli().arg("run").arg(dir.script()).arg("--save").arg(&base).output().unwrap());
+    let shifted = dir.0.join("shifted.json");
+    std::fs::write(
+        &shifted,
+        json!({"commands": [{"command": "solid.box", "params": {"length": 2, "width": 3, "height": 4, "corner": [10, 0, 0]}}]}).to_string(),
+    )
+    .unwrap();
+    let shot = |name: &str, args: &[&std::ffi::OsStr]| {
+        let png = dir.0.join(name);
+        json_output(cli().arg("snapshot").args(args).arg("--out").arg(&png).args(["--width", "64", "--height", "48"]).output().unwrap());
+        std::fs::read(&png).unwrap()
+    };
+    // Pictures are drawn on the GPU: without an adapter only the option checks below run.
+    match solidcraft_gpu::capture::shared() {
+        Ok(_) => {
+            let alone = shot("alone.png", &[shifted.as_os_str()]);
+            let on_base = shot("on_base.png", &[shifted.as_os_str(), "--in".as_ref(), base.as_os_str()]);
+            let base_only = shot("base.png", &["--in".as_ref(), base.as_os_str()]);
+            assert_ne!(alone, on_base, "the script ran on the --in design");
+            assert_ne!(base_only, on_base);
+        }
+        Err(e @ solidcraft_gpu::GpuError::NoAdapter(_)) if std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none() => {
+            eprintln!("pictures left out: {e}")
+        }
+        Err(e) => panic!("{e}"),
+    }
+    for (bad, says) in [(["--frobnicate", "1"], "doesn't take --frobnicate"), (["--width", "wide"], "--width must be 16 to 8192")] {
+        let output = cli().arg("snapshot").arg(&base).arg("--out").arg(dir.0.join("x.png")).args(bad).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(says), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+/// An unknown command's error suggests the id that was meant.
+#[test]
+fn unknown_command_suggests_the_closest_id() {
+    let output = cli().args(["exec", "file.open"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("did you mean `doc.open`?"), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// #1833: `--timings` reports each command's time instead of the measurement, `--profile` adds
+/// the kernel's share, `--results` puts the results beside them, and files are still written.
+#[test]
+fn timings_and_profile_report_each_command() {
+    let dir = Scratch::new();
+    let saved = dir.0.join("timed.solidcraft");
+    let t = json_output(cli().arg("run").arg(dir.script()).arg("--timings").arg("--save").arg(&saved).output().unwrap());
+    let rows = t["timings"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0]["index"].as_u64(), rows[0]["command"].as_str()), (Some(0), Some("solid.box")));
+    assert!(rows[0]["ms"].as_f64().is_some() && t["total_ms"].as_f64().is_some(), "{t}");
+    assert!(rows[0].get("profile").is_none() && t.get("results").is_none(), "{t}");
+    assert_eq!(body_count(&saved), 1);
+
+    // --profile alone implies --timings; a flag before the script doesn't eat it.
+    let t = json_output(cli().arg("run").arg("--profile").arg(dir.script()).arg("--results").output().unwrap());
+    let p = &t["timings"][0]["profile"];
+    for k in ["boolean_ms", "tessellate_ms", "other_ms"] {
+        assert!(p[k].as_f64().is_some_and(|ms| ms >= 0.0), "{k}: {t}");
+    }
+    assert_eq!(t["results"].as_array().map(Vec::len), Some(1), "{t}");
+
+    // --results alone stays a plain array.
+    assert!(json_output(cli().arg("run").arg(dir.script()).arg("--results").output().unwrap()).is_array());
+
+    let output = cli().arg("run").arg("--in").arg(&saved).arg("--timings").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--timings needs a script"));
+}

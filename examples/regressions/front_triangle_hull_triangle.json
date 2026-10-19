@@ -1,0 +1,836 @@
+{
+ "description": "Bike front triangle (lofted tubes joined to a bottom-bracket cylinder): the display mesh drew a flat triangle inside the down tube bend at Fine/Ultra.",
+ "commands": [
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      12,
+      0.0,
+      18
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.947,
+      0.0,
+      -0.322
+     ]
+    },
+    "name": "S13"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     19.0,
+     0
+    ],
+    "minor_radius": 18.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -13.0,
+      0.0,
+      91.5
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.947,
+      0.0,
+      -0.322
+     ]
+    },
+    "name": "S14"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     27.0,
+     0
+    ],
+    "minor_radius": 24.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -38,
+      0.0,
+      165
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.959,
+      0.0,
+      -0.282
+     ]
+    },
+    "name": "S15"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     24.0,
+     0
+    ],
+    "minor_radius": 22.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -76.646,
+      0.0,
+      320.0
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.97,
+      0.0,
+      -0.242
+     ]
+    },
+    "name": "S16"
+   }
+  },
+  {
+   "command": "sketch.circle.center",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "radius": 20.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -110.577,
+      0.0,
+      456.089
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.97,
+      0.0,
+      -0.242
+     ]
+    },
+    "name": "S17"
+   }
+  },
+  {
+   "command": "sketch.circle.center",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "radius": 19.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.loft",
+   "params": {
+    "sections": [
+     {
+      "sketch": "S13"
+     },
+     {
+      "sketch": "S14"
+     },
+     {
+      "sketch": "S15"
+     },
+     {
+      "sketch": "S16"
+     },
+     {
+      "sketch": "S17"
+     }
+    ],
+    "operation": "new",
+    "name": "SeatTube",
+    "body_name": "SeatTube"
+   }
+  },
+  {
+   "command": "solid.cylinder",
+   "params": {
+    "diameter": 46,
+    "height": 73.0,
+    "base": [
+     0,
+     -36.5,
+     0
+    ],
+    "axis": "Y",
+    "operation": "new",
+    "name": "BBShell",
+    "body_name": "BBShell"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      459.471,
+      0.0,
+      607.143
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      0.349,
+      0.0,
+      -0.937
+     ]
+    },
+    "name": "S10"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     22.0,
+     0
+    ],
+    "minor_radius": 20.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      181.44,
+      0.0,
+      503.572
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      0.349,
+      0.0,
+      -0.937
+     ]
+    },
+    "name": "S11"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     27.0,
+     0
+    ],
+    "minor_radius": 23.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      -96.592,
+      0.0,
+      400.0
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      0.349,
+      0.0,
+      -0.937
+     ]
+    },
+    "name": "S12"
+   }
+  },
+  {
+   "command": "sketch.ellipse",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "major": [
+     17.0,
+     0
+    ],
+    "minor_radius": 16.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.loft",
+   "params": {
+    "sections": [
+     {
+      "sketch": "S10"
+     },
+     {
+      "sketch": "S11"
+     },
+     {
+      "sketch": "S12"
+     }
+    ],
+    "operation": "new",
+    "name": "TopTube",
+    "body_name": "TopTube"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      501.231,
+      0.0,
+      519.592
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.903,
+      0.0,
+      -0.431
+     ]
+    },
+    "name": "S1"
+   }
+  },
+  {
+   "command": "sketch.circle.center",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "radius": 32.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      473.678,
+      0.0,
+      577.358
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.903,
+      0.0,
+      -0.431
+     ]
+    },
+    "name": "S2"
+   }
+  },
+  {
+   "command": "sketch.circle.center",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "radius": 28.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      447.417,
+      0.0,
+      632.416
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.903,
+      0.0,
+      -0.431
+     ]
+    },
+    "name": "S3"
+   }
+  },
+  {
+   "command": "sketch.circle.center",
+   "params": {
+    "center": [
+     0,
+     0
+    ],
+    "radius": 26.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.loft",
+   "params": {
+    "sections": [
+     {
+      "sketch": "S1"
+     },
+     {
+      "sketch": "S2"
+     },
+     {
+      "sketch": "S3"
+     }
+    ],
+    "operation": "new",
+    "name": "HeadTube",
+    "body_name": "HeadTube"
+   }
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      8,
+      0.0,
+      3
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.178,
+      0.0,
+      0.984
+     ]
+    },
+    "name": "S4"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -19.0,
+     -18.0
+    ],
+    "p1": [
+     19.0,
+     18.0
+    ],
+    "radius": 10.799999999999999
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      80,
+      0.0,
+      16
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.211,
+      0.0,
+      0.977
+     ]
+    },
+    "name": "S5"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -30.0,
+     -26.0
+    ],
+    "p1": [
+     30.0,
+     26.0
+    ],
+    "radius": 15.6
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      175,
+      0.0,
+      40
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.596,
+      0.0,
+      0.803
+     ]
+    },
+    "name": "S6"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -38.0,
+     -33.0
+    ],
+    "p1": [
+     38.0,
+     33.0
+    ],
+    "radius": 19.8
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      314.248,
+      0.0,
+      271.657
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S7"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -37.0,
+     -33.0
+    ],
+    "p1": [
+     37.0,
+     33.0
+    ],
+    "radius": 19.8
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      422.553,
+      0.0,
+      451.835
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S8"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -33.0,
+     -30.0
+    ],
+    "p1": [
+     33.0,
+     30.0
+    ],
+    "radius": 18.0
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "sketch.create",
+   "params": {
+    "plane": {
+     "origin": [
+      484.441,
+      0.0,
+      554.793
+     ],
+     "x_dir": [
+      0.0,
+      1.0,
+      0.0
+     ],
+     "y_dir": [
+      -0.857,
+      0.0,
+      0.515
+     ]
+    },
+    "name": "S9"
+   }
+  },
+  {
+   "command": "sketch.rectangle.rounded",
+   "params": {
+    "p0": [
+     -23.0,
+     -22.0
+    ],
+    "p1": [
+     23.0,
+     22.0
+    ],
+    "radius": 13.2
+   }
+  },
+  {
+   "command": "sketch.finish",
+   "params": {}
+  },
+  {
+   "command": "solid.loft",
+   "params": {
+    "sections": [
+     {
+      "sketch": "S4"
+     },
+     {
+      "sketch": "S5"
+     },
+     {
+      "sketch": "S6"
+     },
+     {
+      "sketch": "S7"
+     },
+     {
+      "sketch": "S8"
+     },
+     {
+      "sketch": "S9"
+     }
+    ],
+    "operation": "new",
+    "name": "DownTube",
+    "body_name": "DownTube"
+   }
+  },
+  {
+   "command": "solid.combine",
+   "params": {
+    "target": "SeatTube",
+    "tools": [
+     "BBShell"
+    ],
+    "operation": "join"
+   }
+  },
+  {
+   "command": "solid.combine",
+   "params": {
+    "target": "SeatTube",
+    "tools": [
+     "TopTube"
+    ],
+    "operation": "join"
+   }
+  },
+  {
+   "command": "solid.combine",
+   "params": {
+    "target": "SeatTube",
+    "tools": [
+     "HeadTube"
+    ],
+    "operation": "join"
+   }
+  },
+  {
+   "command": "solid.combine",
+   "params": {
+    "target": "SeatTube",
+    "tools": [
+     "DownTube"
+    ],
+    "operation": "join"
+   }
+  },
+  {
+   "command": "body.rename",
+   "params": {
+    "body": "SeatTube",
+    "name": "FrontTriangle"
+   }
+  }
+ ]
+}

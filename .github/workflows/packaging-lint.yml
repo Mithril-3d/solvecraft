@@ -8,7 +8,7 @@ on:
     branches: [main]
     paths: [".github/workflows/**", "packaging/**", "assets/**"]
   pull_request:
-    paths: [".github/workflows/**", "packaging/**", "assets/**"]
+    paths: [".github/workflows/**", "packaging/**", "assets/platforms/**"]
   workflow_dispatch:
 
 permissions:

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
 use solidcraft_engine::io::vfs;
+use solidcraft_engine::timing;
 
 use crate::backend::Backend;
 
@@ -109,6 +110,8 @@ pub fn tool_definitions() -> Vec<Value> {
                         "items": {"type": "object", "properties": {"command": {"type": "string"}, "params": {"type": "object"}}, "required": ["command"]},
                     },
                     "rollback": {"type": "boolean", "description": "Undo completed steps when one fails (default true)"},
+                    "timings": {"type": "boolean", "description": "Add `timings`: [{index, command, ms}] for every step run (the failing one included) and `total_ms` (default false)"},
+                    "profile": {"type": "boolean", "description": "Like timings, and each step's `profile`: {boolean_ms, tessellate_ms, other_ms}, its time in kernel booleans, in tessellation and the rest (default false)"},
                     "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created` (default true)"},
                 }),
                 &["commands"],
@@ -135,15 +138,25 @@ pub fn tool_definitions() -> Vec<Value> {
             "measure",
             "Measure bodies",
             "Volume (mm³), surface area (mm²), centre of mass, bounding box and face/edge/vertex counts of one body or all \
-             bodies, with totals.",
-            obj(json!({"body": string("Body name (default: all bodies)")}), &[]),
+             bodies, with totals. With `items` (one or two selections, as `execute` takes them: faces, edges, vertices, \
+             sketch curves, profiles): one item's length, area or position, a circle's, arc's or cylinder's `diameter` and \
+             `radius` (with `circumference`, or an arc's `arc_length` and `angle_deg`), a slot's `slot` sizes; two items' \
+             `min` and `max` distance and, where one is round, `center_distance` (centre to centre, or from its axis).",
+            obj(
+                json!({
+                    "body": string("Body name (default: all bodies)"),
+                    "items": {"type": "array", "items": {"type": "object"}, "description": "One or two selections to measure instead of bodies, e.g. {\"type\": \"face\", \"body\": \"Body1\", \"index\": 3, \"point\": [x,y,z]}"},
+                }),
+                &[],
+            ),
             Effect::ReadOnly,
         ),
         tool(
             "body_topology",
             "List edges and faces",
-            "The edges (index, midpoint, length, endpoints) and faces (index, area, centroid, plane normal) of a body. Use \
-             an edge midpoint as the [x,y,z] point that picks the edge for fillet and chamfer.",
+            "The edges (index, midpoint, length, endpoints) and faces (index, name, area, centroid, plane normal, a `point` that lies \
+             on the face, and for a cylindrical face its `cylinder`: origin, axis, radius) of a body. Use an edge midpoint as the \
+             [x,y,z] point that picks the edge for fillet and chamfer; a face's point or its name picks the face for the face commands.",
             obj(json!({"body": string("Body name, e.g. \"Body1\"")}), &["body"]),
             Effect::ReadOnly,
         ),
@@ -170,7 +183,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "Render the design and return it as a PNG image. Headless: a CPU render of the model, fitted to the view. \
              Connected to the app: a screenshot of the window (source \"window\", the default) or a render of the model \
              with the app's camera (source \"model\"). Both show an active section (inspect.section) with its cut face \
-             capped. `view` first turns the camera to a standard view or a saved named view (view.save), `camera` to              any camera (as view.apply).",
+             capped. `view` first turns the camera to a standard view or a saved named view (view.save), `camera` to              any camera (as view.apply). \
+             `grid: false` and `axes: false` leave the ground grid (on Z 0) and the origin's axes out of a model render.",
             obj(
                 json!({
                     "view": string(
@@ -181,6 +195,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "width": {"type": "integer", "description": "Render width in pixels (model renders; default 960)"},
                     "height": {"type": "integer", "description": "Render height in pixels (model renders; default 600)"},
                     "source": {"type": "string", "enum": ["window", "model"], "description": "window = app screenshot, model = model render"},
+                    "grid": {"type": "boolean", "description": "false: leave the ground grid out of the render. It lies on Z 0 and cuts through a part that straddles it. Model renders only: default true, or as the app shows it when connected; with `grid` or `axes` a connected screenshot is a model render, and source \"window\" is an error"},
+                    "axes": {"type": "boolean", "description": "false: leave the origin's three axes out of the render (see `grid`). Axes hidden with browser.visibility stay hidden"},
                 }),
                 &[],
             ),
@@ -236,9 +252,20 @@ pub fn tool_definitions() -> Vec<Value> {
             "open",
             "Open a design",
             "Open a .solidcraft design file, a STEP file (.step/.stp: a new design whose bodies come from the file, as an \
-             Import base feature) or a 3MF/STL mesh (.3mf/.stl: mesh bodies). Replaces the current design; insert into it \
-             instead with the file.insert_step (STEP) or file.insert_mesh (3MF/STL) commands.",
-            obj(json!({"path": string("Path to a .solidcraft, .step/.stp, .3mf or .stl file")}), &["path"]),
+             Import base feature in a component named after the file; an assembly's parts become nested components) or a \
+             mesh (.3mf/.stl/.obj/.glb/.gltf: mesh bodies in such a component; a glTF file's nodes become nested components and its \
+             materials appearances); the result reports the component (id, component_name). Replaces the current design; insert into it \
+             instead with the file.insert_step (STEP) or file.insert_mesh (mesh) commands. A STEP file from a system \
+             that has Y up opens lying on its back: `up: \"y\"` turns its component a quarter turn about X (Y becomes Z). glTF is Y up, \
+             so it is turned by default (`up: \"z\"` keeps its axes). `names` picks what the bodies are named after when the solids' own names say nothing useful.",
+            obj(
+                json!({
+                    "path": string("Path to a .solidcraft, .step/.stp, .3mf, .stl, .obj, .glb or .gltf file"),
+                    "up": {"type": "string", "enum": ["z", "y"], "description": "STEP and glTF only. z keeps the file's axes; y: the file has Y up, so its bodies are turned to stand Z up. Default: z for STEP, y for glTF"},
+                    "names": {"type": "string", "enum": ["solid", "product", "instance"], "description": "STEP only. What the bodies are named after: solid (default: the solid's own name, else the product's), product (the part's name) or instance (the assembly occurrence's name, else the product's)"},
+                }),
+                &["path"],
+            ),
             Effect::Files,
         ),
         tool(
@@ -375,6 +402,9 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
             Ok(d)
         }
         "measure" => {
+            if let Some(items) = a.get("items") {
+                return exec(b, "inspect.measure", json!({ "items": items }));
+            }
             let p = match str_arg(a, "body") {
                 Some(body) => json!({"bodies": [body]}),
                 None => json!({}),
@@ -400,7 +430,7 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
         "undo" => exec(b, "edit.undo", json!({})),
         "redo" => exec(b, "edit.redo", json!({})),
         "new_design" => exec(b, "file.new", pick(a, &["name"])),
-        "open" => exec(b, "doc.open", pick(a, &["path"])),
+        "open" => exec(b, "doc.open", pick(a, &["path", "up", "names"])),
         "save" => exec(b, "file.save", pick(a, &["path", "format"])),
         other => Err(format!("unknown tool `{other}`")),
     }
@@ -469,15 +499,23 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     }
     let rollback = a.get("rollback").and_then(Value::as_bool).unwrap_or(true);
     let verbose = a.get("verbose").and_then(Value::as_bool).unwrap_or(true);
+    let profile = a.get("profile").and_then(Value::as_bool).unwrap_or(false);
+    let timed = profile || a.get("timings").and_then(Value::as_bool).unwrap_or(false);
     // An app that runs batches itself answers the whole batch in one request, so one frame
     // (#743). One too long for a control line goes step by step: the app would refuse it unrun.
     // The margin covers the envelope and the `allow_paths` the backend adds.
-    let params = json!({"commands": steps, "rollback": rollback});
+    let mut params = json!({"commands": steps, "rollback": rollback});
+    if timed && let Some(o) = params.as_object_mut() {
+        o.insert("timings".into(), Value::Bool(true));
+        o.insert("profile".into(), Value::Bool(profile));
+    }
     if params.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE {
         match b.call("engine.batch", params) {
             Ok(r) => return batch_reply(&r, rollback, verbose),
             // Older apps and the headless session, or the app wants the steps one by one.
             Err(e) if e.starts_with("unknown method") || e.starts_with("engine.batch unavailable") => {}
+            // Never sent: no app to send it to.
+            Err(e) if e.starts_with(crate::backend::NOT_RUNNING) => return text_result(&Value::String(e), true),
             // The app may have run it: sending the steps again would apply them twice.
             Err(e) => {
                 let msg = format!("the app did not answer engine.batch ({e}); it may have run: inspect the design before sending it again");
@@ -487,42 +525,57 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     }
     let start = if rollback { Undo::begin(b) } else { Undo::None };
     let mut results = Vec::with_capacity(steps.len());
+    let mut rows = Vec::new();
+    let clock = timing::Clock::start();
+    // The kernel's share can only be measured where the commands run: in this process.
+    let profile = profile && b.in_process();
     for (i, step) in steps.iter().enumerate() {
         let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str);
-        let r = match command {
+        let (r, took) = timing::time(profile, || match command {
             Some(id) => exec(b, id, step.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({}))),
             None => Err("missing `command`".to_string()),
-        };
+        });
+        if timed {
+            rows.push(took.to_json(i, command.unwrap_or_default()));
+        }
         match r {
             Ok(v) => results.push(if verbose { v } else { compact(v) }),
             Err(e) => {
                 let undone = start.rollback(b, i);
-                return text_result(
-                    &json!({
-                        "ok": false,
-                        "completed": i,
-                        "failed": {"index": i, "command": command, "error": e},
-                        "rolled_back": rollback,
-                        "undone": undone,
-                        "results": results,
-                    }),
-                    true,
-                );
+                let reply = json!({
+                    "ok": false,
+                    "completed": i,
+                    "failed": {"index": i, "command": command, "error": e},
+                    "rolled_back": rollback,
+                    "undone": undone,
+                    "results": results,
+                });
+                return text_result(&with_timings(reply, timed, rows, clock.ms()), true);
             }
         }
     }
     start.finish(b);
-    text_result(&json!({"ok": true, "completed": results.len(), "results": results}), false)
+    let reply = json!({"ok": true, "completed": results.len(), "results": results});
+    text_result(&with_timings(reply, timed, rows, clock.ms()), false)
+}
+
+/// `reply` with `timings` and `total_ms` when they were asked for.
+fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) -> Value {
+    if timed && let Some(o) = reply.as_object_mut() {
+        o.insert("timings".into(), Value::Array(rows));
+        o.insert("total_ms".into(), json!(timing::round_ms(total_ms)));
+    }
+    reply
 }
 
 /// The `batch` reply from the app's `engine.batch` answer, shaped as the per-step path shapes it.
 fn batch_reply(r: &Value, rollback: bool, verbose: bool) -> Value {
     let results: Vec<Value> =
         r["results"].as_array().cloned().unwrap_or_default().into_iter().map(|v| if verbose { v } else { compact(v) }).collect();
-    match r.get("failed").filter(|f| !f.is_null()) {
-        None => text_result(&json!({"ok": true, "completed": results.len(), "results": results}), false),
-        Some(failed) => text_result(
-            &json!({
+    let (mut reply, error) = match r.get("failed").filter(|f| !f.is_null()) {
+        None => (json!({"ok": true, "completed": results.len(), "results": results}), false),
+        Some(failed) => (
+            json!({
                 "ok": false,
                 "completed": r["completed"],
                 "failed": failed,
@@ -532,7 +585,16 @@ fn batch_reply(r: &Value, rollback: bool, verbose: bool) -> Value {
             }),
             true,
         ),
+    };
+    // The app timed the steps where they ran.
+    if let Some(o) = reply.as_object_mut() {
+        for k in ["timings", "total_ms"] {
+            if let Some(v) = r.get(k).filter(|v| !v.is_null()) {
+                o.insert(k.into(), v.clone());
+            }
+        }
     }
+    text_result(&reply, error)
 }
 
 /// A command's result without what the design already had (`execute` or `batch` with `verbose: false`): a
@@ -567,6 +629,16 @@ fn screenshot(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
 }
 
 fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Value), String> {
+    // `grid` and `axes` shape a model render; the window shows what it shows.
+    let guides: Vec<(&str, bool)> = ["grid", "axes"].into_iter().filter_map(|k| a.get(k).and_then(Value::as_bool).map(|v| (k, v))).collect();
+    let window = match str_arg(a, "source") {
+        Some("model") => false,
+        Some("window") if !guides.is_empty() => {
+            return Err("screenshot: `grid` and `axes` apply to model renders; use source \"model\" (the window shows what it shows)".into());
+        }
+        Some("window") => true,
+        _ => b.has_ui() && guides.is_empty(),
+    };
     let apply = |b: &mut dyn Backend, params: Value| b.call("engine.execute", json!({"command": "view.apply", "params": params}));
     match (str_arg(a, "view"), a.get("camera").filter(|c| !c.is_null())) {
         (Some(_), Some(_)) => return Err("screenshot: give `view` or `camera`, not both".into()),
@@ -589,21 +661,32 @@ fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Valu
     let keep = str_arg(a, "path").filter(|p| !p.trim().is_empty()).map(str::to_string);
     let path = keep.clone().unwrap_or_else(|| {
         let n = SHOT.fetch_add(1, Ordering::Relaxed);
-        let dir = crate::scratch_dir().unwrap_or_else(std::env::temp_dir);
+        let dir = crate::scratch_dir().unwrap_or_else(vfs::temp_dir);
         dir.join(format!("shot-{n}.png")).to_string_lossy().to_string()
     });
-    let window = match str_arg(a, "source") {
-        Some("model") => false,
-        Some("window") => true,
-        _ => b.has_ui(),
-    };
     let size = |k: &str, d: u64| a.get(k).and_then(Value::as_u64).unwrap_or(d).clamp(16, 4096);
-    let render = |b: &mut dyn Backend| b.call("ui.render", json!({"path": path, "width": size("width", 960), "height": size("height", 600)}));
+    let render = |b: &mut dyn Backend| {
+        let mut params = json!({"path": path, "width": size("width", 960), "height": size("height", 600)});
+        for (k, v) in &guides {
+            params[*k] = json!(v);
+        }
+        b.call("ui.render", params)
+    };
+    let asked_window = str_arg(a, "source") == Some("window");
+    let mut fallback = None;
     let (info, source) = if window {
         match b.call("ui.screenshot", json!({"path": path})) {
             Ok(v) => (v, "window"),
-            // No presented frame (minimised or hidden window): fall back to a model render.
-            Err(_) => (render(b)?, "model"),
+            // Asked for the window: say why there is none, so the caller can show it or ask for
+            // a model render (#1677).
+            Err(e) if asked_window => {
+                return Err(format!("screenshot: the window gave no picture ({e}); show the window, or use source \"model\""));
+            }
+            // No presented frame (minimised or hidden window): a model render, and the reply says so.
+            Err(e) => {
+                fallback = Some(e);
+                (render(b)?, "model")
+            }
         }
     } else {
         (render(b)?, "model")
@@ -618,7 +701,17 @@ fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Valu
         _ => (info.get("width").cloned().unwrap_or(Value::Null), info.get("height").cloned().unwrap_or(Value::Null)),
     };
     let bytes = png.len();
-    Ok((png, json!({"source": source, "path": keep, "width": w, "height": h, "bytes": bytes})))
+    let mut reply = json!({"source": source, "path": keep, "width": w, "height": h, "bytes": bytes});
+    if let Some(why) = fallback {
+        reply["fallback"] = json!(format!("the window gave no picture ({why}); this is a model render"));
+    }
+    // What drew a model render (gpu, gpu-software or cpu), and the warning a CPU render carries.
+    for k in ["renderer", "warning"] {
+        if let Some(v) = info.get(k).filter(|v| !v.is_null()) {
+            reply[k] = v.clone();
+        }
+    }
+    Ok((png, reply))
 }
 
 /// Standard base64 with padding (RFC 4648).

@@ -1,21 +1,174 @@
 //! Colours and widget style: a dark theme (the default, a blue-grey in the spirit of desktop CAD
-//! tools, viewport #2e3440) and a light one. Every colour the UI uses comes from [`Tokens`].
+//! tools, viewport #2e3440) and a light one, each with colour vision modes, and theme files that
+//! set any of their colours (`theme_files`). Every colour the UI uses comes from [`Tokens`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 #[path = "../../../assets/styles/ui/palettes.rs"]
 mod palettes;
 
 use egui::{Color32, Stroke};
+use serde::{Deserialize, Serialize};
 
-static DARK: AtomicBool = AtomicBool::new(true);
+thread_local! {
+    /// Theme state belongs to the UI thread drawing the frame. Concurrent app/test renderers
+    /// must not change one another's palette while a frame or icon texture is being built.
+    static DARK: Cell<bool> = const { Cell::new(true) };
+    /// The colour vision mode, per thread. Each app
+    /// sets it from its own preferences at the start of every frame (`SolveApp::logic`), on the
+    /// thread that draws it. Tests run many apps side by side on their own threads in one process:
+    /// with one global, a test in a mode changed the colours under another one
+    /// (`hover_stays_off_during_spin_and_animated_views` failed that way). No worker thread reads
+    /// it: the preview thread is handed its colours (`preview::Colors`) and thumbnails are drawn by
+    /// the engine in the model's colours, so a new thread starts Off and stays Off.
+    static VISION: Cell<ColorVision> = const { Cell::new(ColorVision::Off) };
+    /// The palette of a theme file (`theme_files`) in place of the built-in one of its base
+    /// (dark or light), per thread like the rest. `None`: the built-in palettes.
+    static CUSTOM: Cell<Option<Custom>> = const { Cell::new(None) };
+}
+
+/// A theme file's palette and whether it is dark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Custom {
+    pub dark: bool,
+    pub tokens: Tokens,
+}
+
+/// Use a theme file's palette for its base, or the built-in palettes (`None`). Returns whether
+/// that changed anything (the visuals follow on the next [`apply`]).
+pub fn set_custom(custom: Option<Custom>) -> bool {
+    CUSTOM.with(|c| c.replace(custom) != custom)
+}
 
 /// Is the dark theme on?
 pub fn is_dark() -> bool {
-    DARK.load(Ordering::Relaxed)
+    DARK.get()
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The common conversion boundary for compiled icon palette data.
+pub(crate) const fn icon_color(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Colour vision modes (#778): a second set of values for the colours that carry a meaning, for
+/// a weak or missing red (protan), green (deutan) or blue (tritan) sense. Not a filter: Off gives
+/// back the theme's colours unchanged. Protan and Deutan share one red-green table, measured
+/// clear for both (`colour_vision_tests`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorVision {
+    #[default]
+    Off,
+    Protan,
+    Deutan,
+    Tritan,
+}
+
+impl ColorVision {
+    pub const ALL: [ColorVision; 4] = [ColorVision::Off, ColorVision::Protan, ColorVision::Deutan, ColorVision::Tritan];
+
+    /// The saved value (`ui.prefs` `color_vision`).
+    pub fn id(self) -> &'static str {
+        match self {
+            ColorVision::Off => "off",
+            ColorVision::Protan => "protan",
+            ColorVision::Deutan => "deutan",
+            ColorVision::Tritan => "tritan",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<ColorVision> {
+        ColorVision::ALL.into_iter().find(|m| m.id() == id)
+    }
+
+    /// Its name in the Preferences (a message id).
+    pub fn label_id(self) -> &'static str {
+        match self {
+            ColorVision::Off => "ui.colour_vision_off",
+            ColorVision::Protan => "ui.colour_vision_protan",
+            ColorVision::Deutan => "ui.colour_vision_deutan",
+            ColorVision::Tritan => "ui.colour_vision_tritan",
+        }
+    }
+
+    /// Who it is for, in one line (its tooltip; a message id).
+    pub fn help_id(self) -> &'static str {
+        match self {
+            ColorVision::Off => "ui.colour_vision_off_tip",
+            ColorVision::Protan => "ui.colour_vision_protan_tip",
+            ColorVision::Deutan => "ui.colour_vision_deutan_tip",
+            ColorVision::Tritan => "ui.colour_vision_tritan_tip",
+        }
+    }
+}
+
+/// From saved preferences: a value this version doesn't know (a later version's mode, a hand
+/// edit) is Off rather than an error, which would lose every other saved preference with it.
+/// `ui.prefs` refuses such a value before it gets here (`prefs::set`).
+impl<'de> Deserialize<'de> for ColorVision {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_str().and_then(ColorVision::from_id).unwrap_or_default())
+    }
+}
+
+/// The colour vision mode on now (on this thread).
+pub fn vision() -> ColorVision {
+    VISION.with(Cell::get)
+}
+
+/// Switch the colour vision mode (the visuals follow on the next [`apply`]).
+pub fn set_vision(mode: ColorVision) {
+    VISION.with(|v| v.set(mode));
+}
+
+/// An sRGB colour given as 0..1 (the analysis colours), for drawing in the UI.
+pub fn srgb(c: [f32; 3]) -> Color32 {
+    let byte = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgb(byte(c[0]), byte(c[1]), byte(c[2]))
+}
+
+/// Surface analysis colours, straight sRGB 0..1 as the shader takes them (exact, so they read
+/// the same as when they were literals in the WGSL). The light theme's are the headless default.
+pub use solidcraft_engine::render::AnalysisColors;
+
+/// The colours icons draw of their own (`icons::paint` takes ink, fill and accent from its
+/// caller). Every icon colour is a token so a colour vision mode can reach it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconColors {
+    /// Surface sheets: a sheet, a second sheet beside it, a lighter sheet, iso lines and teeth.
+    pub sheet: Color32,
+    pub sheet_2: Color32,
+    pub sheet_light: Color32,
+    pub sheet_line: Color32,
+    /// Highlights (and the white ink of markers and the agent pointer), and the sphere's glint.
+    pub highlight: Color32,
+    pub glint: Color32,
+    pub folder: Color32,
+    pub plane: Color32,
+    pub fold: Color32,
+    /// Zebra stripes, and the environment map's sky and floor.
+    pub stripe: Color32,
+    pub sky: Color32,
+    pub floor: Color32,
+    /// Appearance: red, blue and yellow paint dabs.
+    pub paint: [Color32; 3],
+    /// Origin: X, Y and Z arrows.
+    pub axes: [Color32; 3],
+    /// Accessibility: reachable, blocked. Draft: positive, between. Curvature: flat, middle,
+    /// tight.
+    pub access: [Color32; 2],
+    pub draft: [Color32; 2],
+    pub curvature: [Color32; 3],
+    pub interference: Color32,
+    pub warning: Color32,
+    /// The pointer an AI agent moves.
+    pub agent: Color32,
+    /// The dark halo under viewport markers (snap points).
+    pub marker_halo: Color32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
     pub app_bar: Color32,
     pub toolbar: Color32,
@@ -71,6 +224,8 @@ pub struct Tokens {
     pub manipulator: Color32,
     /// New surface in a feature preview.
     pub preview_add: Color32,
+    /// The surface of a body a feature preview creates (New Body), apart from a join (#1805).
+    pub preview_new: Color32,
     /// Proposed sketch geometry, distinct from blue selections.
     pub preview_sketch: Color32,
     /// Removed material in a feature preview (translucent).
@@ -122,6 +277,8 @@ pub struct Tokens {
     pub rubber_band: Color32,
     /// Light text on the application bar.
     pub app_bar_text: Color32,
+    /// A hovered tab on the application bar (keeps `app_bar_text` readable).
+    pub app_bar_hover: Color32,
     /// Timeline items: normal and failed.
     pub timeline_item: Color32,
     pub timeline_item_error: Color32,
@@ -131,12 +288,55 @@ pub struct Tokens {
     // ---- box selection ----
     pub box_window: Color32,
     pub box_crossing: Color32,
+    // ---- colours that came from the engine or were drawn in place ----
+    /// Sketch curves the engine tags (`view::colors`): projected, lost link, construction,
+    /// centerline.
+    pub sketch_projected: Color32,
+    pub sketch_lost: Color32,
+    pub sketch_construction: Color32,
+    pub sketch_centerline: Color32,
+    /// The view triad's X, Y and Z (and the CPU scene's origin axes).
+    pub triad: [Color32; 3],
+    /// The move gizmo's X, Y and Z.
+    pub gizmo: [Color32; 3],
+    /// Sheet metal flat pattern: bend up, bend down.
+    pub bend_up: Color32,
+    pub bend_down: Color32,
+    /// Interference: the clash fill, before its shading.
+    pub interference: Color32,
+    /// Continuity Analysis seams, best to worst as `inspect.continuity` judges them: smooth (G2),
+    /// tangent with a curvature jump (G1), a crease (G0) and a gap. Bluish green, blue, yellow
+    /// and reddish purple stay apart in every colour vision mode, so no mode changes them.
+    pub continuity: [Color32; 4],
+    pub analysis: AnalysisColors,
+    pub icons: IconColors,
+    /// The application bar's buttons: ink, fill and accent of their icons.
+    pub app_bar_icon: [Color32; 3],
+    /// The SolidCraft mark on the application bar: light, mid and dark faces, and its edge.
+    pub logo: [Color32; 4],
 }
 
 impl Tokens {
-    /// The tokens of the current theme.
+    /// The tokens of the current theme and colour vision mode.
     pub fn get() -> Tokens {
-        if is_dark() { Tokens::dark() } else { Tokens::light() }
+        Tokens::themed(is_dark(), vision())
+    }
+
+    /// The tokens of a theme and colour vision mode: a theme file's palette when one is on for
+    /// that base ([`set_custom`]), else the built-in one; the colour vision mode on top.
+    pub fn themed(dark: bool, mode: ColorVision) -> Tokens {
+        let custom = CUSTOM.get().filter(|c| c.dark == dark).map(|c| c.tokens);
+        custom.unwrap_or(if dark { Tokens::dark() } else { Tokens::light() }).with_vision(dark, mode)
+    }
+
+    /// These tokens with a colour vision mode's values on top (the tables in `palettes.rs`); Off
+    /// gives them back unchanged.
+    pub fn with_vision(self, dark: bool, mode: ColorVision) -> Tokens {
+        match mode {
+            ColorVision::Off => self,
+            ColorVision::Protan | ColorVision::Deutan => self.red_green(dark),
+            ColorVision::Tritan => self.blue_yellow(dark),
+        }
     }
 
     /// Fade idle cube colours into the viewport while retaining opaque facets.
@@ -162,11 +362,11 @@ pub fn material_color(name: &str) -> Option<Color32> {
 
 /// Switch themes (the visuals follow on the next [`apply`]).
 pub fn set_dark(dark: bool) {
-    DARK.store(dark, Ordering::Relaxed);
+    DARK.set(dark);
 }
 
 fn visuals(dark: bool) -> egui::Visuals {
-    let t = if dark { Tokens::dark() } else { Tokens::light() };
+    let t = Tokens::themed(dark, vision());
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = t.panel;
     v.window_fill = t.panel;
@@ -202,6 +402,24 @@ pub fn apply(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_ui_renderers_keep_their_own_theme_and_vision() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (dark, vision) in [(false, super::ColorVision::Off), (true, super::ColorVision::Protan)] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    super::set_dark(dark);
+                    super::set_vision(vision);
+                    barrier.wait();
+                    assert_eq!(super::is_dark(), dark);
+                    assert_eq!(super::vision(), vision);
+                    assert_eq!(super::Tokens::get().sketch_accent, super::Tokens::themed(dark, vision).sketch_accent);
+                });
+            }
+        });
+    }
+
     /// Title and section bands stand out from a dialog, the title more than its sections.
     #[test]
     fn heading_bands_are_darker_than_the_dialog_in_order() {

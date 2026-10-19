@@ -114,14 +114,6 @@ fn ring_basis(i: usize) -> (Vec3, Vec3) {
     }
 }
 
-fn axis_color(i: usize) -> Color32 {
-    match i {
-        0 => Color32::from_rgb(225, 70, 60),
-        1 => Color32::from_rgb(80, 190, 80),
-        _ => Color32::from_rgb(70, 130, 240),
-    }
-}
-
 /// Distance from `p` to the screen segment a–b.
 fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -246,6 +238,11 @@ pub(crate) fn cancel(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|d| d.remove::<State>(id));
 }
 
+/// Hit-test before registering the dynamic egui drag widget or changing the camera.
+pub(crate) fn contains_pointer(proj: &Proj, t: &Triad, p: Pos2) -> bool {
+    mm_per_px(proj, t.center).and_then(|scale| shapes(proj, t, scale * LEN_PX)).is_some_and(|sh| hit(&sh, p).is_some())
+}
+
 /// Draw the triad and run a drag on it. `step` is the distance snap step.
 pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::Id, t: &Triad, step: f64) -> Option<Drag> {
     let tk = Tokens::get();
@@ -263,7 +260,7 @@ pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::I
     let hovered = if state.is_none() { pointer.filter(|_| ui.rect_contains_pointer(proj.rect)).and_then(|p| hit(&sh, p)) } else { None };
     let active = state.map(|s| s.handle).or(hovered);
     let hot = |h: Handle| active == Some(h);
-    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { axis_color(i) };
+    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { tk.gizmo[i.min(2)] };
     for (i, pts) in &sh.rings {
         painter.add(Shape::line(pts.clone(), Stroke::new(if hot(Handle::Ring(*i)) { 3.0 } else { 1.8 }, col(Handle::Ring(*i), *i))));
     }

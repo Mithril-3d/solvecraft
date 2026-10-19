@@ -1,0 +1,50 @@
+# Files generated from the code are rewritten here, on main, after each merge, so pull requests
+# never edit them (two pull requests that each regenerated one would always conflict):
+# THIRD-PARTY-LICENSES.txt (`cargo xtask licences`) and docs/features.md (`cargo xtask features`).
+name: Generated files
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One run at a time; a burst of merges leaves one run waiting, which sees all of them.
+concurrency:
+  group: generated-files
+  cancel-in-progress: false
+
+jobs:
+  regenerate:
+    name: Regenerate and commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # Always main itself, never pull request code, since this job can push.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # main goes through the merge queue; this deploy key may push past it.
+          ssh-key: ${{ secrets.GENERATED_FILES_DEPLOY_KEY }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: generated-files
+      - name: THIRD-PARTY-LICENSES.txt
+        run: cargo xtask licences
+      - name: docs/features.md
+        run: cargo xtask features
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- THIRD-PARTY-LICENSES.txt docs/features.md; then echo "unchanged"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add THIRD-PARTY-LICENSES.txt docs/features.md
+          git commit -m "Regenerate THIRD-PARTY-LICENSES.txt and docs/features.md [skip ci]"
+          for _ in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep 10
+          done
+          exit 1

@@ -10,9 +10,9 @@ build-dir = "../../target/book"
 create-missing = false
 
 [output.html]
-git-repository-url = "https://github.com/bherbruck/solidcraft"
-edit-url-template = "https://github.com/bherbruck/solidcraft/edit/main/docs/book/{path}"
-site-url = "/solidcraft/"
+git-repository-url = "https://github.com/tangency-labs/solidcraft"
+edit-url-template = "https://github.com/tangency-labs/solidcraft/edit/main/docs/book/{path}"
+site-url = "/"
 no-section-label = false
 
 [output.html.search]
@@ -23,7 +23,7 @@ enable = true
 # links; these send them to the right place.
 "/dev/mcp.html" = "../guide/mcp.html"
 "/dev/docs/oracle.html" = "../oracle.html"
-"/dev/README.html" = "https://github.com/bherbruck/solidcraft/blob/main/README.md"
-"/dev/ATTRIBUTION.html" = "https://github.com/bherbruck/solidcraft/blob/main/ATTRIBUTION.md"
-"/dev/AGENTS.html" = "https://github.com/bherbruck/solidcraft/blob/main/AGENTS.md"
-"/dev/ROADMAP.html" = "https://github.com/bherbruck/solidcraft/blob/main/ROADMAP.md"
+"/dev/README.html" = "https://github.com/tangency-labs/solidcraft/blob/main/README.md"
+"/dev/ATTRIBUTION.html" = "https://github.com/tangency-labs/solidcraft/blob/main/ATTRIBUTION.md"
+"/dev/AGENTS.html" = "https://github.com/tangency-labs/solidcraft/blob/main/AGENTS.md"
+"/dev/ROADMAP.html" = "https://github.com/tangency-labs/solidcraft/blob/main/ROADMAP.md"
