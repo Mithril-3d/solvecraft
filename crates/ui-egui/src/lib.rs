@@ -81,6 +81,7 @@ pub mod issue_report;
 pub mod joint_drag;
 pub mod keymap;
 mod linked_source;
+pub mod locale_labels;
 #[cfg(test)]
 mod loft_rails_dialog_tests;
 #[cfg(test)]
@@ -244,6 +245,7 @@ mod ui_kit_guard_tests;
 pub mod update;
 pub mod viewport;
 mod viewport_layout;
+pub mod web_fonts;
 pub mod workspace;
 
 use std::sync::mpsc::Receiver;
